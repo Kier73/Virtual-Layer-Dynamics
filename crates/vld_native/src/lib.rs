@@ -85,7 +85,7 @@ pub unsafe extern "C" fn vld_bilinear_periodic_matvec_f64(
     0
 }
 
-/// Evaluate row-wise FP32 RMSNorm: `out[r, c] = x[r, c] * rsqrt(mean(x[r]^2) + eps) * weight[c]`.
+/// Evaluate row-wise FP32 RMSNorm: `out[r, c] = x[r, c] * rsqrt(mean_f64(x[r]^2) + eps) * weight[c]`.
 #[no_mangle]
 pub unsafe extern "C" fn vld_rms_norm_f32(
     rows: usize,
@@ -98,21 +98,36 @@ pub unsafe extern "C" fn vld_rms_norm_f32(
     if cols == 0 || (rows > 0 && (x_ptr.is_null() || out_ptr.is_null())) || w_ptr.is_null() {
         return -1;
     }
+    if !eps.is_finite() || eps < 0.0 {
+        return -2;
+    }
     let x = if rows > 0 { slice::from_raw_parts(x_ptr, rows * cols) } else { &[] };
     let w = slice::from_raw_parts(w_ptr, cols);
+    if w.iter().any(|v| !v.is_finite()) {
+        return -2;
+    }
     let out = if rows > 0 { slice::from_raw_parts_mut(out_ptr, rows * cols) } else { &mut [] };
 
-    let inv_cols = 1.0_f32 / (cols as f32);
+    let inv_cols = 1.0_f64 / (cols as f64);
+    let eps64 = eps as f64;
     for r in 0..rows {
         let row_in = &x[r * cols..(r + 1) * cols];
         let row_out = &mut out[r * cols..(r + 1) * cols];
-        let mut sum_sq: f32 = 0.0;
+        let mut sum_sq: f64 = 0.0;
         for &v in row_in {
-            sum_sq += v * v;
+            if !v.is_finite() {
+                return -2;
+            }
+            let dv = v as f64;
+            sum_sq += dv * dv;
         }
-        let scale = 1.0_f32 / (sum_sq * inv_cols + eps).sqrt();
+        let scale = 1.0_f64 / (sum_sq * inv_cols + eps64).sqrt();
         for c in 0..cols {
-            row_out[c] = row_in[c] * scale * w[c];
+            let y = ((row_in[c] as f64) * scale * (w[c] as f64)) as f32;
+            if !y.is_finite() {
+                return -2;
+            }
+            row_out[c] = y;
         }
     }
     0

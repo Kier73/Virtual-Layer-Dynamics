@@ -721,3 +721,158 @@ def test_high_hinge_multivariate_arrangement_scalability_and_chamber_budget() ->
     assert NumericEngine.max_abs_diff(eng_np.rms_norm_2d(large_row, w_ones, 1e-6), eng_py.rms_norm_2d(large_row, w_ones, 1e-6)) < 1e-5
 
 
+def test_high_dimensional_ridge_algebra_aks_attention_hf_tokenizer_and_lazy_safetensors() -> None:
+    """Verify 24D whole-domain ReLU ridge verification, AKS F_p attention (`G18`), HF `tokenizer.json` & `HttpRangeSource`."""
+    from vld.canonical import domain_digest
+    from vld.models import (
+        AffineKernelAttentionGround,
+        HttpRangeSource,
+        HuggingFaceBPETokenizerGround,
+        LazySafetensorsWeightGround,
+        TransformerLayerRealizer,
+        compile_multivariate_hinge_relu,
+        direct_affine_kernel_oracle,
+        evaluate_multivariate_capsule,
+        verify_multivariate_capsule,
+        verify_softmax_insufficiency_witness,
+    )
+    from vld.models.artifacts import _BYTE_TO_UNICODE
+
+    # 1. High-dimensional (d=24, 48 hinges -> > 10^12 Zaslavsky chambers!) whole-domain verification via ridge algebra!
+    d_hi = 24
+    hinges_hi = []
+    for h_i in range(48):
+        normal = [str(((h_i + j * 3) % 5) - 2) for j in range(d_hi)]
+        normal[h_i % d_hi] = "3"  # guarantee non-zero normal
+        hinges_hi.append({"normal": normal, "offset": str((h_i % 7) - 3), "weights": ["1", "-2"]})
+    cap_hi = compile_multivariate_hinge_relu(
+        input_dim=d_hi,
+        base_linear=[[str((j % 3) - 1) for j in range(d_hi)], [str(j % 2) for j in range(d_hi)]],
+        base_bias=["5/2", "-3/4"],
+        hinges=hinges_hi,
+    )
+    rep_hi = verify_multivariate_capsule(cap_hi, default_chamber_limit=64)
+    assert rep_hi["status"] == "VERIFIED_WHOLE_DOMAIN"
+    assert rep_hi["verification_method"] == "algebraic_ridge_exact"
+    assert rep_hi["input_dim"] == 24
+
+    # Perturbing ONE hinge output weight in 24D and rehashing MUST construct an exact rational counterexample x* in Q^24!
+    tampered_hi = json.loads(json.dumps(cap_hi))
+    tampered_hi["network"]["output_weight"][0][-1] = "9/7"
+    tampered_body = {k: v for k, v in tampered_hi.items() if k != "capsule_digest"}
+    tampered_hi["capsule_digest"] = domain_digest("vld.snc-multivariate-relu-capsule.v1", tampered_body)
+    with pytest.raises(ProceduralModelError, match="rational witness"):
+        verify_multivariate_capsule(tampered_hi, default_chamber_limit=64)
+
+    # 2. AKS-001 / G18: Exact fixed-size sufficient-state AffineKernelAttentionGround over F_65537
+    p = 65537
+    aks = AffineKernelAttentionGround(modulus_p=p, key_dim=4, value_dim=3)
+    ks, vs = [], []
+    for t in range(300):
+        kt = [(17 * t + 3 * j + 1) % p for j in range(4)]
+        vt = [(29 * t + 11 * j + 5) % p for j in range(3)]
+        ks.append(kt)
+        vs.append(vt)
+        aks.admit_token(kt, vt)
+    assert aks.state_shape == ((5, 3), 5)  # Constant 15 + 5 = 20 field elements regardless of T=300!
+    q_vec = [7, 19, 42, 101]
+    q_rcpt = aks.query(q_vec, normalized=True, expected_head=aks.head_digest)
+    assert q_rcpt.value == direct_affine_kernel_oracle(p, ks, vs, q_vec, normalized=True)
+
+    # Snapshot / restore preserves lineage & refuses wrong expected_head
+    restored_aks = AffineKernelAttentionGround.from_snapshot(aks.to_snapshot(), expected_head=aks.head_digest)
+    assert restored_aks.query(q_vec, normalized=False).value == direct_affine_kernel_oracle(p, ks, vs, q_vec, normalized=False)
+    with pytest.raises(ModelOrbitError, match="expected_head"):
+        restored_aks.query(q_vec, expected_head="0" * 64)
+
+    # Zero-mass denominator refusal in F_5: 5 tokens with k=0 -> sum(1 + q*0) = 5 == 0 mod 5!
+    aks5 = AffineKernelAttentionGround(modulus_p=5, key_dim=1, value_dim=1)
+    for _ in range(5):
+        aks5.admit_token([0], [2])
+    with pytest.raises(ModelOrbitError, match="Zero kernel mass"):
+        aks5.query([3], normalized=True)
+
+    witness_info = verify_softmax_insufficiency_witness()
+    assert witness_info["identical_affine_sufficient_state"] is True
+    assert witness_info["distinct_lineage_heads"] is True
+    assert witness_info["softmax_discrepancy"] > 0.1
+
+    # 3. HuggingFaceBPETokenizerGround (`tokenizer.json` with NFC, digit split, contractions & special tokens)
+    base_vocab = {_BYTE_TO_UNICODE[b]: b for b in range(256)}
+    g_sp = _BYTE_TO_UNICODE[32]
+    base_vocab[g_sp + "t"] = 256
+    base_vocab[g_sp + "th"] = 257
+    base_vocab[g_sp + "the"] = 258
+    hf_json = {
+        "added_tokens": [
+            {"content": "<|im_start|>", "id": 259, "special": True},
+            {"content": "<|im_end|>", "id": 260, "special": True},
+        ],
+        "model": {
+            "ignore_merges": False,
+            "merges": [[g_sp, "t"], [g_sp + "t", "h"], [g_sp + "th", "e"]],
+            "type": "BPE",
+            "vocab": base_vocab,
+        },
+        "normalizer": {"type": "NFC"},
+        "pre_tokenizer": {"pattern": {"Regex": "\\p{N}"}},
+    }
+    hf_tok = HuggingFaceBPETokenizerGround(hf_json, tokenizer_id="vld.test.qwen_bpe")
+    sample = "<|im_start|>We don't skip   the 42 Δ steps!<|im_end|>"
+    rcpt = hf_tok.encode_with_receipt(sample)
+    assert rcpt.token_ids[0] == 259 and rcpt.token_ids[-1] == 260 and 258 in rcpt.token_ids
+    assert hf_tok.decode(rcpt.token_ids, skip_special_tokens=True) == "We don't skip   the 42 Δ steps!"
+
+    # 4. HttpRangeSource keep-alive + LazySafetensorsWeightGround row-slice embed_tokens locality!
+    arch_lazy = TransformerArchitectureSpec(
+        source_model="Qwen/Qwen3-LazySlice",
+        revision="e" * 40,
+        model_type="qwen3",
+        hidden_size=8,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=4,
+        intermediate_size=16,
+        vocab_size=128,  # 128 > 8 * 2 unique tokens -> triggers row-slice Range locality!
+        max_position_embeddings=32,
+        tie_word_embeddings=True,
+        dtype="BF16",
+    )
+    raw_map = _make_deterministic_weights(arch_lazy)
+    st_shard = build_safetensors_bytes(
+        {name: (t.dtype, t.shape, raw_map[name]) for t in arch_lazy.build_parameter_space().tensors if (name := t.name)}
+    )
+    srv_store = PagedObjectStore(InMemoryPageBacking(page_size=256))
+    srv_node = VLDVantageNode("range-origin", store=srv_store)
+    srv_manifest = srv_store.put_bytes(st_shard)
+
+    with VLDHttpVantageServer(srv_node) as srv:
+        url = f"{srv.base_url}/v1/m1/{srv_manifest.manifest_digest}/bytes"
+        http_src = HttpRangeSource(url, total_size_bytes=len(st_shard))
+        lazy_g = LazySafetensorsWeightGround(
+            space=arch_lazy.build_parameter_space(),
+            source_pin="http://local-test",
+            shard_sources={"model.safetensors": (http_src.read_range, lambda: http_src.total_size_bytes)},
+            tensor_to_shard={t.name: "model.safetensors" for t in arch_lazy.build_parameter_space().tensors},
+            cache_store=PagedObjectStore(InMemoryPageBacking(page_size=256)),
+        )
+        real = TransformerLayerRealizer(arch_lazy, lazy_g)
+        # Embed 2 tokens -> reads header + 2 * 16B = 32B instead of full 128 * 16B = 2048B embedding matrix!
+        emb_rows = real.embed_tokens([5, 99, 5])
+        assert len(emb_rows) == 3 and emb_rows[0] == emb_rows[2]
+        assert lazy_g.slice_reads_executed == 2 and lazy_g.tensors_materialized == 0
+
+        # Coalesced layer prefetch + full generation parity against IndependentReferenceOracle!
+        spans = lazy_g.prefetch_tensors_coalesced([t.name for t in arch_lazy.build_parameter_space().tensors])
+        assert spans == 1
+        http_src.close()
+
+    gen_lazy = AutoregressiveModelRunner(
+        arch_lazy, lazy_g, PagedObjectStore(InMemoryPageBacking(page_size=256))
+    ).generate((5, 99), max_new_tokens=2)
+    ref_logits = IndependentReferenceOracle.forward_full_sequence(arch_lazy, raw_map, gen_lazy.all_tokens[:-1])[-1]
+    assert NumericEngine.max_abs_diff(gen_lazy.last_step_logits, ref_logits) < 1e-4
+
+
+

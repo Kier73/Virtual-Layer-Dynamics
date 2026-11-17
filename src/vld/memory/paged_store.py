@@ -112,6 +112,15 @@ class InMemoryPageBacking:
         with self._lock:
             return digest in self._pages
 
+    def list_pages(self) -> tuple[str, ...]:
+        with self._lock:
+            return tuple(sorted(self._pages.keys()))
+
+    def delete_page(self, page_digest: str) -> bool:
+        digest = _strict_hex64(page_digest, "page_digest")
+        with self._lock:
+            return self._pages.pop(digest, None) is not None
+
 
 class DiskPageBacking:
     """Crash-safe content-addressed filesystem page backing with atomic rename and SHA-256 read verification."""
@@ -165,6 +174,29 @@ class DiskPageBacking:
     def has_page(self, page_digest: str) -> bool:
         digest = _strict_hex64(page_digest, "page_digest")
         return self._page_path(digest).is_file()
+
+    def list_pages(self) -> tuple[str, ...]:
+        with self._lock:
+            found: list[str] = []
+            if not self._root.is_dir():
+                return ()
+            for sub in self._root.iterdir():
+                if not sub.is_dir() or len(sub.name) != 2:
+                    continue
+                for entry in sub.glob("*.page"):
+                    stem = entry.stem
+                    if _HEX64.fullmatch(stem):
+                        found.append(stem)
+            return tuple(sorted(set(found)))
+
+    def delete_page(self, page_digest: str) -> bool:
+        digest = _strict_hex64(page_digest, "page_digest")
+        target = self._page_path(digest)
+        with self._lock:
+            if not target.is_file():
+                return False
+            target.unlink()
+            return True
 
 
 @dataclass(frozen=True, slots=True)
@@ -284,8 +316,19 @@ class PagedByteManifest:
         return manifest
 
 
+@dataclass(frozen=True, slots=True)
+class GarbageCollectionReport:
+    """Verified mark-and-sweep retention report for M1 `PagedObjectStore` (`G15`)."""
+
+    pinned_manifest_count: int
+    live_page_count: int
+    reclaimed_manifest_count: int
+    reclaimed_page_count: int
+    reclaimed_bytes: int
+
+
 class PagedObjectStore:
-    """Content-addressed M1 byte object store supporting streaming ingest and $O(L/P)$ bounded range reads."""
+    """Content-addressed M1 byte object store supporting streaming ingest, retention leases & $O(L/P)$ range reads."""
 
     def __init__(
         self,
@@ -301,6 +344,7 @@ class PagedObjectStore:
         self.max_object_bytes = _strict_int(max_object_bytes, "max_object_bytes", minimum=1)
         self._lock = threading.RLock()
         self._manifests: dict[str, PagedByteManifest] = {}
+        self._pins: dict[str, set[str]] = {}  # manifest_digest -> set of lease_ids
 
     def register_manifest(self, manifest: PagedByteManifest | Mapping[str, Any]) -> PagedByteManifest:
         m = manifest if isinstance(manifest, PagedByteManifest) else PagedByteManifest.from_dict(manifest)
@@ -426,3 +470,78 @@ class PagedObjectStore:
             return True
         except PagedStoreError:
             return False
+
+    def pin_manifest(
+        self,
+        manifest: PagedByteManifest | Mapping[str, Any] | str,
+        *,
+        lease_id: str = "default",
+    ) -> PagedByteManifest:
+        """Pin a manifest under `lease_id` so mark-and-sweep GC retains all of its referenced M1 pages (`G15`)."""
+        if not isinstance(lease_id, str) or not lease_id.strip():
+            raise PagedStoreError("lease_id must be a non-empty string.")
+        with self._lock:
+            m = self.get_manifest(manifest) if isinstance(manifest, str) else self.register_manifest(manifest)
+            for ch in m.chunks:
+                if not self.backing.has_page(ch.page_digest):
+                    raise PagedStoreError(
+                        f"Cannot pin manifest {m.manifest_digest}: missing dependency page {ch.page_digest}."
+                    )
+            self._pins.setdefault(m.manifest_digest, set()).add(lease_id)
+            return m
+
+    def unpin_manifest(self, manifest_digest: str, *, lease_id: str | None = None) -> bool:
+        """Release `lease_id` (or all leases when `lease_id is None`) on `manifest_digest`."""
+        digest = _strict_hex64(manifest_digest, "manifest_digest")
+        with self._lock:
+            leases = self._pins.get(digest)
+            if not leases:
+                return False
+            if lease_id is None:
+                del self._pins[digest]
+                return True
+            removed = lease_id in leases
+            leases.discard(lease_id)
+            if not leases:
+                del self._pins[digest]
+            return removed
+
+    def pinned_manifests(self) -> tuple[PagedByteManifest, ...]:
+        with self._lock:
+            return tuple(self._manifests[d] for d in sorted(self._pins.keys()) if d in self._manifests)
+
+    def collect_garbage(self) -> GarbageCollectionReport:
+        r"""Sweep unpinned manifests and unreachable backing pages while verifying all pinned dependencies (`G15`)."""
+        if not (hasattr(self.backing, "list_pages") and hasattr(self.backing, "delete_page")):
+            raise PagedStoreError("Active PageBacking does not support page enumeration/deletion for GC.")
+        with self._lock:
+            live_pages: set[str] = set()
+            for m_digest in sorted(self._pins.keys()):
+                m = self._manifests.get(m_digest)
+                if m is None:
+                    raise PagedStoreError(f"Pinned manifest {m_digest} missing from store catalogue.")
+                for ch in m.chunks:
+                    if not self.backing.has_page(ch.page_digest):
+                        raise PagedStoreError(
+                            f"Refusing GC: pinned manifest {m_digest} is missing live page {ch.page_digest}."
+                        )
+                    live_pages.add(ch.page_digest)
+
+            unpinned = [d for d in list(self._manifests.keys()) if d not in self._pins]
+            for d in unpinned:
+                del self._manifests[d]
+
+            all_pages: tuple[str, ...] = self.backing.list_pages()  # type: ignore[attr-defined]
+            reclaimed_pages = 0
+            for p_digest in all_pages:
+                if p_digest not in live_pages:
+                    if self.backing.delete_page(p_digest):  # type: ignore[attr-defined]
+                        reclaimed_pages += 1
+
+            return GarbageCollectionReport(
+                pinned_manifest_count=len(self._pins),
+                live_page_count=len(live_pages),
+                reclaimed_manifest_count=len(unpinned),
+                reclaimed_page_count=reclaimed_pages,
+                reclaimed_bytes=reclaimed_pages * self.page_size,
+            )

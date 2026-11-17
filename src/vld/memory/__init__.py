@@ -17,6 +17,7 @@ from vld.memory.certifier import (
 from vld.memory.paged_store import (
     DEFAULT_PAGE_SIZE,
     DiskPageBacking,
+    GarbageCollectionReport,
     InMemoryPageBacking,
     MAX_PAGE_SIZE,
     PageBacking,
@@ -39,6 +40,7 @@ __all__ = [
     "CertifiedLaw",
     "DEFAULT_PAGE_SIZE",
     "DiskPageBacking",
+    "GarbageCollectionReport",
     "HorizonExceededError",
     "InMemoryPageBacking",
     "LawCertificationRefused",

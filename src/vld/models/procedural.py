@@ -27,7 +27,7 @@ import hashlib
 import math
 import re
 import struct
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from vld.accel import decode_f32_le, encode_f32_le
 from vld.canonical import canonical_json, domain_digest, parse_strict_json
@@ -420,14 +420,14 @@ def compile_multivariate_hinge_relu(
     base_linear: Sequence[Sequence[str]],
     base_bias: Sequence[str],
     hinges: Sequence[Mapping[str, Any]] = (),
-    max_hinges: int = 64,
+    max_hinges: int = 256,
 ) -> dict[str, Any]:
     r"""Compile a multivariate polyhedral hinge specification $f: \mathbb{Q}^d \to \mathbb{Q}^m$ into an exact ReLU capsule."""
-    if isinstance(input_dim, bool) or not isinstance(input_dim, int) or not (1 <= input_dim <= 8):
-        raise ProceduralModelError("input_dim must be an integer in [1, 8].")
+    if isinstance(input_dim, bool) or not isinstance(input_dim, int) or not (1 <= input_dim <= 256):
+        raise ProceduralModelError("input_dim must be an integer in [1, 256].")
     out_dim = len(base_bias)
-    if not (1 <= out_dim <= 16) or len(base_linear) != out_dim:
-        raise ProceduralModelError("base_linear / base_bias output dimensions must match and lie in [1, 16].")
+    if not (1 <= out_dim <= 64) or len(base_linear) != out_dim:
+        raise ProceduralModelError("base_linear / base_bias output dimensions must match and lie in [1, 64].")
     if len(hinges) > max_hinges:
         raise ProceduralModelError(f"hinges count exceeds max_hinges={max_hinges}.")
 
@@ -535,14 +535,190 @@ def evaluate_multivariate_capsule(
     ]
 
 
+def _construct_ridge_counterexample(
+    *,
+    d: int,
+    out_i: int,
+    const_diff: Fraction,
+    lin_diff: Sequence[Fraction],
+    ridge_diff: Mapping[tuple[tuple[Fraction, ...], Fraction], Fraction],
+    all_hyperplanes: Sequence[tuple[tuple[Fraction, ...], Fraction]],
+    eval_diff_i: Callable[[tuple[Fraction, ...]], Fraction],
+) -> tuple[Fraction, ...]:
+    r"""Construct an exact rational witness $x^* \in \mathbb{Q}^d$ satisfying $f_{\text{net},i}(x^*) \neq f_{\text{spec},i}(x^*)$."""
+    zero_pt = tuple(Fraction(0) for _ in range(d))
+    if eval_diff_i(zero_pt) != 0:
+        return zero_pt
+
+    if not ridge_diff:
+        # Pure affine discrepancy: since eval_diff_i(0) == 0, some lin_diff[j] != 0
+        j_nz = next((j for j, g_j in enumerate(lin_diff) if g_j != 0), 0)
+        unit_pt = tuple(Fraction(1 if j == j_nz else 0) for j in range(d))
+        if eval_diff_i(unit_pt) != 0:
+            return unit_pt
+        raise ProceduralModelError(f"Channel {out_i} failed affine ridge consistency check.")
+
+    # Select canonical hyperplane H* = (a*, delta*) with non-zero absolute-value ridge residual c_{i, r*} != 0
+    (a_star, delta_star), _c_star = next(iter(ridge_diff.items()))
+    j_star = next(j for j, v in enumerate(a_star) if v != 0)  # a_star[j_star] == 1 by canonicalization
+    p0 = [Fraction(0)] * d
+    p0[j_star] = -delta_star
+
+    other_hps = [hp for hp in all_hyperplanes if hp != (a_star, delta_star)]
+    if d == 1 or not other_hps:
+        p = tuple(p0)
+    else:
+        free_coords = [k for k in range(d) if k != j_star]
+        # Non-parallel hyperplanes induce non-zero linear forms q_s over free_coords
+        forms: list[list[Fraction]] = []
+        for a_s, _ in other_hps:
+            if a_s != a_star:
+                forms.append([a_s[k] - a_s[j_star] * a_star[k] for k in free_coords])
+
+        # Deterministically pick tiny integer u in Z^{d-1} avoiding every hyperplane kernel <q_s, u> == 0
+        u_vals = [Fraction(0)] * len(free_coords)
+        last_nz = [max(m for m, val in enumerate(q) if val != 0) for q in forms]
+        accs = [Fraction(0)] * len(forms)
+        for m in range(len(free_coords)):
+            forbidden_u: set[Fraction] = set()
+            for idx_f, q in enumerate(forms):
+                if last_nz[idx_f] == m:
+                    forbidden_u.add(-accs[idx_f] / q[m])
+            cand_u = 0
+            while Fraction(cand_u) in forbidden_u:
+                cand_u += 1
+            u_m = Fraction(cand_u)
+            u_vals[m] = u_m
+            for idx_f, q in enumerate(forms):
+                accs[idx_f] += q[m] * u_m
+
+        v_vec = [Fraction(0)] * d
+        for m, k in enumerate(free_coords):
+            v_vec[k] = u_vals[m]
+        v_vec[j_star] = -sum((a_star[k] * v_vec[k] for k in free_coords), start=Fraction(0))
+
+        forbidden_t: set[Fraction] = set()
+        for a_s, d_s in other_hps:
+            denom = sum((a_s[k] * v_vec[k] for k in range(d)), start=Fraction(0))
+            if denom != 0:
+                val0 = sum((a_s[k] * p0[k] for k in range(d)), start=d_s)
+                forbidden_t.add(-val0 / denom)
+        t_int = 0
+        while Fraction(t_int) in forbidden_t:
+            t_int += 1
+        t_q = Fraction(t_int)
+        p = tuple(p0[k] + t_q * v_vec[k] for k in range(d))
+
+    # Step +/- eps along normal a_star without crossing any other arrangement hyperplane
+    margins: list[Fraction] = [Fraction(1)]
+    for a_s, d_s in other_hps:
+        dir_dot = sum((a_s[k] * a_star[k] for k in range(d)), start=Fraction(0))
+        if dir_dot != 0:
+            dist = abs(sum((a_s[k] * p[k] for k in range(d)), start=d_s))
+            margins.append(dist / abs(dir_dot))
+    eps = min(margins) / 2
+    p_plus = tuple(p[k] + eps * a_star[k] for k in range(d))
+    p_minus = tuple(p[k] - eps * a_star[k] for k in range(d))
+    for cand in (p, p_plus, p_minus):
+        if eval_diff_i(cand) != 0:
+            return cand
+    raise ProceduralModelError(f"Channel {out_i} ridge residual non-zero at {a_star}.")
+
+
+def _verify_multivariate_ridge_exact(
+    *,
+    d: int,
+    m_out: int,
+    w1: Sequence[tuple[Fraction, ...]],
+    b1: Sequence[Fraction],
+    w2: Sequence[Sequence[Fraction]],
+    b2: Sequence[Fraction],
+    a_spec: Sequence[Sequence[Fraction]],
+    c_spec: Sequence[Fraction],
+    hinges_spec: Sequence[tuple[tuple[Fraction, ...], Fraction, tuple[Fraction, ...]]],
+    all_hyperplanes: Sequence[tuple[tuple[Fraction, ...], Fraction]],
+) -> None:
+    r"""Verify whole-domain $\mathbb{R}^d$ identity $f_{\text{net}} \equiv f_{\text{spec}}$ via canonical ridge basis.
+
+    Uses $\operatorname{ReLU}(\langle w, x \rangle + b) = \frac{1}{2}(\langle w, x \rangle + b) + \frac{1}{2}|\lambda|\cdot|\langle \tilde{a}, x \rangle + \tilde{\delta}|$
+    and linear independence of distinct affine hyperplane ridges $\{|\langle \tilde{a}_r, x \rangle + \tilde{\delta}_r|\}$ on $\mathbb{R}^d$.
+    """
+    for out_i in range(m_out):
+        const_diff = b2[out_i] - c_spec[out_i]
+        lin_diff = [-a_ij for a_ij in a_spec[out_i]]
+        ridge_diff: dict[tuple[tuple[Fraction, ...], Fraction], Fraction] = {}
+
+        def _accum_relu(w_vec: tuple[Fraction, ...], bias_val: Fraction, coeff: Fraction) -> None:
+            nonlocal const_diff
+            if coeff == 0:
+                return
+            first_nz = next((v for v in w_vec if v != 0), Fraction(0))
+            if first_nz == 0:
+                if bias_val > 0:
+                    const_diff += coeff * bias_val
+                return
+            const_diff += (coeff * bias_val) / 2
+            for col_j in range(d):
+                lin_diff[col_j] += (coeff * w_vec[col_j]) / 2
+            canon_hp = (tuple(v / first_nz for v in w_vec), bias_val / first_nz)
+            ridge_coeff = (coeff * abs(first_nz)) / 2
+            prev = ridge_diff.get(canon_hp, Fraction(0)) + ridge_coeff
+            if prev == 0:
+                ridge_diff.pop(canon_hp, None)
+            else:
+                ridge_diff[canon_hp] = prev
+
+        for u_idx, (row, bi) in enumerate(zip(w1, b1)):
+            _accum_relu(row, bi, w2[out_i][u_idx])
+        for n_vec, beta, gamma in hinges_spec:
+            _accum_relu(n_vec, beta, -gamma[out_i])
+
+        if const_diff != 0 or any(v != 0 for v in lin_diff) or ridge_diff:
+            def _eval_diff_channel(pt: tuple[Fraction, ...], ch: int = out_i) -> Fraction:
+                net_v = b2[ch] + sum(
+                    (
+                        w2[ch][u_k] * max(Fraction(0), sum((w_j * x_j for w_j, x_j in zip(r_k, pt)), start=b_k))
+                        for u_k, (r_k, b_k) in enumerate(zip(w1, b1))
+                    ),
+                    start=Fraction(0),
+                )
+                spec_v = c_spec[ch] + sum((a_j * x_j for a_j, x_j in zip(a_spec[ch], pt)), start=Fraction(0))
+                for n_h, b_h, g_h in hinges_spec:
+                    spec_v += g_h[ch] * max(Fraction(0), sum((n_j * x_j for n_j, x_j in zip(n_h, pt)), start=b_h))
+                return net_v - spec_v
+
+            witness = _construct_ridge_counterexample(
+                d=d,
+                out_i=out_i,
+                const_diff=const_diff,
+                lin_diff=lin_diff,
+                ridge_diff=ridge_diff,
+                all_hyperplanes=all_hyperplanes,
+                eval_diff_i=_eval_diff_channel,
+            )
+            raise ProceduralModelError(
+                f"Multivariate ReLU network disagrees with source_spec on output {out_i} at rational witness {witness}."
+            )
+
+
 def verify_multivariate_capsule(
     capsule: Mapping[str, Any] | str | bytes,
     *,
-    max_chambers: int = 10_000,
+    max_chambers: int | None = None,
+    default_chamber_limit: int = 512,
 ) -> dict[str, Any]:
-    r"""Independently verify whole-domain $\mathbb{R}^d$ equivalence across all polyhedral hyperplane chambers."""
-    if isinstance(max_chambers, bool) or not isinstance(max_chambers, int) or max_chambers < 1:
+    r"""Independently verify whole-domain $\mathbb{R}^d$ equivalence via chamber arrangement + exact ridge algebra.
+
+    When `max_chambers` is `None` (default), arrangements up to `default_chamber_limit` are dual-verified by both
+    open-polyhedron chamber enumeration and canonical hyperplane ridge algebra, while higher-dimensional
+    arrangements exceeding `default_chamber_limit` complete exact whole-domain $\mathbb{R}^d$ verification via
+    the algebraic ridge-independence theorem without combinatorial chamber explosion. When an explicit integer
+    `max_chambers` is supplied, exceeding that chamber count raises `ProceduralModelError`.
+    """
+    if max_chambers is not None and (isinstance(max_chambers, bool) or not isinstance(max_chambers, int) or max_chambers < 1):
         raise ProceduralModelError("max_chambers must be a positive integer.")
+    if isinstance(default_chamber_limit, bool) or not isinstance(default_chamber_limit, int) or default_chamber_limit < 1:
+        raise ProceduralModelError("default_chamber_limit must be a positive integer.")
     try:
         data = parse_strict_json(capsule) if isinstance(capsule, (str, bytes)) else dict(capsule)
     except Exception as exc:
@@ -561,8 +737,8 @@ def verify_multivariate_capsule(
         raise ProceduralModelError("Source multivariate spec digest mismatch.")
 
     raw_d = spec.get("input_dim") if isinstance(spec, Mapping) else None
-    if isinstance(raw_d, bool) or not isinstance(raw_d, int) or not (1 <= raw_d <= 8):
-        raise ProceduralModelError("Untrusted multivariate capsule input_dim must be an integer in [1, 8].")
+    if isinstance(raw_d, bool) or not isinstance(raw_d, int) or not (1 <= raw_d <= 256):
+        raise ProceduralModelError("Untrusted multivariate capsule input_dim must be an integer in [1, 256].")
     d = raw_d
     a_spec = [[_parse_canonical_rational(v) for v in row] for row in spec["base_linear"]]
     c_spec = [_parse_canonical_rational(v) for v in spec["base_bias"]]
@@ -591,72 +767,119 @@ def verify_multivariate_capsule(
     if len(w1) != len(b1) or any(len(row) != d for row in w1) or len(w2) != m_out or any(len(r) != len(w1) for r in w2):
         raise ProceduralModelError("Invalid multivariate network dimensions.")
 
-    # Collect canonical unique arrangement hyperplanes from BOTH network hidden units and source hinges!
+    # Collect canonical unique arrangement hyperplanes (first non-zero normal coordinate normalized to +1)
     hyperplanes: list[tuple[tuple[Fraction, ...], Fraction]] = []
     seen_hp: set[tuple[tuple[Fraction, ...], Fraction]] = set()
     for n_vec, beta in [*(zip(w1, b1)), *((h[0], h[1]) for h in hinges_spec)]:
         first_nz = next((v for v in n_vec if v != 0), Fraction(0))
         if first_nz == 0:
             continue
-        scale = abs(first_nz)
-        sgn = 1 if first_nz > 0 else -1
-        canon = (tuple((sgn * v) / scale for v in n_vec), (sgn * beta) / scale)
+        canon = (tuple(v / first_nz for v in n_vec), beta / first_nz)
         if canon not in seen_hp:
             seen_hp.add(canon)
             hyperplanes.append(canon)
 
-    # Incrementally split open polyhedral chambers using normal-ray witnesses + redundancy elimination
+    # 1. Always run O(U * d + U * m) exact whole-domain algebraic ridge decomposition over Q^d
+    _verify_multivariate_ridge_exact(
+        d=d,
+        m_out=m_out,
+        w1=w1,
+        b1=b1,
+        w2=w2,
+        b2=b2,
+        a_spec=a_spec,
+        c_spec=c_spec,
+        hinges_spec=hinges_spec,
+        all_hyperplanes=hyperplanes,
+    )
+
+    # 2. Dual-derivation open-polyhedron chamber enumeration when arrangement stays within chamber budget
+    chamber_cap = max_chambers if max_chambers is not None else default_chamber_limit
     active_chambers: list[tuple[list[tuple[tuple[Fraction, ...], Fraction]], tuple[Fraction, ...]]] = [
         ([], tuple(Fraction(0) for _ in range(d)))
     ]
+    chamber_overflow = False
     for n_vec, beta in hyperplanes:
         next_chambers: list[tuple[list[tuple[tuple[Fraction, ...], Fraction]], tuple[Fraction, ...]]] = []
         for ineqs, w_pt in active_chambers:
             next_chambers.extend(_split_open_chamber(ineqs, w_pt, n_vec, beta, d))
-            if len(next_chambers) > max_chambers:
-                raise ProceduralModelError(
-                    f"Polyhedral chamber count exceeded max_chambers={max_chambers} budget."
-                )
+            if len(next_chambers) > chamber_cap:
+                if max_chambers is not None:
+                    raise ProceduralModelError(
+                        f"Polyhedral chamber count exceeded max_chambers={max_chambers} budget."
+                    )
+                chamber_overflow = True
+                break
+        if chamber_overflow:
+            break
         active_chambers = next_chambers
 
     chambers = [w_pt for _, w_pt in active_chambers]
     if not chambers:
         raise ProceduralModelError("Empty polyhedral domain arrangement.")
 
-    for witness in chambers:
-        # 1. Exact affine law induced by ReLU network on this chamber
-        net_jac = [[Fraction(0)] * d for _ in range(m_out)]
-        net_bias = list(b2)
-        for u_idx, (row, bi) in enumerate(zip(w1, b1)):
-            pre = sum((w_j * x_j for w_j, x_j in zip(row, witness)), start=bi)
-            if pre > 0:
-                for out_i in range(m_out):
-                    coeff = w2[out_i][u_idx]
-                    net_bias[out_i] += coeff * bi
-                    for col_j in range(d):
-                        net_jac[out_i][col_j] += coeff * row[col_j]
+    if not chamber_overflow:
+        for witness in chambers:
+            # Witness lies strictly off ALL arrangement hyperplanes: compare exact local affine Jacobian & bias
+            net_jac = [[Fraction(0)] * d for _ in range(m_out)]
+            net_bias = list(b2)
+            for u_idx, (row, bi) in enumerate(zip(w1, b1)):
+                pre = sum((w_j * x_j for w_j, x_j in zip(row, witness)), start=bi)
+                if pre > 0:
+                    for out_i in range(m_out):
+                        coeff = w2[out_i][u_idx]
+                        net_bias[out_i] += coeff * bi
+                        for col_j in range(d):
+                            net_jac[out_i][col_j] += coeff * row[col_j]
 
-        # 2. Exact affine law required by source specification on this chamber
-        exp_jac = [list(r) for r in a_spec]
-        exp_bias = list(c_spec)
-        for n_vec, beta, gamma in hinges_spec:
-            if sum((n_j * x_j for n_j, x_j in zip(n_vec, witness)), start=beta) > 0:
-                for out_i in range(m_out):
-                    exp_bias[out_i] += gamma[out_i] * beta
-                    for col_j in range(d):
-                        exp_jac[out_i][col_j] += gamma[out_i] * n_vec[col_j]
+            exp_jac = [list(r) for r in a_spec]
+            exp_bias = list(c_spec)
+            for n_vec, beta, gamma in hinges_spec:
+                if sum((n_j * x_j for n_j, x_j in zip(n_vec, witness)), start=beta) > 0:
+                    for out_i in range(m_out):
+                        exp_bias[out_i] += gamma[out_i] * beta
+                        for col_j in range(d):
+                            exp_jac[out_i][col_j] += gamma[out_i] * n_vec[col_j]
 
-        if net_jac != exp_jac or net_bias != exp_bias:
-            raise ProceduralModelError(
-                f"Multivariate ReLU network affine law disagrees with source_spec on chamber containing {witness}."
-            )
+            if net_jac != exp_jac or net_bias != exp_bias:
+                raise ProceduralModelError(
+                    f"Multivariate ReLU network affine law disagrees with source_spec on chamber containing {witness}."
+                )
+    else:
+        # Partial-prefix witnesses may lie directly on un-split hyperplanes; check exact pointwise values in addition to ridge proof
+        for witness in chambers[:64]:
+            net_vals = [
+                b2[out_i]
+                + sum(
+                    (
+                        w2[out_i][u_idx] * max(Fraction(0), sum((w_j * x_j for w_j, x_j in zip(row, witness)), start=bi))
+                        for u_idx, (row, bi) in enumerate(zip(w1, b1))
+                    ),
+                    start=Fraction(0),
+                )
+                for out_i in range(m_out)
+            ]
+            exp_vals = [
+                c_spec[out_i] + sum((a_j * x_j for a_j, x_j in zip(a_spec[out_i], witness)), start=Fraction(0))
+                for out_i in range(m_out)
+            ]
+            for n_vec, beta, gamma in hinges_spec:
+                act = max(Fraction(0), sum((n_j * x_j for n_j, x_j in zip(n_vec, witness)), start=beta))
+                if act > 0:
+                    for out_i in range(m_out):
+                        exp_vals[out_i] += gamma[out_i] * act
+            if net_vals != exp_vals:
+                raise ProceduralModelError(
+                    f"Multivariate ReLU network disagrees with source_spec at witness {witness}."
+                )
 
     return {
         "capsule_digest": supplied_digest,
-        "chambers_verified": len(chambers),
+        "chambers_verified": 0 if chamber_overflow else len(chambers),
         "hyperplanes": len(hyperplanes),
         "input_dim": d,
         "status": "VERIFIED_WHOLE_DOMAIN",
+        "verification_method": "algebraic_ridge_exact" if chamber_overflow else "dual_chamber_and_ridge",
     }
 
 

@@ -4,12 +4,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+import math
 from typing import Any, Callable, Mapping, Sequence
 
 from vld.accel import NumericEngine, decode_f32_le, encode_f32_le
 from vld.canonical import canonical_json, domain_digest, parse_strict_json
 from vld.memory import PagedByteManifest, PagedObjectStore
-from vld.models.artifacts import ModelWeightSnapshot, TransformerArchitectureSpec
+from vld.models.artifacts import LazySafetensorsWeightGround, ModelWeightSnapshot, TransformerArchitectureSpec
 from vld.models.realizers import MoERoutingReceipt, TransformerLayerRealizer, hidden_state_digest
 
 
@@ -205,6 +206,16 @@ class ModelOrbitCheckpoint:
         body["checkpoint_digest"] = self.checkpoint_digest
         return canonical_json(body)
 
+    def referenced_manifests(self) -> tuple[PagedByteManifest, ...]:
+        """Return all M1 manifests (`K`, `V`, and active `hidden_manifest`) required to resume this checkpoint (`G15`)."""
+        seen: dict[str, PagedByteManifest] = {}
+        if self.hidden_manifest is not None:
+            seen[self.hidden_manifest.manifest_digest] = self.hidden_manifest
+        for page in (*self.kv_pages_by_layer.values(), *self.step_kv_pages_by_layer.values()):
+            seen[page.k_manifest.manifest_digest] = page.k_manifest
+            seen[page.v_manifest.manifest_digest] = page.v_manifest
+        return tuple(seen[d] for d in sorted(seen.keys()))
+
     @classmethod
     def from_json(cls, raw: str | bytes) -> ModelOrbitCheckpoint:
         data = parse_strict_json(raw)
@@ -245,7 +256,7 @@ class AutoregressiveModelRunner:
     def __init__(
         self,
         arch: TransformerArchitectureSpec,
-        snapshot: ModelWeightSnapshot,
+        snapshot: ModelWeightSnapshot | LazySafetensorsWeightGround,
         state_store: PagedObjectStore,
         *,
         weight_store: PagedObjectStore | None = None,
@@ -432,11 +443,267 @@ class AutoregressiveModelRunner:
         )
 
 
+# ============================================================================
+# AKS-001 / G18: Exact Sufficient-State Affine-Kernel Attention Ground over F_p
+# ============================================================================
+
+
+def _is_prime(n: int) -> bool:
+    if n < 2:
+        return False
+    if n in (2, 3):
+        return True
+    if n % 2 == 0 or n % 3 == 0:
+        return False
+    # Deterministic Miller-Rabin for all 64-bit integers + small prime bases
+    d = n - 1
+    s = 0
+    while d % 2 == 0:
+        d //= 2
+        s += 1
+    for a in (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37):
+        if a >= n:
+            break
+        x = pow(a, d, n)
+        if x in (1, n - 1):
+            continue
+        for _ in range(s - 1):
+            x = (x * x) % n
+            if x == n - 1:
+                break
+        else:
+            return False
+    return True
+
+
+@dataclass(frozen=True, slots=True)
+class AffineKernelQueryReceipt:
+    """Verified constant-state query receipt over `AffineKernelAttentionGround` (`AKS-001`, `G18`)."""
+
+    ground_fingerprint: str
+    prefix_length: int
+    head_digest: str
+    query: tuple[int, ...]
+    numerator: tuple[int, ...]
+    mass: int
+    normalized: bool
+    value: tuple[int, ...]
+    receipt_digest: str
+
+
+class AffineKernelAttentionGround:
+    r"""Exact fixed-size sufficient-state attention Ground for $K(q, k) = (1 + \langle q, k \rangle) \bmod p$ (`G18`).
+
+    Retains $S_T = \sum_{t=1}^T \phi(k_t) \otimes v_t \in \mathbb{F}_p^{(d_k+1)\times d_v}$ and
+    $z_T = \sum_{t=1}^T \phi(k_t) \in \mathbb{F}_p^{d_k+1}$ where $\phi(x) = (1, x_1, \dots, x_{d_k})$,
+    answering arbitrary causal prefix queries in $O(d_k d_v)$ independent of prefix length $T$,
+    while binding every admitted `(k_t, v_t)` into a SHA-256 lineage chain (`head_digest`).
+    """
+
+    def __init__(self, *, modulus_p: int, key_dim: int, value_dim: int) -> None:
+        if isinstance(modulus_p, bool) or not isinstance(modulus_p, int) or not _is_prime(modulus_p):
+            raise ModelOrbitError(f"modulus_p must be a prime integer >= 2, got {modulus_p!r}.")
+        if isinstance(key_dim, bool) or not isinstance(key_dim, int) or key_dim < 1:
+            raise ModelOrbitError("key_dim must be a positive integer.")
+        if isinstance(value_dim, bool) or not isinstance(value_dim, int) or value_dim < 1:
+            raise ModelOrbitError("value_dim must be a positive integer.")
+        self.modulus_p = modulus_p
+        self.key_dim = key_dim
+        self.value_dim = value_dim
+        self.prefix_length = 0
+        self.head_digest = "0" * 64
+        self._state_s: list[list[int]] = [[0] * value_dim for _ in range(key_dim + 1)]
+        self._state_z: list[int] = [0] * (key_dim + 1)
+
+    @property
+    def ground_fingerprint(self) -> str:
+        return domain_digest(
+            "vld.aks-attention-ground.v1",
+            {"key_dim": self.key_dim, "modulus_p": self.modulus_p, "value_dim": self.value_dim},
+        )
+
+    @property
+    def state_shape(self) -> tuple[tuple[int, int], int]:
+        return ((self.key_dim + 1, self.value_dim), self.key_dim + 1)
+
+    def admit_token(self, key: Sequence[int], value: Sequence[int]) -> str:
+        """Update sufficient state `(S_T, z_T)` in `O(d_k * d_v)` and advance token lineage digest."""
+        if len(key) != self.key_dim or len(value) != self.value_dim:
+            raise ModelOrbitError("Token key/value dimension mismatch in AffineKernelAttentionGround.")
+        if any(isinstance(x, bool) or not isinstance(x, int) for x in (*key, *value)):
+            raise ModelOrbitError("Token key/value entries must be exact integers.")
+        p = self.modulus_p
+        k_mod = [x % p for x in key]
+        v_mod = [y % p for y in value]
+        feat = [1, *k_mod]
+        for a, f_a in enumerate(feat):
+            self._state_z[a] = (self._state_z[a] + f_a) % p
+            row = self._state_s[a]
+            for b, v_b in enumerate(v_mod):
+                row[b] = (row[b] + f_a * v_b) % p
+        self.prefix_length += 1
+        self.head_digest = domain_digest(
+            "vld.aks-token-evidence.v1",
+            {
+                "ground_fingerprint": self.ground_fingerprint,
+                "key": k_mod,
+                "prefix_index": self.prefix_length,
+                "prev_digest": self.head_digest,
+                "state_s": self._state_s,
+                "state_z": self._state_z,
+                "value": v_mod,
+            },
+        )
+        return self.head_digest
+
+    def query(
+        self,
+        q: Sequence[int],
+        *,
+        normalized: bool = True,
+        expected_head: str | None = None,
+    ) -> AffineKernelQueryReceipt:
+        """Evaluate exact affine-kernel attention at `q` in `O(d_k * d_v)` without replaying token history."""
+        if expected_head is not None and expected_head != self.head_digest:
+            raise ModelOrbitError("Trusted receiver expected_head pin disagrees with current lineage head_digest.")
+        if len(q) != self.key_dim or any(isinstance(x, bool) or not isinstance(x, int) for x in q):
+            raise ModelOrbitError("Query vector must contain key_dim exact integers.")
+        p = self.modulus_p
+        q_mod = tuple(x % p for x in q)
+        feat = (1, *q_mod)
+        mass = sum(feat[a] * self._state_z[a] for a in range(self.key_dim + 1)) % p
+        num = tuple(
+            sum(feat[a] * self._state_s[a][b] for a in range(self.key_dim + 1)) % p
+            for b in range(self.value_dim)
+        )
+        if normalized:
+            if mass == 0:
+                raise ModelOrbitError(f"Zero kernel mass denominator in F_{p}; normalized observation undefined.")
+            inv_mass = pow(mass, -1, p)
+            out = tuple((n_b * inv_mass) % p for n_b in num)
+        else:
+            out = num
+        body = {
+            "ground_fingerprint": self.ground_fingerprint,
+            "head_digest": self.head_digest,
+            "mass": mass,
+            "normalized": normalized,
+            "numerator": list(num),
+            "prefix_length": self.prefix_length,
+            "query": list(q_mod),
+            "value": list(out),
+        }
+        return AffineKernelQueryReceipt(
+            ground_fingerprint=self.ground_fingerprint,
+            prefix_length=self.prefix_length,
+            head_digest=self.head_digest,
+            query=q_mod,
+            numerator=num,
+            mass=mass,
+            normalized=normalized,
+            value=out,
+            receipt_digest=domain_digest("vld.aks-query-receipt.v1", body),
+        )
+
+    def to_snapshot(self) -> dict[str, Any]:
+        body = {
+            "ground_fingerprint": self.ground_fingerprint,
+            "head_digest": self.head_digest,
+            "key_dim": self.key_dim,
+            "modulus_p": self.modulus_p,
+            "prefix_length": self.prefix_length,
+            "schema": "vld.aks-snapshot.v1",
+            "state_s": [list(r) for r in self._state_s],
+            "state_z": list(self._state_z),
+            "value_dim": self.value_dim,
+        }
+        return {**body, "snapshot_digest": domain_digest("vld.aks-snapshot.v1", body)}
+
+    @classmethod
+    def from_snapshot(cls, data: Mapping[str, Any], *, expected_head: str | None = None) -> AffineKernelAttentionGround:
+        if not isinstance(data, Mapping) or data.get("schema") != "vld.aks-snapshot.v1":
+            raise ModelOrbitError("Invalid AffineKernelAttentionGround snapshot schema.")
+        body = {k: v for k, v in data.items() if k != "snapshot_digest"}
+        if data.get("snapshot_digest") != domain_digest("vld.aks-snapshot.v1", body):
+            raise ModelOrbitError("AffineKernelAttentionGround snapshot_digest mismatch.")
+        inst = cls(modulus_p=int(data["modulus_p"]), key_dim=int(data["key_dim"]), value_dim=int(data["value_dim"]))
+        if data.get("ground_fingerprint") != inst.ground_fingerprint:
+            raise ModelOrbitError("AffineKernelAttentionGround fingerprint mismatch.")
+        if expected_head is not None and data.get("head_digest") != expected_head:
+            raise ModelOrbitError("Restored AKS snapshot disagrees with trusted expected_head.")
+        s_mat = [[int(v) % inst.modulus_p for v in row] for row in data["state_s"]]
+        z_vec = [int(v) % inst.modulus_p for v in data["state_z"]]
+        if len(s_mat) != inst.key_dim + 1 or any(len(r) != inst.value_dim for r in s_mat) or len(z_vec) != inst.key_dim + 1:
+            raise ModelOrbitError("Corrupted AKS state tensor dimensions.")
+        inst.prefix_length = int(data["prefix_length"])
+        inst.head_digest = str(data["head_digest"])
+        inst._state_s = s_mat
+        inst._state_z = z_vec
+        return inst
+
+
+def direct_affine_kernel_oracle(
+    modulus_p: int,
+    keys: Sequence[Sequence[int]],
+    values: Sequence[Sequence[int]],
+    query: Sequence[int],
+    *,
+    normalized: bool = True,
+) -> tuple[int, ...]:
+    """Independent `O(T * d_k * d_v)` per-token replay oracle for `AffineKernelAttentionGround`."""
+    if len(keys) != len(values):
+        raise ModelOrbitError("keys and values length mismatch.")
+    d_v = len(values[0]) if values else 0
+    num = [0] * d_v
+    mass = 0
+    for k_t, v_t in zip(keys, values):
+        w_t = (1 + sum((q_j % modulus_p) * (k_j % modulus_p) for q_j, k_j in zip(query, k_t))) % modulus_p
+        mass = (mass + w_t) % modulus_p
+        for j in range(d_v):
+            num[j] = (num[j] + w_t * (v_t[j] % modulus_p)) % modulus_p
+    if not normalized:
+        return tuple(num)
+    if mass == 0:
+        raise ModelOrbitError("Zero kernel mass denominator in direct_affine_kernel_oracle.")
+    inv_m = pow(mass, -1, modulus_p)
+    return tuple((x * inv_m) % modulus_p for x in num)
+
+
+def verify_softmax_insufficiency_witness() -> dict[str, Any]:
+    r"""Constructive proof (`AKS-001`) that identical `(S_T, z_T)` cannot authorize exact softmax attention."""
+    g_a = AffineKernelAttentionGround(modulus_p=97, key_dim=1, value_dim=1)
+    g_b = AffineKernelAttentionGround(modulus_p=97, key_dim=1, value_dim=1)
+    keys = ([0], [1], [2])
+    vals_a = ([2], [2], [2])
+    vals_b = ([3], [0], [3])
+    for k, va, vb in zip(keys, vals_a, vals_b):
+        g_a.admit_token(k, va)
+        g_b.admit_token(k, vb)
+
+    assert g_a._state_s == g_b._state_s and g_a._state_z == g_b._state_z
+    # Yet under exponential softmax at q = 1, scores = [0, 1, 2]:
+    weights = [math.exp(0.0), math.exp(1.0), math.exp(2.0)]
+    denom = sum(weights)
+    softmax_a = sum(w * va[0] for w, va in zip(weights, vals_a)) / denom
+    softmax_b = sum(w * vb[0] for w, vb in zip(weights, vals_b)) / denom
+    return {
+        "distinct_lineage_heads": g_a.head_digest != g_b.head_digest,
+        "identical_affine_sufficient_state": (g_a._state_s == g_b._state_s and g_a._state_z == g_b._state_z),
+        "softmax_discrepancy": abs(softmax_a - softmax_b),
+        "softmax_output_a": softmax_a,
+        "softmax_output_b": softmax_b,
+    }
+
+
 __all__ = [
+    "AffineKernelAttentionGround",
+    "AffineKernelQueryReceipt",
     "AutoregressiveModelRunner",
     "GenerationResult",
     "LayerKVPage",
     "ModelOrbitCheckpoint",
     "ModelOrbitError",
     "PagedKVCacheGround",
+    "direct_affine_kernel_oracle",
+    "verify_softmax_insufficiency_witness",
 ]

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+import math
 import struct
 from typing import Any, Callable, Mapping, Sequence
 
@@ -373,6 +374,76 @@ def _wasm_rem_s(a_s: int, b_s: int) -> int:
     return a_s - q * b_s
 
 
+_WASM_VALTYPES = (0x7F, 0x7E, 0x7D, 0x7C)  # i32, i64, f32, f64
+_CANON_NAN32 = 0x7FC00000
+_CANON_NAN64 = 0x7FF8000000000000
+
+
+def _f32_to_bits(val: float) -> int:
+    if math.isnan(val):
+        return _CANON_NAN32
+    try:
+        return struct.unpack("<I", struct.pack("<f", float(val)))[0]
+    except OverflowError:
+        return 0x7F800000 if val > 0 else 0xFF800000
+
+
+def _bits_to_f32(bits: int) -> float:
+    return struct.unpack("<f", struct.pack("<I", bits & 0xFFFFFFFF))[0]
+
+
+def _f64_to_bits(val: float) -> int:
+    if math.isnan(val):
+        return _CANON_NAN64
+    return struct.unpack("<Q", struct.pack("<d", float(val)))[0]
+
+
+def _bits_to_f64(bits: int) -> float:
+    return struct.unpack("<d", struct.pack("<Q", bits & 0xFFFFFFFFFFFFFFFF))[0]
+
+
+def _wasm_fmin(a: float, b: float) -> float:
+    if math.isnan(a) or math.isnan(b):
+        return float("nan")
+    if a == 0.0 and b == 0.0:
+        return -0.0 if (math.copysign(1.0, a) < 0.0 or math.copysign(1.0, b) < 0.0) else 0.0
+    return a if a < b else b
+
+
+def _wasm_fmax(a: float, b: float) -> float:
+    if math.isnan(a) or math.isnan(b):
+        return float("nan")
+    if a == 0.0 and b == 0.0:
+        return 0.0 if (math.copysign(1.0, a) > 0.0 or math.copysign(1.0, b) > 0.0) else -0.0
+    return a if a > b else b
+
+
+def _wasm_fnearest(a: float) -> float:
+    if not math.isfinite(a) or a == 0.0:
+        return a
+    r = float(round(a))
+    return math.copysign(0.0, a) if r == 0.0 else r
+
+
+def _wasm_trunc_to_int(val: float, lo_inclusive: int, hi_inclusive: int) -> int:
+    if not math.isfinite(val):
+        raise LiftingError("WASM trap: invalid float-to-int conversion (NaN or Inf).")
+    t = math.trunc(val)
+    if t < lo_inclusive or t > hi_inclusive:
+        raise LiftingError("WASM trap: integer overflow in float-to-int conversion.")
+    return t
+
+
+def _clz(u: int, width: int) -> int:
+    v = u & ((1 << width) - 1)
+    return width if v == 0 else (width - v.bit_length())
+
+
+def _ctz(u: int, width: int) -> int:
+    v = u & ((1 << width) - 1)
+    return width if v == 0 else ((v & -v).bit_length() - 1)
+
+
 @dataclass(frozen=True, slots=True)
 class WasmDecodedInstr:
     opcode: int
@@ -390,6 +461,13 @@ class WasmFunctionBody:
 
 
 @dataclass(frozen=True, slots=True)
+class WasmGlobalDecl:
+    val_type: int
+    mutable: bool
+    init_bits: int
+
+
+@dataclass(frozen=True, slots=True)
 class LiftedWasmModule:
     """Validated binary WebAssembly 1.0 module lifted into Virtual Layer Ground form."""
 
@@ -398,6 +476,15 @@ class LiftedWasmModule:
     exports: Mapping[str, tuple[int, int]]  # name -> (kind, index)
     min_memory_pages: int
     data_segments: tuple[tuple[int, bytes], ...]
+    func_types: tuple[tuple[tuple[int, ...], tuple[int, ...]], ...] = ()
+    func_type_indices: tuple[int, ...] = ()
+    has_memory: bool = True
+    declared_max_memory_pages: int | None = None
+    has_table: bool = False
+    min_table_size: int = 0
+    declared_max_table_size: int | None = None
+    element_segments: tuple[tuple[int, tuple[int, ...]], ...] = ()
+    globals: tuple[WasmGlobalDecl, ...] = ()
 
 
 def _parse_wasm_expr(code: bytes) -> tuple[WasmDecodedInstr, ...]:
@@ -413,7 +500,7 @@ def _parse_wasm_expr(code: bytes) -> tuple[WasmDecodedInstr, ...]:
             if pos >= len(code):
                 raise LiftingError("Truncated WASM blocktype.")
             bt = code[pos]
-            if bt not in (0x40, 0x7F, 0x7E):
+            if bt not in (0x40, *_WASM_VALTYPES):
                 raise LiftingError(f"Unsupported WASM blocktype {bt:#04x}.")
             pos += 1
             raw_ins.append([op, (bt,), None, None])
@@ -449,26 +536,43 @@ def _parse_wasm_expr(code: bytes) -> tuple[WasmDecodedInstr, ...]:
                 tv, pos = _read_u_leb128(code, pos, 32)
                 targets.append(tv)
             raw_ins.append([op, tuple(targets), None, None])
-        elif op in (0x0C, 0x0D, 0x10, 0x20, 0x21, 0x22):  # br, br_if, call, local.get/set/tee
+        elif op == 0x11:  # call_indirect
+            type_idx, pos = _read_u_leb128(code, pos, 32)
+            if pos >= len(code) or code[pos] != 0x00:
+                raise LiftingError("WASM 1.0 call_indirect requires reserved table index 0x00.")
+            pos += 1
+            raw_ins.append([op, (type_idx, 0), None, None])
+        elif op in (0x0C, 0x0D, 0x10, 0x20, 0x21, 0x22, 0x23, 0x24):  # br, br_if, call, local.*, global.*
             v, pos = _read_u_leb128(code, pos, 32)
             raw_ins.append([op, (v,), None, None])
-        elif op in (0x28, 0x36):  # i32.load, i32.store
+        elif 0x28 <= op <= 0x3E:  # linear memory loads and stores
             align, pos = _read_u_leb128(code, pos, 32)
             offset, pos = _read_u_leb128(code, pos, 32)
             raw_ins.append([op, (align, offset), None, None])
+        elif op in (0x3F, 0x40):  # memory.size, memory.grow
+            if pos >= len(code) or code[pos] != 0x00:
+                raise LiftingError("WASM 1.0 memory.size/grow requires reserved memory index 0x00.")
+            pos += 1
+            raw_ins.append([op, (0,), None, None])
         elif op == 0x41:  # i32.const
             v, pos = _read_s_leb128(code, pos, 32)
             raw_ins.append([op, (v & 0xFFFFFFFF,), None, None])
         elif op == 0x42:  # i64.const
             v, pos = _read_s_leb128(code, pos, 64)
             raw_ins.append([op, (v & 0xFFFFFFFFFFFFFFFF,), None, None])
-        elif op in (
-            0x00, 0x01, 0x0F, 0x1A, 0x1B,
-            0x45, 0x46, 0x47, 0x48, 0x49, 0x4A, 0x4B, 0x4C, 0x4D, 0x4E, 0x4F,
-            0x50, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5A,
-            0x6A, 0x6B, 0x6C, 0x6D, 0x6E, 0x6F, 0x70, 0x71, 0x72, 0x73, 0x74, 0x75, 0x76,
-            0x7C, 0x7D, 0x7E, 0x7F, 0x80, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88,
-        ):
+        elif op == 0x43:  # f32.const
+            if pos + 4 > len(code):
+                raise LiftingError("Truncated WASM f32.const immediate.")
+            (bits32,) = struct.unpack("<I", code[pos : pos + 4])
+            pos += 4
+            raw_ins.append([op, (bits32,), None, None])
+        elif op == 0x44:  # f64.const
+            if pos + 8 > len(code):
+                raise LiftingError("Truncated WASM f64.const immediate.")
+            (bits64,) = struct.unpack("<Q", code[pos : pos + 8])
+            pos += 8
+            raw_ins.append([op, (bits64,), None, None])
+        elif op in (0x00, 0x01, 0x0F, 0x1A, 0x1B) or (0x45 <= op <= 0xBF):
             raw_ins.append([op, (), None, None])
         else:
             raise LiftingError(f"Unsupported WASM opcode {op:#04x}.")
@@ -478,11 +582,40 @@ def _parse_wasm_expr(code: bytes) -> tuple[WasmDecodedInstr, ...]:
     return tuple(WasmDecodedInstr(r[0], r[1], r[2], r[3]) for r in raw_ins)
 
 
+def _read_const_init_expr(buf: bytes, pos: int, sec_end: int, expected_type: int) -> tuple[int, int]:
+    if pos >= sec_end:
+        raise LiftingError("Truncated WASM constant initializer expression.")
+    op = buf[pos]
+    pos += 1
+    if op == 0x41 and expected_type == 0x7F:
+        val, pos = _read_s_leb128(buf, pos, 32, sec_end)
+        bits = val & 0xFFFFFFFF
+    elif op == 0x42 and expected_type == 0x7E:
+        val, pos = _read_s_leb128(buf, pos, 64, sec_end)
+        bits = val & 0xFFFFFFFFFFFFFFFF
+    elif op == 0x43 and expected_type == 0x7D:
+        if pos + 4 > sec_end:
+            raise LiftingError("Truncated WASM f32.const in initializer.")
+        (bits,) = struct.unpack("<I", buf[pos : pos + 4])
+        pos += 4
+    elif op == 0x44 and expected_type == 0x7C:
+        if pos + 8 > sec_end:
+            raise LiftingError("Truncated WASM f64.const in initializer.")
+        (bits,) = struct.unpack("<Q", buf[pos : pos + 8])
+        pos += 8
+    else:
+        raise LiftingError(f"Unsupported or type-mismatched WASM constant initializer opcode {op:#04x}.")
+    if pos >= sec_end or buf[pos] != 0x0B:
+        raise LiftingError("Expected 0x0B end after WASM constant initializer expression.")
+    return bits, pos + 1
+
+
 def lift_wasm_module(
     raw_wasm: bytes,
     *,
     max_memory_pages: int = 256,
     max_locals_per_func: int = 4096,
+    max_table_size: int = 65_536,
 ) -> LiftedWasmModule:
     """Parse and validate a binary WebAssembly 1.0 module into a `LiftedWasmModule`."""
     if not isinstance(raw_wasm, bytes) or len(raw_wasm) < 8 or raw_wasm[:8] != WASM_MAGIC:
@@ -492,7 +625,13 @@ def lift_wasm_module(
     func_types: list[tuple[tuple[int, ...], tuple[int, ...]]] = []
     func_type_indices: list[int] = []
     min_mem_pages = 0
+    declared_max_mem_pages: int | None = None
     has_memory = False
+    has_table = False
+    min_tbl_size = 0
+    declared_max_tbl_size: int | None = None
+    elem_segs: list[tuple[int, tuple[int, ...]]] = []
+    globals_list: list[WasmGlobalDecl] = []
     exports: dict[str, tuple[int, int]] = {}
     code_bodies: list[tuple[tuple[int, ...], tuple[WasmDecodedInstr, ...]]] = []
     data_segs: list[tuple[int, bytes]] = []
@@ -528,8 +667,8 @@ def lift_wasm_module(
                     raise LiftingError("Truncated WASM result types.")
                 results = tuple(raw_wasm[pos : pos + r_cnt])
                 pos += r_cnt
-                if any(vt not in (0x7F, 0x7E) for vt in (*params, *results)):
-                    raise LiftingError("Only i32/i64 WASM value types are supported.")
+                if any(vt not in _WASM_VALTYPES for vt in (*params, *results)):
+                    raise LiftingError("Unsupported WASM value type in Type section.")
                 func_types.append((params, results))
         elif sec_id == 3:  # Function section
             cnt, pos = _read_u_leb128(raw_wasm, pos, 32, sec_end)
@@ -538,6 +677,27 @@ def lift_wasm_module(
                 if t_idx >= len(func_types):
                     raise LiftingError("Function references out-of-bounds type index.")
                 func_type_indices.append(t_idx)
+        elif sec_id == 4:  # Table section
+            cnt, pos = _read_u_leb128(raw_wasm, pos, 32, sec_end)
+            if cnt > 1:
+                raise LiftingError("WASM 1.0 allows at most 1 table.")
+            if cnt == 1:
+                if pos + 2 > sec_end or raw_wasm[pos] != 0x70:
+                    raise LiftingError("WASM 1.0 Table section requires 0x70 funcref element type.")
+                pos += 1
+                lim_flag = raw_wasm[pos]
+                if lim_flag not in (0, 1):
+                    raise LiftingError("Invalid WASM table limit flag.")
+                pos += 1
+                min_tbl_size, pos = _read_u_leb128(raw_wasm, pos, 32, sec_end)
+                if min_tbl_size > max_table_size:
+                    raise LiftingError(f"WASM min_table_size {min_tbl_size} exceeds max_table_size ({max_table_size}).")
+                if lim_flag == 1:
+                    max_t, pos = _read_u_leb128(raw_wasm, pos, 32, sec_end)
+                    if max_t < min_tbl_size:
+                        raise LiftingError("WASM table max size < min size.")
+                    declared_max_tbl_size = max_t
+                has_table = True
         elif sec_id == 5:  # Memory section
             cnt, pos = _read_u_leb128(raw_wasm, pos, 32, sec_end)
             if cnt > 1:
@@ -556,7 +716,20 @@ def lift_wasm_module(
                     max_p, pos = _read_u_leb128(raw_wasm, pos, 32, sec_end)
                     if max_p < min_mem_pages:
                         raise LiftingError("WASM memory max pages < min pages.")
+                    declared_max_mem_pages = max_p
                 has_memory = True
+        elif sec_id == 6:  # Global section
+            cnt, pos = _read_u_leb128(raw_wasm, pos, 32, sec_end)
+            for _ in range(cnt):
+                if pos + 2 > sec_end:
+                    raise LiftingError("Truncated WASM global declaration.")
+                g_type = raw_wasm[pos]
+                g_mut = raw_wasm[pos + 1]
+                pos += 2
+                if g_type not in _WASM_VALTYPES or g_mut not in (0, 1):
+                    raise LiftingError("Invalid WASM global value type or mutability flag.")
+                init_bits, pos = _read_const_init_expr(raw_wasm, pos, sec_end, g_type)
+                globals_list.append(WasmGlobalDecl(val_type=g_type, mutable=(g_mut == 1), init_bits=init_bits))
         elif sec_id == 7:  # Export section
             cnt, pos = _read_u_leb128(raw_wasm, pos, 32, sec_end)
             for _ in range(cnt):
@@ -574,6 +747,24 @@ def lift_wasm_module(
                 if name in exports:
                     raise LiftingError(f"Duplicate WASM export {name!r}.")
                 exports[name] = (kind, e_idx)
+        elif sec_id == 9:  # Element section
+            cnt, pos = _read_u_leb128(raw_wasm, pos, 32, sec_end)
+            for _ in range(cnt):
+                if not has_table:
+                    raise LiftingError("WASM Element section requires a declared Table section.")
+                tbl_idx, pos = _read_u_leb128(raw_wasm, pos, 32, sec_end)
+                if tbl_idx != 0:
+                    raise LiftingError("WASM 1.0 Element segment requires table index 0.")
+                e_off_bits, pos = _read_const_init_expr(raw_wasm, pos, sec_end, 0x7F)
+                e_off = _to_s32(e_off_bits)
+                f_cnt, pos = _read_u_leb128(raw_wasm, pos, 32, sec_end)
+                if f_cnt > max_table_size:
+                    raise LiftingError("WASM Element segment exceeds max_table_size.")
+                fn_indices: list[int] = []
+                for _ in range(f_cnt):
+                    f_i, pos = _read_u_leb128(raw_wasm, pos, 32, sec_end)
+                    fn_indices.append(f_i)
+                elem_segs.append((e_off, tuple(fn_indices)))
         elif sec_id == 10:  # Code section
             cnt, pos = _read_u_leb128(raw_wasm, pos, 32, sec_end)
             for _ in range(cnt):
@@ -588,7 +779,7 @@ def lift_wasm_module(
                     if pos >= b_end:
                         raise LiftingError("Truncated WASM local declaration.")
                     l_type = raw_wasm[pos]
-                    if l_type not in (0x7F, 0x7E):
+                    if l_type not in _WASM_VALTYPES:
                         raise LiftingError(f"Unsupported WASM local value type {l_type:#04x}.")
                     pos += 1
                     if len(locals_flat) + l_cnt > max_locals_per_func:
@@ -637,26 +828,48 @@ def lift_wasm_module(
     for kind, e_idx in exports.values():
         if kind == 0 and e_idx >= len(funcs):
             raise LiftingError("WASM function export references out-of-bounds function index.")
+        if kind == 1 and (not has_table or e_idx != 0):
+            raise LiftingError("WASM table export references undeclared table.")
+        if kind == 2 and (not has_memory or e_idx != 0):
+            raise LiftingError("WASM memory export references undeclared memory.")
+        if kind == 3 and e_idx >= len(globals_list):
+            raise LiftingError("WASM global export references out-of-bounds global index.")
+    for e_off, fn_indices in elem_segs:
+        if e_off < 0 or e_off + len(fn_indices) > min_tbl_size:
+            raise LiftingError("WASM Element segment exceeds table bounds.")
+        if any(f_i >= len(funcs) for f_i in fn_indices):
+            raise LiftingError("WASM Element segment references out-of-bounds function index.")
+
     for fn in funcs:
         total_locs = len(fn.param_types) + len(fn.local_types)
         for ins in fn.instructions:
             if ins.opcode in (0x20, 0x21, 0x22) and ins.imm[0] >= total_locs:
                 raise LiftingError("WASM local index out of bounds.")
+            if ins.opcode in (0x23, 0x24):
+                if ins.imm[0] >= len(globals_list):
+                    raise LiftingError("WASM global index out of bounds.")
+                if ins.opcode == 0x24 and not globals_list[ins.imm[0]].mutable:
+                    raise LiftingError("WASM global.set targets immutable global.")
             if ins.opcode == 0x10 and ins.imm[0] >= len(funcs):
                 raise LiftingError("WASM call references out-of-bounds function index.")
-            if ins.opcode in (0x28, 0x36) and not has_memory:
+            if ins.opcode == 0x11:
+                if not has_table:
+                    raise LiftingError("WASM call_indirect requires a declared Table section.")
+                if ins.imm[0] >= len(func_types):
+                    raise LiftingError("WASM call_indirect references out-of-bounds type index.")
+            if (0x28 <= ins.opcode <= 0x40) and not has_memory:
                 raise LiftingError("WASM memory instruction requires a declared Memory section.")
 
     src_sha = hashlib.sha256(raw_wasm).hexdigest()
     entry_export = next((k for k, (kind, _) in sorted(exports.items()) if kind == 0), "<none>")
     spec = VirtualGroundSpec(
         ground_id=f"vld.wasm.{src_sha[:16]}",
-        version="1.0.0",
+        version="1.1.0",
         language="wasm.v1",
-        state_domain="WasmStackAndLinearMemory",
-        transitions=("invoke_export", "locate", "transform"),
-        invariants=("structured_control_flow", "bounded_linear_memory"),
-        observers=("return_values", "linear_memory"),
+        state_domain="WasmStackTableGlobalsAndLinearMemory",
+        transitions=("invoke_export", "locate", "transform", "memory_grow", "call_indirect"),
+        invariants=("structured_control_flow", "bounded_linear_memory", "checked_call_indirect"),
+        observers=("return_values", "linear_memory", "globals"),
     )
     ground = LiftedProcessGround(
         format_kind="wasm",
@@ -672,36 +885,89 @@ def lift_wasm_module(
         exports=exports,
         min_memory_pages=min_mem_pages,
         data_segments=tuple(data_segs),
+        func_types=tuple(func_types),
+        func_type_indices=tuple(func_type_indices),
+        has_memory=has_memory,
+        declared_max_memory_pages=declared_max_mem_pages,
+        has_table=has_table,
+        min_table_size=min_tbl_size,
+        declared_max_table_size=declared_max_tbl_size,
+        element_segments=tuple(elem_segs),
+        globals=tuple(globals_list),
     )
 
 
 class WasmRealizer:
-    """Deterministic stack + linear-memory realizer for `LiftedWasmModule`."""
+    """Deterministic stack + table + globals + linear-memory realizer for `LiftedWasmModule`."""
 
     def __init__(self, module: LiftedWasmModule, *, max_fuel: int = 200_000, max_memory_pages: int = 256) -> None:
         if module.min_memory_pages > max_memory_pages:
             raise LiftingError(f"Module min_memory_pages {module.min_memory_pages} exceeds {max_memory_pages}.")
         self.module = module
         self.max_fuel = max_fuel
-        self.memory = bytearray(max(1, module.min_memory_pages) * 65_536)
+        self.max_memory_pages = (
+            min(max_memory_pages, module.declared_max_memory_pages)
+            if module.declared_max_memory_pages is not None
+            else max_memory_pages
+        )
+        init_pages = module.min_memory_pages if module.has_memory else 0
+        self.memory = bytearray(init_pages * 65_536)
         for off, seg in module.data_segments:
             if off < 0 or off + len(seg) > len(self.memory):
                 raise LiftingError("WASM data segment exceeds linear memory bounds.")
             self.memory[off : off + len(seg)] = seg
+        self.table: list[int | None] = [None] * (module.min_table_size if module.has_table else 0)
+        for e_off, fn_indices in module.element_segments:
+            if e_off < 0 or e_off + len(fn_indices) > len(self.table):
+                raise LiftingError("WASM element segment exceeds table bounds.")
+            for k, f_i in enumerate(fn_indices):
+                self.table[e_off + k] = f_i
+        self.globals: list[int] = [g.init_bits for g in module.globals]
 
-    def invoke(self, export_name: str, args: Sequence[int] = ()) -> tuple[int, ...]:
+    @staticmethod
+    def _encode_arg(val: int | float, val_type: int) -> int:
+        if isinstance(val, bool):
+            raise LiftingError("Boolean argument rejected in WasmRealizer.invoke.")
+        if val_type == 0x7F:
+            return int(val) & 0xFFFFFFFF
+        if val_type == 0x7E:
+            return int(val) & 0xFFFFFFFFFFFFFFFF
+        if val_type == 0x7D:
+            return _f32_to_bits(float(val))
+        if val_type == 0x7C:
+            return _f64_to_bits(float(val))
+        raise LiftingError(f"Unsupported WASM parameter type {val_type:#04x}.")
+
+    @staticmethod
+    def _decode_result(bits: int, val_type: int) -> int | float:
+        if val_type == 0x7F:
+            return bits & 0xFFFFFFFF
+        if val_type == 0x7E:
+            return bits & 0xFFFFFFFFFFFFFFFF
+        if val_type == 0x7D:
+            return _bits_to_f32(bits)
+        if val_type == 0x7C:
+            return _bits_to_f64(bits)
+        raise LiftingError(f"Unsupported WASM result type {val_type:#04x}.")
+
+    def invoke(self, export_name: str, args: Sequence[int | float] = ()) -> tuple[Any, ...]:
         exp = self.module.exports.get(export_name)
         if exp is None or exp[0] != 0:
             raise LiftingError(f"Exported WASM function {export_name!r} not found.")
-        return self._call_func(exp[1], args, fuel_budget=[self.max_fuel])
-
-    def _call_func(self, fn_idx: int, args: Sequence[int], *, fuel_budget: list[int]) -> tuple[int, ...]:
-        fn = self.module.functions[fn_idx]
+        fn = self.module.functions[exp[1]]
         if len(args) != len(fn.param_types):
             raise LiftingError(f"Expected {len(fn.param_types)} WASM args, got {len(args)}.")
+        raw_args = [self._encode_arg(v, pt) for v, pt in zip(args, fn.param_types)]
+        raw_rets = self._call_raw(exp[1], raw_args, fuel_budget=[self.max_fuel])
+        return tuple(self._decode_result(b, rt) for b, rt in zip(raw_rets, fn.result_types))
+
+    def _call_raw(self, fn_idx: int, raw_args: Sequence[int], *, fuel_budget: list[int]) -> tuple[int, ...]:
+        fn = self.module.functions[fn_idx]
+        if len(raw_args) != len(fn.param_types):
+            raise LiftingError(f"Expected {len(fn.param_types)} WASM args, got {len(raw_args)}.")
         locals_arr = [
-            (int(v) & (0xFFFFFFFF if pt == 0x7F else 0xFFFFFFFFFFFFFFFF))
-            for v, pt in zip(args, fn.param_types)
+            (v & (0xFFFFFFFF if pt in (0x7F, 0x7D) else 0xFFFFFFFFFFFFFFFF))
+            for v, pt in zip(raw_args, fn.param_types)
         ] + [0] * len(fn.local_types)
 
         stack: list[int] = []
@@ -712,12 +978,21 @@ class WasmRealizer:
         M32 = 0xFFFFFFFF
         M64 = 0xFFFFFFFFFFFFFFFF
         MIN_S32 = -(1 << 31)
+        MAX_S32 = (1 << 31) - 1
         MIN_S64 = -(1 << 63)
+        MAX_S64 = (1 << 63) - 1
 
         def _pop() -> int:
             if not stack:
                 raise LiftingError("WASM operand stack underflow.")
             return stack.pop()
+
+        def _check_ea(offset: int, width: int) -> int:
+            base_u32 = _pop() & M32
+            ea = base_u32 + offset
+            if ea + width > len(self.memory):
+                raise LiftingError("WASM out-of-bounds linear memory access.")
+            return ea
 
         def _execute_branch(depth: int) -> int | None:
             if depth > len(labels):
@@ -760,7 +1035,7 @@ class WasmRealizer:
                 labels.append((op, pc + 1, ins.end_pc, arity, len(stack)))
                 pc += 1
             elif op == 0x04:  # if
-                cond = _pop()
+                cond = _pop() & M32
                 bt = ins.imm[0]
                 arity = 0 if bt == 0x40 else 1
                 assert ins.end_pc is not None
@@ -772,7 +1047,7 @@ class WasmRealizer:
                 else:
                     labels.pop()
                     pc = ins.end_pc + 1
-            elif op == 0x05:  # else (reached from end of true-branch -> unwind to block result & jump past end!)
+            elif op == 0x05:  # else
                 assert ins.end_pc is not None
                 _, _, _, arity, base_h = labels.pop()
                 kept = stack[-arity:] if arity > 0 else []
@@ -790,7 +1065,7 @@ class WasmRealizer:
                     break
             elif op in (0x0C, 0x0D):  # br, br_if
                 depth = ins.imm[0]
-                if op == 0x0D and _pop() == 0:
+                if op == 0x0D and (_pop() & M32) == 0:
                     pc += 1
                     continue
                 next_pc = _execute_branch(depth)
@@ -816,14 +1091,35 @@ class WasmRealizer:
                 call_args = stack[-p_len:] if p_len > 0 else []
                 if p_len > 0:
                     del stack[-p_len:]
-                rets = self._call_func(callee_idx, call_args, fuel_budget=fuel_budget)
+                rets = self._call_raw(callee_idx, call_args, fuel_budget=fuel_budget)
+                stack.extend(rets)
+                pc += 1
+            elif op == 0x11:  # call_indirect
+                elem_idx = _pop() & M32
+                if elem_idx >= len(self.table):
+                    raise LiftingError("WASM trap: undefined table element (out of bounds).")
+                callee_opt = self.table[elem_idx]
+                if callee_opt is None:
+                    raise LiftingError("WASM trap: uninitialized null table element.")
+                expected_sig = self.module.func_types[ins.imm[0]]
+                actual_sig = self.module.func_types[self.module.func_type_indices[callee_opt]]
+                if actual_sig != expected_sig:
+                    raise LiftingError("WASM trap: indirect call type signature mismatch.")
+                callee = self.module.functions[callee_opt]
+                p_len = len(callee.param_types)
+                if len(stack) < p_len:
+                    raise LiftingError("WASM operand stack underflow on call_indirect.")
+                call_args = stack[-p_len:] if p_len > 0 else []
+                if p_len > 0:
+                    del stack[-p_len:]
+                rets = self._call_raw(callee_opt, call_args, fuel_budget=fuel_budget)
                 stack.extend(rets)
                 pc += 1
             elif op == 0x1A:  # drop
                 _pop()
                 pc += 1
             elif op == 0x1B:  # select
-                c = _pop()
+                c = _pop() & M32
                 v2 = _pop()
                 v1 = _pop()
                 stack.append(v1 if c != 0 else v2)
@@ -839,22 +1135,99 @@ class WasmRealizer:
                     raise LiftingError("WASM stack underflow on local.tee.")
                 locals_arr[ins.imm[0]] = stack[-1]
                 pc += 1
-            elif op == 0x28:  # i32.load (WASM 1.0 spec §4.4.7: effective address in Z_>=0 WITHOUT mod 2^32 wrap!)
-                base_u32 = _pop() & M32
-                ea = base_u32 + ins.imm[1]
-                if ea + 4 > len(self.memory):
-                    raise LiftingError("WASM out-of-bounds i32.load.")
+            elif op == 0x23:  # global.get
+                stack.append(self.globals[ins.imm[0]])
+                pc += 1
+            elif op == 0x24:  # global.set
+                self.globals[ins.imm[0]] = _pop()
+                pc += 1
+            elif op in (0x28, 0x2A):  # i32.load, f32.load
+                ea = _check_ea(ins.imm[1], 4)
                 stack.append(struct.unpack("<I", self.memory[ea : ea + 4])[0])
                 pc += 1
-            elif op == 0x36:  # i32.store (WASM 1.0 spec §4.4.7: effective address in Z_>=0 WITHOUT mod 2^32 wrap!)
+            elif op in (0x29, 0x2B):  # i64.load, f64.load
+                ea = _check_ea(ins.imm[1], 8)
+                stack.append(struct.unpack("<Q", self.memory[ea : ea + 8])[0])
+                pc += 1
+            elif op == 0x2C:  # i32.load8_s
+                ea = _check_ea(ins.imm[1], 1)
+                stack.append(struct.unpack("<b", self.memory[ea : ea + 1])[0] & M32)
+                pc += 1
+            elif op == 0x2D:  # i32.load8_u
+                ea = _check_ea(ins.imm[1], 1)
+                stack.append(self.memory[ea])
+                pc += 1
+            elif op == 0x2E:  # i32.load16_s
+                ea = _check_ea(ins.imm[1], 2)
+                stack.append(struct.unpack("<h", self.memory[ea : ea + 2])[0] & M32)
+                pc += 1
+            elif op == 0x2F:  # i32.load16_u
+                ea = _check_ea(ins.imm[1], 2)
+                stack.append(struct.unpack("<H", self.memory[ea : ea + 2])[0])
+                pc += 1
+            elif op == 0x30:  # i64.load8_s
+                ea = _check_ea(ins.imm[1], 1)
+                stack.append(struct.unpack("<b", self.memory[ea : ea + 1])[0] & M64)
+                pc += 1
+            elif op == 0x31:  # i64.load8_u
+                ea = _check_ea(ins.imm[1], 1)
+                stack.append(self.memory[ea])
+                pc += 1
+            elif op == 0x32:  # i64.load16_s
+                ea = _check_ea(ins.imm[1], 2)
+                stack.append(struct.unpack("<h", self.memory[ea : ea + 2])[0] & M64)
+                pc += 1
+            elif op == 0x33:  # i64.load16_u
+                ea = _check_ea(ins.imm[1], 2)
+                stack.append(struct.unpack("<H", self.memory[ea : ea + 2])[0])
+                pc += 1
+            elif op == 0x34:  # i64.load32_s
+                ea = _check_ea(ins.imm[1], 4)
+                stack.append(struct.unpack("<i", self.memory[ea : ea + 4])[0] & M64)
+                pc += 1
+            elif op == 0x35:  # i64.load32_u
+                ea = _check_ea(ins.imm[1], 4)
+                stack.append(struct.unpack("<I", self.memory[ea : ea + 4])[0])
+                pc += 1
+            elif op in (0x36, 0x38):  # i32.store, f32.store
                 val = _pop() & M32
-                base_u32 = _pop() & M32
-                ea = base_u32 + ins.imm[1]
-                if ea + 4 > len(self.memory):
-                    raise LiftingError("WASM out-of-bounds i32.store.")
+                ea = _check_ea(ins.imm[1], 4)
                 self.memory[ea : ea + 4] = struct.pack("<I", val)
                 pc += 1
-            elif op in (0x41, 0x42):  # i32.const, i64.const
+            elif op in (0x37, 0x39):  # i64.store, f64.store
+                val = _pop() & M64
+                ea = _check_ea(ins.imm[1], 8)
+                self.memory[ea : ea + 8] = struct.pack("<Q", val)
+                pc += 1
+            elif op in (0x3A, 0x3C):  # i32.store8, i64.store8
+                val = _pop() & 0xFF
+                ea = _check_ea(ins.imm[1], 1)
+                self.memory[ea] = val
+                pc += 1
+            elif op in (0x3B, 0x3D):  # i32.store16, i64.store16
+                val = _pop() & 0xFFFF
+                ea = _check_ea(ins.imm[1], 2)
+                self.memory[ea : ea + 2] = struct.pack("<H", val)
+                pc += 1
+            elif op == 0x3E:  # i64.store32
+                val = _pop() & M32
+                ea = _check_ea(ins.imm[1], 4)
+                self.memory[ea : ea + 4] = struct.pack("<I", val)
+                pc += 1
+            elif op == 0x3F:  # memory.size
+                stack.append((len(self.memory) // 65_536) & M32)
+                pc += 1
+            elif op == 0x40:  # memory.grow (WASM 1.0 §4.4.7: returns old page count or -1 on limit failure)
+                delta_pages = _pop() & M32
+                cur_pages = len(self.memory) // 65_536
+                if cur_pages + delta_pages > self.max_memory_pages:
+                    stack.append(M32)  # -1 as i32
+                else:
+                    if delta_pages > 0:
+                        self.memory.extend(bytes(delta_pages * 65_536))
+                    stack.append(cur_pages & M32)
+                pc += 1
+            elif op in (0x41, 0x42, 0x43, 0x44):  # i32/i64/f32/f64.const
                 stack.append(ins.imm[0])
                 pc += 1
             elif op == 0x45:  # i32.eqz
@@ -937,6 +1310,34 @@ class WasmRealizer:
                 b, a = _pop() & M64, _pop() & M64
                 stack.append(1 if a >= b else 0)
                 pc += 1
+            elif 0x5B <= op <= 0x66:  # f32/f64 comparisons
+                is_f32 = op <= 0x60
+                b_f = _bits_to_f32(_pop()) if is_f32 else _bits_to_f64(_pop())
+                a_f = _bits_to_f32(_pop()) if is_f32 else _bits_to_f64(_pop())
+                rel = (op - 0x5B) if is_f32 else (op - 0x61)
+                if rel == 0:
+                    res = a_f == b_f
+                elif rel == 1:
+                    res = a_f != b_f
+                elif rel == 2:
+                    res = a_f < b_f
+                elif rel == 3:
+                    res = a_f > b_f
+                elif rel == 4:
+                    res = a_f <= b_f
+                else:
+                    res = a_f >= b_f
+                stack.append(1 if res else 0)
+                pc += 1
+            elif op == 0x67:  # i32.clz
+                stack.append(_clz(_pop(), 32))
+                pc += 1
+            elif op == 0x68:  # i32.ctz
+                stack.append(_ctz(_pop(), 32))
+                pc += 1
+            elif op == 0x69:  # i32.popcnt
+                stack.append((_pop() & M32).bit_count())
+                pc += 1
             elif op == 0x6A:  # i32.add
                 b, a = _pop(), _pop()
                 stack.append((a + b) & M32)
@@ -992,6 +1393,25 @@ class WasmRealizer:
             elif op == 0x76:  # i32.shr_u
                 b, a = _pop(), _pop()
                 stack.append(((a & M32) >> (b & 31)) & M32)
+                pc += 1
+            elif op == 0x77:  # i32.rotl
+                k = _pop() & 31
+                a = _pop() & M32
+                stack.append(((a << k) | (a >> ((32 - k) & 31))) & M32)
+                pc += 1
+            elif op == 0x78:  # i32.rotr
+                k = _pop() & 31
+                a = _pop() & M32
+                stack.append(((a >> k) | (a << ((32 - k) & 31))) & M32)
+                pc += 1
+            elif op == 0x79:  # i64.clz
+                stack.append(_clz(_pop(), 64))
+                pc += 1
+            elif op == 0x7A:  # i64.ctz
+                stack.append(_ctz(_pop(), 64))
+                pc += 1
+            elif op == 0x7B:  # i64.popcnt
+                stack.append((_pop() & M64).bit_count())
                 pc += 1
             elif op == 0x7C:  # i64.add
                 b, a = _pop(), _pop()
@@ -1049,6 +1469,147 @@ class WasmRealizer:
                 b, a = _pop(), _pop()
                 stack.append(((a & M64) >> (b & 63)) & M64)
                 pc += 1
+            elif op == 0x89:  # i64.rotl
+                k = _pop() & 63
+                a = _pop() & M64
+                stack.append(((a << k) | (a >> ((64 - k) & 63))) & M64)
+                pc += 1
+            elif op == 0x8A:  # i64.rotr
+                k = _pop() & 63
+                a = _pop() & M64
+                stack.append(((a >> k) | (a << ((64 - k) & 63))) & M64)
+                pc += 1
+            elif 0x8B <= op <= 0xA6:  # f32 / f64 unary & binary IEEE 754 operations
+                is_f32 = op <= 0x98
+                sub = (op - 0x8B) if is_f32 else (op - 0x99)
+                if sub == 0:  # abs (exact bit mask per WASM 1.0 §4.3.3)
+                    stack.append((_pop() & 0x7FFFFFFF) if is_f32 else (_pop() & 0x7FFFFFFFFFFFFFFF))
+                elif sub == 1:  # neg
+                    stack.append(((_pop() ^ 0x80000000) & M32) if is_f32 else ((_pop() ^ 0x8000000000000000) & M64))
+                elif sub == 13:  # copysign
+                    b_bits = _pop()
+                    a_bits = _pop()
+                    if is_f32:
+                        stack.append((a_bits & 0x7FFFFFFF) | (b_bits & 0x80000000))
+                    else:
+                        stack.append((a_bits & 0x7FFFFFFFFFFFFFFF) | (b_bits & 0x8000000000000000))
+                elif sub <= 6:  # ceil, floor, trunc, nearest, sqrt
+                    a_f = _bits_to_f32(_pop()) if is_f32 else _bits_to_f64(_pop())
+                    if math.isnan(a_f):
+                        out_f = float("nan")
+                    elif sub == 2:  # ceil
+                        out_f = a_f if (not math.isfinite(a_f) or a_f == 0.0) else math.copysign(float(math.ceil(a_f)), a_f if math.ceil(a_f) == 0 else float(math.ceil(a_f)))
+                    elif sub == 3:  # floor
+                        out_f = a_f if (not math.isfinite(a_f) or a_f == 0.0) else math.copysign(float(math.floor(a_f)), a_f if math.floor(a_f) == 0 else float(math.floor(a_f)))
+                    elif sub == 4:  # trunc
+                        out_f = a_f if (not math.isfinite(a_f) or a_f == 0.0) else math.copysign(float(math.trunc(a_f)), a_f)
+                    elif sub == 5:  # nearest
+                        out_f = _wasm_fnearest(a_f)
+                    else:  # sqrt
+                        if a_f == 0.0:
+                            out_f = a_f  # preserves -0.0 -> -0.0 per IEEE 754
+                        elif a_f < 0.0:
+                            out_f = float("nan")
+                        else:
+                            out_f = math.sqrt(a_f)
+                    stack.append(_f32_to_bits(out_f) if is_f32 else _f64_to_bits(out_f))
+                else:  # add, sub, mul, div, min, max
+                    b_f = _bits_to_f32(_pop()) if is_f32 else _bits_to_f64(_pop())
+                    a_f = _bits_to_f32(_pop()) if is_f32 else _bits_to_f64(_pop())
+                    if math.isnan(a_f) or math.isnan(b_f):
+                        out_f = float("nan")
+                    elif sub == 7:
+                        out_f = a_f + b_f
+                    elif sub == 8:
+                        out_f = a_f - b_f
+                    elif sub == 9:
+                        out_f = a_f * b_f
+                    elif sub == 10:  # IEEE 754 float division (x/0 -> ±inf, 0/0 -> nan, inf/inf -> nan)
+                        if b_f == 0.0:
+                            if a_f == 0.0:
+                                out_f = float("nan")
+                            else:
+                                sign = math.copysign(1.0, a_f) * math.copysign(1.0, b_f)
+                                out_f = math.copysign(float("inf"), sign)
+                        elif math.isinf(a_f) and math.isinf(b_f):
+                            out_f = float("nan")
+                        else:
+                            out_f = a_f / b_f
+                    elif sub == 11:
+                        out_f = _wasm_fmin(a_f, b_f)
+                    else:
+                        out_f = _wasm_fmax(a_f, b_f)
+                    stack.append(_f32_to_bits(out_f) if is_f32 else _f64_to_bits(out_f))
+                pc += 1
+            elif op == 0xA7:  # i32.wrap_i64
+                stack.append(_pop() & M32)
+                pc += 1
+            elif op == 0xA8:  # i32.trunc_f32_s
+                stack.append(_wasm_trunc_to_int(_bits_to_f32(_pop()), MIN_S32, MAX_S32) & M32)
+                pc += 1
+            elif op == 0xA9:  # i32.trunc_f32_u
+                stack.append(_wasm_trunc_to_int(_bits_to_f32(_pop()), 0, M32) & M32)
+                pc += 1
+            elif op == 0xAA:  # i32.trunc_f64_s
+                stack.append(_wasm_trunc_to_int(_bits_to_f64(_pop()), MIN_S32, MAX_S32) & M32)
+                pc += 1
+            elif op == 0xAB:  # i32.trunc_f64_u
+                stack.append(_wasm_trunc_to_int(_bits_to_f64(_pop()), 0, M32) & M32)
+                pc += 1
+            elif op == 0xAC:  # i64.extend_i32_s
+                stack.append(_to_s32(_pop()) & M64)
+                pc += 1
+            elif op == 0xAD:  # i64.extend_i32_u
+                stack.append(_pop() & M32)
+                pc += 1
+            elif op == 0xAE:  # i64.trunc_f32_s
+                stack.append(_wasm_trunc_to_int(_bits_to_f32(_pop()), MIN_S64, MAX_S64) & M64)
+                pc += 1
+            elif op == 0xAF:  # i64.trunc_f32_u
+                stack.append(_wasm_trunc_to_int(_bits_to_f32(_pop()), 0, M64) & M64)
+                pc += 1
+            elif op == 0xB0:  # i64.trunc_f64_s
+                stack.append(_wasm_trunc_to_int(_bits_to_f64(_pop()), MIN_S64, MAX_S64) & M64)
+                pc += 1
+            elif op == 0xB1:  # i64.trunc_f64_u
+                stack.append(_wasm_trunc_to_int(_bits_to_f64(_pop()), 0, M64) & M64)
+                pc += 1
+            elif op == 0xB2:  # f32.convert_i32_s
+                stack.append(_f32_to_bits(float(_to_s32(_pop()))))
+                pc += 1
+            elif op == 0xB3:  # f32.convert_i32_u
+                stack.append(_f32_to_bits(float(_pop() & M32)))
+                pc += 1
+            elif op == 0xB4:  # f32.convert_i64_s
+                stack.append(_f32_to_bits(float(_to_s64(_pop()))))
+                pc += 1
+            elif op == 0xB5:  # f32.convert_i64_u
+                stack.append(_f32_to_bits(float(_pop() & M64)))
+                pc += 1
+            elif op == 0xB6:  # f32.demote_f64
+                stack.append(_f32_to_bits(_bits_to_f64(_pop())))
+                pc += 1
+            elif op == 0xB7:  # f64.convert_i32_s
+                stack.append(_f64_to_bits(float(_to_s32(_pop()))))
+                pc += 1
+            elif op == 0xB8:  # f64.convert_i32_u
+                stack.append(_f64_to_bits(float(_pop() & M32)))
+                pc += 1
+            elif op == 0xB9:  # f64.convert_i64_s
+                stack.append(_f64_to_bits(float(_to_s64(_pop()))))
+                pc += 1
+            elif op == 0xBA:  # f64.convert_i64_u
+                stack.append(_f64_to_bits(float(_pop() & M64)))
+                pc += 1
+            elif op == 0xBB:  # f64.promote_f32
+                stack.append(_f64_to_bits(_bits_to_f32(_pop())))
+                pc += 1
+            elif op in (0xBC, 0xBE):  # i32.reinterpret_f32, f32.reinterpret_i32
+                stack.append(_pop() & M32)
+                pc += 1
+            elif op in (0xBD, 0xBF):  # i64.reinterpret_f64, f64.reinterpret_i64
+                stack.append(_pop() & M64)
+                pc += 1
             else:
                 raise LiftingError(f"Unhandled WASM opcode {op:#04x}.")
 
@@ -1056,7 +1617,7 @@ class WasmRealizer:
         if len(stack) < r_len:
             raise LiftingError("WASM stack underflow at function return.")
         return tuple(
-            (v & (M32 if rt == 0x7F else M64))
+            (v & (M32 if rt in (0x7F, 0x7D) else M64))
             for v, rt in zip(stack[-r_len:], fn.result_types)
         ) if r_len > 0 else ()
 
@@ -1105,6 +1666,84 @@ def assemble_wasm_affine_orbit_module() -> bytes:
     body = locals_decl + bytes(ins)
     code_sec = _sec(10, b"\x01" + _encode_u_leb128(len(body)) + body)
     return WASM_MAGIC + type_sec + func_sec + mem_sec + exp_sec + code_sec
+
+
+def assemble_wasm_f32_dot_indirect_module() -> bytes:
+    r"""Assemble a WebAssembly 1.0 module exercising `f32`/`f64`, `memory.grow`, `Table` & `call_indirect`.
+
+    Exports:
+      - `grow_and_size(delta_pages: i32) -> i32`: invokes `memory.grow(delta_pages)` then returns `(prev << 16) | memory.size()`.
+      - `dispatch_dot(op_slot: i32, count: i32, base_a: i32, base_b: i32) -> f32`:
+        Accumulates $\sum_{i=0}^{\text{count}-1} g_{\text{op\_slot}}(A[i], B[i])$ over IEEE `f32` vectors in linear
+        memory via `call_indirect` over table slots `0 -> mul(x, y)` and `1 -> relu_diff(x, y) = max(0, x - y)`.
+    """
+    def _sec(sec_id: int, payload: bytes) -> bytes:
+        return bytes([sec_id]) + _encode_u_leb128(len(payload)) + payload
+
+    # Types:
+    # 0: (f32, f32) -> (f32)
+    # 1: (i32) -> (i32)
+    # 2: (i32, i32, i32, i32) -> (f32)
+    # 3: (i32) -> (i64)  [deliberately distinct signature at table slot 2 to test signature-mismatch trap!]
+    type_sec = _sec(
+        1,
+        b"\x04"
+        b"\x60\x02\x7d\x7d\x01\x7d"
+        b"\x60\x01\x7f\x01\x7f"
+        b"\x60\x04\x7f\x7f\x7f\x7f\x01\x7d"
+        b"\x60\x01\x7f\x01\x7e",
+    )
+    # Functions: 0->type0 (mul), 1->type0 (relu_diff), 2->type1 (grow_and_size), 3->type2 (dispatch_dot), 4->type3 (wrong_sig)
+    func_sec = _sec(3, b"\x05\x00\x00\x01\x02\x03")
+    # Table: 1 funcref table, min=4, max=4 (slot 3 left uninitialized null!)
+    table_sec = _sec(4, b"\x01\x70\x01\x04\x04")
+    # Memory: min=1 page, max=4 pages
+    mem_sec = _sec(5, b"\x01\x01\x01\x04")
+    # Exports: grow_and_size (func 2), dispatch_dot (func 3)
+    exp_payload = (
+        b"\x02"
+        + _encode_u_leb128(len(b"grow_and_size")) + b"grow_and_size\x00\x02"
+        + _encode_u_leb128(len(b"dispatch_dot")) + b"dispatch_dot\x00\x03"
+    )
+    exp_sec = _sec(7, exp_payload)
+    # Element: table 0, offset i32.const 0, [func 0, func 1, func 4] (slot 3 remains null!)
+    elem_sec = _sec(9, b"\x01\x00\x41\x00\x0b\x03\x00\x01\x04")
+
+    # Func 0: f32.mul(local 0, local 1)
+    f0 = b"\x00\x20\x00\x20\x01\x94\x0b"
+    # Func 1: f32.max(0.0, f32.sub(local 0, local 1))
+    f1 = b"\x00\x43\x00\x00\x00\x00\x20\x00\x20\x01\x93\x97\x0b"
+    # Func 2: (memory.grow(local 0) << 16) | (memory.size() & 0xFFFF)
+    # local 1: prev_pages
+    f2_ins = (
+        b"\x20\x00\x40\x00\x21\x01"  # prev = memory.grow(delta)
+        b"\x20\x01\x41\x10\x74"      # prev << 16
+        b"\x3f\x00\x41" + _encode_s_leb128(0xFFFF) + b"\x71\x72\x0b"
+    )
+    f2 = b"\x01\x01\x7f" + f2_ins
+    # Func 3: dispatch_dot(op_slot=0, count=1, base_a=2, base_b=3) -> f32
+    # locals: 4=i (i32), 5=acc (f32)
+    f3_ins = bytearray()
+    f3_ins += b"\x41\x00\x21\x04"                  # i = 0
+    f3_ins += b"\x43\x00\x00\x00\x00\x21\x05"      # acc = 0.0f
+    f3_ins += b"\x02\x40\x03\x40"                  # block $done, loop $lp
+    f3_ins += b"\x20\x04\x20\x01\x4e\x0d\x01"      # if i >= count: br $done
+    # stack for call_indirect(type 0): f32.load(base_a + 4*i), f32.load(base_b + 4*i), op_slot
+    f3_ins += b"\x20\x05"                          # acc
+    f3_ins += b"\x20\x02\x20\x04\x41\x02\x74\x6a\x2a\x02\x00"  # f32.load(base_a + (i<<2))
+    f3_ins += b"\x20\x03\x20\x04\x41\x02\x74\x6a\x2a\x02\x00"  # f32.load(base_b + (i<<2))
+    f3_ins += b"\x20\x00\x11\x00\x00"              # call_indirect type=0 table=0
+    f3_ins += b"\x92\x21\x05"                      # acc = acc + term
+    f3_ins += b"\x20\x04\x41\x01\x6a\x21\x04"      # i = i + 1
+    f3_ins += b"\x0c\x00\x0b\x0b"                  # br $lp; end; end
+    f3_ins += b"\x20\x05\x0b"                      # return acc
+    f3 = b"\x02\x01\x7f\x01\x7d" + bytes(f3_ins)
+    # Func 4: wrong signature (i32) -> (i64)
+    f4 = b"\x00\x20\x00\xad\x0b"
+
+    bodies = b"".join(_encode_u_leb128(len(b)) + b for b in (f0, f1, f2, f3, f4))
+    code_sec = _sec(10, b"\x05" + bodies)
+    return WASM_MAGIC + type_sec + func_sec + table_sec + mem_sec + exp_sec + elem_sec + code_sec
 
 
 # ============================================================================
@@ -1216,8 +1855,10 @@ __all__ = [
     "WASM_MAGIC",
     "WasmDecodedInstr",
     "WasmFunctionBody",
+    "WasmGlobalDecl",
     "WasmRealizer",
     "assemble_wasm_affine_orbit_module",
+    "assemble_wasm_f32_dot_indirect_module",
     "build_minimal_elf64_image",
     "continue_process",
     "lift_elf64_image",

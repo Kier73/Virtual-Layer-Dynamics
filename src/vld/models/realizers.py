@@ -10,7 +10,14 @@ from typing import Any, Callable, Mapping, Sequence
 from vld.accel import NumericEngine, decode_bf16_le, decode_f16_le, decode_f32_le, decode_tensor_ndarray, encode_f32_le
 from vld.canonical import domain_digest
 from vld.memory import PagedObjectStore
-from vld.models.artifacts import ModelArtifactError, ModelWeightSnapshot, TransformerArchitectureSpec
+from vld.models.artifacts import (
+    LazySafetensorsWeightGround,
+    ModelArtifactError,
+    ModelParameterSpace,
+    ModelWeightSnapshot,
+    SAFETENSORS_DTYPE_WIDTHS,
+    TransformerArchitectureSpec,
+)
 
 
 class RealizerError(ValueError):
@@ -183,7 +190,7 @@ class TransformerLayerRealizer:
     def __init__(
         self,
         arch: TransformerArchitectureSpec,
-        snapshot: ModelWeightSnapshot,
+        snapshot: ModelWeightSnapshot | LazySafetensorsWeightGround,
         *,
         store: PagedObjectStore | None = None,
         remote_range_fetcher: Callable[[str, int, int], bytes] | None = None,
@@ -222,8 +229,33 @@ class TransformerLayerRealizer:
         for tid in token_ids:
             if not (0 <= tid < self.arch.vocab_size):
                 raise RealizerError(f"Token ID {tid} outside vocab_size {self.arch.vocab_size}.")
+        if not token_ids:
+            return []
+        unique_ids = sorted(set(int(t) for t in token_ids))
+        # Row-slice locality: when touching a sparse subset of a large vocabulary (e.g., 10 of 151,936 tokens),
+        # read ONLY the exact row byte ranges [tid * row_bytes, (tid + 1) * row_bytes) instead of 300MB..1.2GB!
+        if hasattr(self.snapshot, "read_tensor_slice_bytes") and len(unique_ids) * 8 < self.arch.vocab_size:
+            t_space = self.snapshot.space.tensor("model.embed_tokens.weight")
+            row_bytes = self.arch.hidden_size * SAFETENSORS_DTYPE_WIDTHS[t_space.dtype]
+            row_cache: dict[int, list[float]] = {}
+            for uid in unique_ids:
+                raw_row = self.snapshot.read_tensor_slice_bytes(
+                    "model.embed_tokens.weight",
+                    uid * row_bytes,
+                    row_bytes,
+                    store=self.store,
+                    remote_range_fetcher=self.remote_range_fetcher,
+                )
+                row_cache[uid] = decode_shaped_tensor(
+                    raw_row,
+                    t_space.dtype,
+                    (self.arch.hidden_size,),
+                    use_numpy=self.engine.uses_numpy,
+                )
+            return [list(row_cache[int(tid)]) for tid in token_ids]
+
         loaded: list[str] = []
-        if self.engine.uses_numpy and token_ids:
+        if self.engine.uses_numpy:
             emb_nd = self._load_tensor_nd("model.embed_tokens.weight", loaded)
             return [[float(v) for v in row] for row in emb_nd[list(token_ids)].tolist()]
         emb_table = self._load_tensor("model.embed_tokens.weight", loaded)

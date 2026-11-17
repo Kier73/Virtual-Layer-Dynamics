@@ -293,3 +293,36 @@ def test_wrapping_modular_poly_fgraph_priority_and_forged_receipt_rejection() ->
     )
     ok_fj, reason_fj = reg.verify_read_receipt(forged_journal)
     assert not ok_fj and reason_fj == "missing_journal_event"
+
+
+def test_m1_retention_leases_and_mark_and_sweep_garbage_collection_g15(tmp_path) -> None:
+    """Verify M1 `pin_manifest`, `unpin_manifest`, and `collect_garbage` (`G15`) across memory and disk backings."""
+    from vld.memory import DiskPageBacking, PagedStoreError
+
+    for backing in (InMemoryPageBacking(page_size=64), DiskPageBacking(tmp_path / "gc_pages", page_size=64)):
+        store = PagedObjectStore(backing)
+        shared_prefix = b"SHARED_64_BYTE_HEADER_" + b"X" * (64 - 22)
+        m_keep = store.put_bytes(shared_prefix + b"KEEP_TAIL_PAYLOAD")
+        m_drop = store.put_bytes(shared_prefix + b"EPHEMERAL_UNPINNED_PAYLOAD_" * 3)
+
+        store.pin_manifest(m_keep, lease_id="lease-a")
+        store.pin_manifest(m_keep.manifest_digest, lease_id="lease-b")
+        assert len(store.pinned_manifests()) == 1
+
+        rep1 = store.collect_garbage()
+        assert rep1.pinned_manifest_count == 1
+        assert rep1.reclaimed_manifest_count == 1
+        assert rep1.reclaimed_page_count >= 1
+        # Shared prefix page + keep tail page MUST survive intact!
+        assert store.read_bytes(m_keep) == shared_prefix + b"KEEP_TAIL_PAYLOAD"
+
+        # Releasing lease-a keeps m_keep pinned via lease-b
+        assert store.unpin_manifest(m_keep.manifest_digest, lease_id="lease-a") is True
+        assert store.collect_garbage().reclaimed_page_count == 0
+
+        # Corrupting/deleting a live page of a pinned manifest MUST refuse GC rather than silently corrupting!
+        tail_digest = m_keep.chunks[-1].page_digest
+        backing.delete_page(tail_digest)
+        with pytest.raises(PagedStoreError, match="missing live page"):
+            store.collect_garbage()
+

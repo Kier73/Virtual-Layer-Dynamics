@@ -4,6 +4,9 @@ from __future__ import annotations
 
 from vld.models.artifacts import (
     ByteLevelBPETokenizerGround,
+    HttpRangeSource,
+    HuggingFaceBPETokenizerGround,
+    LazySafetensorsWeightGround,
     MAX_SAFETENSORS_HEADER_BYTES,
     ModelArtifactError,
     ModelParameterSpace,
@@ -19,12 +22,16 @@ from vld.models.artifacts import (
     observe_safetensors_header,
 )
 from vld.models.orbit import (
+    AffineKernelAttentionGround,
+    AffineKernelQueryReceipt,
     AutoregressiveModelRunner,
     GenerationResult,
     LayerKVPage,
     ModelOrbitCheckpoint,
     ModelOrbitError,
     PagedKVCacheGround,
+    direct_affine_kernel_oracle,
+    verify_softmax_insufficiency_witness,
 )
 from vld.models.procedural import (
     CompiledNeuralFSM,
@@ -58,15 +65,20 @@ from vld.models.realizers import (
 )
 
 __all__ = [
+    "AffineKernelAttentionGround",
+    "AffineKernelQueryReceipt",
     "AutoregressiveModelRunner",
     "ByteLevelBPETokenizerGround",
     "CompiledNeuralFSM",
     "FeedForwardBlock",
     "GenerationResult",
     "GenerativeWeightGround",
+    "HttpRangeSource",
+    "HuggingFaceBPETokenizerGround",
     "IndependentReferenceOracle",
     "LayerExecutionOutput",
     "LayerKVPage",
+    "LazySafetensorsWeightGround",
     "MAX_SAFETENSORS_HEADER_BYTES",
     "MoERoutingReceipt",
     "ModelArtifactError",
@@ -92,6 +104,7 @@ __all__ = [
     "compile_multivariate_hinge_relu",
     "compile_piecewise_affine_relu",
     "decode_shaped_tensor",
+    "direct_affine_kernel_oracle",
     "evaluate_compiled_capsule",
     "evaluate_multivariate_capsule",
     "hidden_state_digest",
@@ -102,6 +115,7 @@ __all__ = [
     "route_moe_topk",
     "verify_compiled_capsule",
     "verify_multivariate_capsule",
+    "verify_softmax_insufficiency_witness",
     "verify_widening_certificate",
     "widen_block_dyadic",
 ]

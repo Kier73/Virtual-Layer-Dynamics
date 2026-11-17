@@ -429,3 +429,101 @@ def test_atomic_cow_fault_wasm_edge_cases_simt_publication_and_false_arithmetic_
     with pytest.raises(ForgedTileDigestError, match="arithmetic oracle"):
         ex.matmul_tiled_recoverable(mat_a, mat_b, checkpoint_log=DeltaTensorCheckpointLog(d_path))
 
+
+def test_wasm_f32_f64_memory_grow_call_indirect_globals_and_conversions() -> None:
+    """Exercise full WASM 1.0 `f32`/`f64`, `memory.grow`, `Table` + `call_indirect`, globals & float-int traps."""
+    import math
+    import struct
+    from vld.substrates import WASM_MAGIC, assemble_wasm_f32_dot_indirect_module
+    from vld.substrates.lifting import _encode_s_leb128, _encode_u_leb128
+
+    # 1. Lifted f32 + memory.grow + call_indirect module
+    mod = lift_wasm_module(assemble_wasm_f32_dot_indirect_module())
+    runner = WasmRealizer(mod)
+
+    # Initial memory = 1 page; grow by 2 pages -> returns (prev=1 << 16) | (new_size=3)
+    (packed_ok,) = runner.invoke("grow_and_size", (2,))
+    assert (packed_ok >> 16) == 1 and (packed_ok & 0xFFFF) == 3
+
+    # Attempting to grow by 2 more pages exceeds declared max=4 -> memory.grow returns -1 (0xFFFFFFFF), size stays 3!
+    (packed_fail,) = runner.invoke("grow_and_size", (2,))
+    assert ((packed_fail >> 16) & 0xFFFF) == 0xFFFF and (packed_fail & 0xFFFF) == 3
+
+    # Write f32 vectors into dynamically grown page 2 (offset 131072 = 2 * 65536)!
+    base_a, base_b = 131_072, 131_104
+    vec_a = [1.5, -2.0, 4.25, 3.0]
+    vec_b = [2.0, 0.5, 1.25, 5.0]
+    runner.memory[base_a : base_a + 16] = struct.pack("<4f", *vec_a)
+    runner.memory[base_b : base_b + 16] = struct.pack("<4f", *vec_b)
+
+    # Slot 0 -> dot product sum(a_i * b_i) = 3.0 + (-1.0) + 5.3125 + 15.0 = 22.3125
+    (dot_val,) = runner.invoke("dispatch_dot", (0, 4, base_a, base_b))
+    assert math.isclose(dot_val, 22.3125, rel_tol=1e-6)
+
+    # Slot 1 -> sum(max(0, a_i - b_i)) = 0 + 0 + 3.0 + 0 = 3.0
+    (relu_val,) = runner.invoke("dispatch_dot", (1, 4, base_a, base_b))
+    assert math.isclose(relu_val, 3.0, rel_tol=1e-6)
+
+    # Slot 2 -> signature mismatch trap ((i32)->(i64) vs expected (f32,f32)->(f32))!
+    with pytest.raises(LiftingError, match="signature mismatch"):
+        runner.invoke("dispatch_dot", (2, 1, base_a, base_b))
+
+    # Slot 3 -> uninitialized null table slot trap!
+    with pytest.raises(LiftingError, match="null table element"):
+        runner.invoke("dispatch_dot", (3, 1, base_a, base_b))
+
+    # Slot 99 -> out-of-bounds table index trap!
+    with pytest.raises(LiftingError, match="undefined table element"):
+        runner.invoke("dispatch_dot", (99, 1, base_a, base_b))
+
+    # 2. Globals, f64 IEEE edge cases (-0.0 min/max, 1.0/0.0 -> inf, 0.0/0.0 -> nan), reinterpret & trunc traps!
+    def _sec(sid: int, payload: bytes) -> bytes:
+        return bytes([sid]) + _encode_u_leb128(len(payload)) + payload
+
+    # Global 0: mutable f64 initialized to 2.5
+    g_sec = _sec(6, b"\x01\x7c\x01\x44" + struct.pack("<d", 2.5) + b"\x0b")
+    type_s = _sec(1, b"\x02\x60\x02\x7c\x7c\x01\x7c\x60\x01\x7d\x01\x7f")
+    func_s = _sec(3, b"\x03\x00\x00\x01")
+    exp_s = _sec(
+        7,
+        b"\x03"
+        b"\x04fmin\x00\x00"
+        b"\x04gacc\x00\x01"
+        b"\x05trunc\x00\x02",
+    )
+    # fn0(a:f64, b:f64)->f64: f64.min(a, b)
+    fn0 = b"\x00\x20\x00\x20\x01\xa4\x0b"
+    # fn1(a:f64, b:f64)->f64: global0 = global0 + a / b; return global0
+    fn1 = b"\x00\x23\x00\x20\x00\x20\x01\xa3\xa0\x24\x00\x23\x00\x0b"
+    # fn2(x:f32)->i32: i32.trunc_f32_s(x)
+    fn2 = b"\x00\x20\x00\xa8\x0b"
+    code_s = _sec(10, b"\x03" + b"".join(_encode_u_leb128(len(b)) + b for b in (fn0, fn1, fn2)))
+    g_mod = lift_wasm_module(WASM_MAGIC + type_s + func_s + g_sec + exp_s + code_s)
+    g_run = WasmRealizer(g_mod)
+
+    # WASM 1.0 IEEE min(-0.0, +0.0) MUST preserve negative zero!
+    (mz,) = g_run.invoke("fmin", (0.0, -0.0))
+    assert mz == 0.0 and math.copysign(1.0, mz) == -1.0
+    (mnan,) = g_run.invoke("fmin", (1.0, float("nan")))
+    assert math.isnan(mnan)
+
+    # Mutable global accumulation + IEEE 1.0 / 0.0 -> +inf (does NOT integer-trap!)
+    assert g_run.invoke("gacc", (3.0, 2.0)) == (4.0,)
+    (inf_v,) = g_run.invoke("gacc", (1.0, 0.0))
+    assert math.isinf(inf_v) and inf_v > 0
+
+    # i32.trunc_f32_s(-3.9) == -3 (unsigned 0xFFFFFFFD); traps on NaN or overflow 1e20!
+    assert g_run.invoke("trunc", (-3.9,)) == ((-3) & 0xFFFFFFFF,)
+    with pytest.raises(LiftingError, match="NaN or Inf"):
+        g_run.invoke("trunc", (float("nan"),))
+    with pytest.raises(LiftingError, match="overflow"):
+        g_run.invoke("trunc", (1.0e20,))
+
+    # Immutable global write MUST be rejected statically at lift time!
+    imm_g_sec = _sec(6, b"\x01\x7f\x00\x41" + _encode_s_leb128(7) + b"\x0b")
+    imm_fn = b"\x00\x41\x01\x24\x00\x0b"
+    bad_imm = WASM_MAGIC + _sec(1, b"\x01\x60\x00\x00") + _sec(3, b"\x01\x00") + imm_g_sec + _sec(10, b"\x01" + _encode_u_leb128(len(imm_fn)) + imm_fn)
+    with pytest.raises(LiftingError, match="immutable global"):
+        lift_wasm_module(bad_imm)
+
+

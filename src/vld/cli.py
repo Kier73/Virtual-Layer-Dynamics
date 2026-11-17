@@ -52,12 +52,15 @@ from vld.ground import (
 from vld.journal import HashChainedJournal, IdempotencyConflictError
 from vld.memory import DiskPageBacking, InMemoryPageBacking, PagedObjectStore, StructuralMemoryRegistry, certify_sequence_law
 from vld.models import (
+    AffineKernelAttentionGround,
     TransformerArchitectureSpec,
     compile_multivariate_hinge_relu,
     compile_piecewise_affine_relu,
+    direct_affine_kernel_oracle,
     route_moe_topk,
     verify_compiled_capsule,
     verify_multivariate_capsule,
+    verify_softmax_insufficiency_witness,
 )
 from vld.navigation import (
     ComputationNode,
@@ -78,6 +81,7 @@ from vld.substrates import (
     VirtualPageSpace,
     WasmRealizer,
     assemble_wasm_affine_orbit_module,
+    assemble_wasm_f32_dot_indirect_module,
     build_minimal_elf64_image,
     build_room_intention,
     execute_room_on_realizer,
@@ -196,6 +200,10 @@ def run_self_verification() -> dict[str, Any]:
     m1_manifest = m1_store.put_bytes(bytes(i % 256 for i in range(300)))
     m1_backing.pages_read = 0
     assert len(m1_store.read_range(m1_manifest, 70, 50)) == 50 and m1_backing.pages_read == 1
+    _ = m1_store.put_bytes(b"ephemeral-unpinned" * 5)
+    m1_store.pin_manifest(m1_manifest, lease_id="verify-root")
+    gc_rep = m1_store.collect_garbage()
+    assert gc_rep.pinned_manifest_count == 1 and gc_rep.reclaimed_manifest_count == 1 and m1_store.verify(m1_manifest)
 
     lcg_seq = [73]
     for _ in range(6):
@@ -210,7 +218,7 @@ def run_self_verification() -> dict[str, Any]:
     assert sm_reg.verify_read_receipt(late_rcpt)[0] is False
     wrap_poly = certify_sequence_law([(t * t + 3 * t + 5) % 97 for t in range(12)], declared_modulus=97)
     assert wrap_poly.family == "poly" and wrap_poly.evaluate(10_000) == (10_000 * 10_000 + 30_005) % 97
-    checks["phase2_m1_and_structural_memory"] = 6
+    checks["phase2_m1_and_structural_memory"] = 7
 
     # 7. Phase 3: Scheduler-scoped vector clocks (G13) & strict-majority (2q > N) quorum fencing
     tc_a = TemporalCoordinate("sched.verify.a", 1, VectorClock.from_mapping({"p0": 1}))
@@ -326,6 +334,10 @@ def run_self_verification() -> dict[str, Any]:
     (wasm_val,) = WasmRealizer(wasm_mod).invoke("affine_jump", (17, 29, 65521, 5, 1_000_000_007))
     assert alg_val == vm_val == wasm_val
 
+    wasm_f32_runner = WasmRealizer(lift_wasm_module(assemble_wasm_f32_dot_indirect_module()))
+    (grow_res,) = wasm_f32_runner.invoke("grow_and_size", (1,))
+    assert (grow_res >> 16) == 1 and (grow_res & 0xFFFF) == 2
+
     try:
         SIMTWorkgroupExecutor(workgroup_size=2).execute_kernel(
             (SIMTInstruction("JZ_EVEN_LANE", ("r0", 2)), SIMTInstruction("BARRIER", ("b0",)), SIMTInstruction("HALT", ())),
@@ -334,7 +346,7 @@ def run_self_verification() -> dict[str, Any]:
         raise AssertionError("Expected BarrierDivergenceError")
     except BarrierDivergenceError:
         pass
-    checks["phase5_substrates_cow_elf_wasm_simt_and_rooms"] = 6
+    checks["phase5_substrates_cow_elf_wasm_simt_and_rooms"] = 8
 
     # 10. Phases 6 & 7: MoE routing, 1D + R^d SNC whole-domain ReLU compilation & Hypervisor-governed Model Agent
     moe_spec = TransformerArchitectureSpec.from_published_profile("qwen3-235b-a22b")
@@ -361,6 +373,22 @@ def run_self_verification() -> dict[str, Any]:
         hinges=[{"normal": ["1", "1"], "offset": "-1", "weights": ["2"]}],
     )
     assert verify_multivariate_capsule(mv_capsule)["status"] == "VERIFIED_WHOLE_DOMAIN"
+    hi_capsule = compile_multivariate_hinge_relu(
+        input_dim=16,
+        base_linear=[[str(i % 3) for i in range(16)]],
+        base_bias=["1"],
+        hinges=[
+            {"normal": ["1" if j == (k % 16) else ("-1" if j == ((k + 3) % 16) else "0") for j in range(16)], "offset": str(k - 4), "weights": ["1"]}
+            for k in range(20)
+        ],
+    )
+    assert verify_multivariate_capsule(hi_capsule, default_chamber_limit=16)["verification_method"] == "algebraic_ridge_exact"
+
+    aks_g = AffineKernelAttentionGround(modulus_p=257, key_dim=2, value_dim=2)
+    aks_g.admit_token([3, 5], [7, 11])
+    aks_g.admit_token([13, 17], [19, 23])
+    assert aks_g.query([2, 9]).value == direct_affine_kernel_oracle(257, ([3, 5], [13, 17]), ([7, 11], [19, 23]), [2, 9])
+    assert verify_softmax_insufficiency_witness()["identical_affine_sufficient_state"] is True
 
     hyp = ReceiverHypervisor()
     hyp.register_agent(create_default_exploration_grant("verify-agent", probe_budget=Fraction(10)))
@@ -372,7 +400,7 @@ def run_self_verification() -> dict[str, Any]:
         raise AssertionError("Expected HypervisorRefusalError")
     except HypervisorRefusalError:
         pass
-    checks["phases6_7_models_snc_and_agent_hypervisor"] = 7
+    checks["phases6_7_models_snc_and_agent_hypervisor"] = 10
 
     # 8. Pareto shortcut inequality & HashChainedJournal idempotency
     physical = NavigationCostVector(latency_ms=120.0, compute_ops=1_000_000.0, bytes_moved=65536.0, verification_ops=10.0)

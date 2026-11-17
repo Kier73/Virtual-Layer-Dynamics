@@ -258,6 +258,16 @@ def test_bf16_overflow_operator_fingerprint_uniqueness_and_spectral_guard() -> N
     if native.available:
         with pytest.raises(ValueError):
             native.rms_norm_f32([[1.0, 2.0], [3.0]], [1.0, 1.0], 1e-6)
+        # Native Rust f64-mean-square overflow safety at 2e19 (where f32 squaring overflows to +Inf!)
+        huge_row = [[2.0e19, -2.0e19, 1.0e19, -1.0e19]]
+        w4 = [1.0, 1.0, 1.0, 1.0]
+        rust_out = native.rms_norm_f32(huge_row, w4, 1e-6)
+        py_out = NumericEngine("stdlib").rms_norm_2d(huge_row, w4, 1e-6)
+        assert NumericEngine.max_abs_diff(rust_out, py_out) < 1e-5
+        with pytest.raises(RuntimeError):
+            native.rms_norm_f32([[float("nan"), 1.0]], [1.0, 1.0], 1e-6)
+        with pytest.raises(RuntimeError):
+            native.rms_norm_f32([[1.0, 1.0]], [1.0, 1.0], -1.0)
 
 
 def test_concurrent_http_vantage_with_disk_backing_and_persisted_reentrant_journal(tmp_path) -> None:

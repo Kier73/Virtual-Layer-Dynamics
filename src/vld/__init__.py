@@ -1,6 +1,6 @@
 r"""Virtual Layer Dynamics (`vld`) — Consolidated Computational Ground Architecture.
 
-Active consolidated package layers (`v0.3.0` — Phases 0 through 7 Complete):
+Active consolidated package layers (`v0.4.0` — Phases 0 through 7 Complete & Hardened):
   - `vld.canonical`: Deterministic JSON & domain-separated SHA-256 addressing
   - `vld.triad`: Kleene $\mathcal{K}_3$ guards, epistemic tags, Myhill-Nerode quotient & erasure bits
   - `vld.ground`: `VirtualGroundSpec`, reversible `ByteLens`, dual-derivation `AffineOrbitLaw` & Pareto costs
@@ -72,7 +72,7 @@ from vld.triad import (
     require_determinate_branch,
 )
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 __all__ = [
     "ActionInformationSummary",
