@@ -157,32 +157,42 @@ def execute_room_on_realizer(intention: Mapping[str, Any], realizer: str) -> int
         return int(val)
 
     if realizer == "subprocess-rehomed":
+        intent_digest = domain_digest("vld.room-intention.v1", dict(intention))
         with tempfile.TemporaryDirectory() as td:
             state_file = Path(td) / "room_rehome.json"
-            # Host 1 starts execution, checkpoints intermediate coordinate n // 2, then suffers hard `os._exit(95)`!
+            # Host 1 starts execution, checkpoints verified intermediate coordinate n // 2, then suffers hard `os._exit(95)`!
             half = n // 2
-            rem = n - half
             code_kill = f"""
-import json, os
+import os
 from pathlib import Path
+from vld.canonical import canonical_bytes, domain_digest
 from vld.ground import AffineOrbitLaw
 law = AffineOrbitLaw({a}, {c}, {m})
 mid = law.navigate({seed}, {half}).value
-Path({str(state_file)!r}).write_text(json.dumps({{"mid": mid, "done": {half}}}), encoding="utf-8")
+body = {{"done": {half}, "intention_digest": {intent_digest!r}, "mid": mid, "schema": "vld.room-rehome-state.v1"}}
+doc = {{**body, "state_digest": domain_digest("vld.room-rehome-state.v1", body)}}
+Path({str(state_file)!r}).write_bytes(canonical_bytes(doc))
 os._exit(95)
 """
             p1 = subprocess.run([sys.executable, "-c", code_kill], capture_output=True, text=True)
             if p1.returncode != 95:
                 raise RoomError(f"Expected simulated hard-kill exit 95, got {p1.returncode}: {p1.stderr}")
 
-            # Host 2 rehomes from saved intermediate orbit point and finishes remaining `rem` steps!
+            # Host 2 rehomes, independently verifies intention & checkpoint digest, and finishes `n - done` steps!
             code_resume = f"""
 import json
 from pathlib import Path
+from vld.canonical import domain_digest, parse_strict_json
 from vld.ground import AffineOrbitLaw
-st = json.loads(Path({str(state_file)!r}).read_text(encoding="utf-8"))
+st = parse_strict_json(Path({str(state_file)!r}).read_bytes())
+body = {{k: v for k, v in st.items() if k != "state_digest"}}
+if st.get("state_digest") != domain_digest("vld.room-rehome-state.v1", body) or st.get("intention_digest") != {intent_digest!r}:
+    raise SystemExit("Tampered or mismatched room rehome checkpoint.")
+done = int(st["done"])
+if not (0 <= done <= {n}):
+    raise SystemExit("Invalid room rehome coordinate.")
 law = AffineOrbitLaw({a}, {c}, {m})
-final_v = law.navigate(int(st["mid"]), {rem}).value
+final_v = law.navigate(int(st["mid"]), {n} - done).value
 print(json.dumps({{"value": final_v}}))
 """
             p2 = subprocess.run([sys.executable, "-c", code_resume], capture_output=True, text=True, check=True)

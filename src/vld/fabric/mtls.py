@@ -31,10 +31,11 @@ import threading
 from typing import Any, Callable, Mapping, Sequence
 
 from vld.canonical import canonical_bytes, parse_strict_json
-from vld.memory import PagedByteManifest, PagedObjectStore, PagedStoreError
+from vld.memory import PageChunkRef, PagedByteManifest, PagedObjectStore, PagedStoreError
 
 MAX_CONTROL_FRAME_BYTES = 65_536
 DEFAULT_STREAM_CHUNK_BYTES = 65_536
+MAX_MANIFEST_STREAM_BYTES = 16 * 1024 * 1024
 
 _SMALL_PRIMES = (
     3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71,
@@ -363,11 +364,14 @@ def _extract_peer_dns_names(tls_sock: ssl.SSLSocket) -> frozenset[str]:
 
 def _recv_exact(sock: socket.socket, n: int) -> bytes:
     buf = bytearray()
-    while len(buf) < n:
-        chunk = sock.recv(n - len(buf))
-        if not chunk:
-            raise MutualTLSError(f"Unexpected EOF reading {n} bytes (got {len(buf)}).")
-        buf.extend(chunk)
+    try:
+        while len(buf) < n:
+            chunk = sock.recv(n - len(buf))
+            if not chunk:
+                raise MutualTLSError(f"Unexpected EOF reading {n} bytes (got {len(buf)}).")
+            buf.extend(chunk)
+    except OSError as exc:
+        raise MutualTLSError(f"mTLS socket receive failed: {exc}") from exc
     return bytes(buf)
 
 
@@ -378,7 +382,10 @@ def _send_control_frame(sock: socket.socket, payload: Mapping[str, Any]) -> None
             f"Control frame size {len(raw)} exceeds MAX_CONTROL_FRAME_BYTES ({MAX_CONTROL_FRAME_BYTES}); "
             "bulk data must use out-of-band M1 range streaming."
         )
-    sock.sendall(struct.pack(">I", len(raw)) + raw)
+    try:
+        sock.sendall(struct.pack(">I", len(raw)) + raw)
+    except OSError as exc:
+        raise MutualTLSError(f"mTLS socket send failed: {exc}") from exc
 
 
 def _recv_control_frame(sock: socket.socket) -> dict[str, Any]:
@@ -481,7 +488,16 @@ class MTLSPeerServer:
             peer_names = _extract_peer_dns_names(tls_conn)
             matched = peer_names & self.allowed_peer_dns
             if not matched:
+                # Drain inbound request frame before replying + half-closing so Windows Winsock never emits TCP RST!
+                try:
+                    _recv_control_frame(tls_conn)
+                except MutualTLSError:
+                    pass
                 _send_control_frame(tls_conn, {"error": "peer_san_unauthorized", "status": "DENIED"})
+                try:
+                    tls_conn.shutdown(socket.SHUT_WR)
+                except OSError:
+                    pass
                 return
             caller_dns = sorted(matched)[0]
 
@@ -499,7 +515,16 @@ class MTLSPeerServer:
                     mdigest = str(req.get("manifest_digest", ""))
                     try:
                         m = self.store.get_manifest(mdigest)
-                        _send_control_frame(tls_conn, {"manifest": m.to_dict(), "status": "OK"})
+                        raw_m = m.to_bytes()
+                        _send_control_frame(
+                            tls_conn,
+                            {
+                                "manifest_bytes": len(raw_m),
+                                "manifest_sha256": hashlib.sha256(raw_m).hexdigest(),
+                                "status": "MANIFEST_STREAM",
+                            },
+                        )
+                        tls_conn.sendall(raw_m)
                     except PagedStoreError as exc:
                         _send_control_frame(tls_conn, {"error": str(exc), "status": "NOT_FOUND"})
                 elif kind == "m1_range_stream":
@@ -536,8 +561,13 @@ class MTLSPeerServer:
                     if self._control_handler is None:
                         _send_control_frame(tls_conn, {"error": "no_control_handler", "status": "ERROR"})
                     else:
-                        out = self._control_handler(caller_dns, dict(req.get("body", {})))
-                        _send_control_frame(tls_conn, {"result": out, "status": "OK"})
+                        try:
+                            out = self._control_handler(caller_dns, dict(req.get("body", {})))
+                            _send_control_frame(tls_conn, {"result": out, "status": "OK"})
+                        except PermissionError as exc:
+                            _send_control_frame(tls_conn, {"error": str(exc), "status": "DENIED"})
+                        except Exception as exc:
+                            _send_control_frame(tls_conn, {"error": str(exc), "status": "ERROR"})
                 else:
                     _send_control_frame(tls_conn, {"error": f"unknown_kind:{kind}", "status": "ERROR"})
         except Exception:
@@ -619,9 +649,19 @@ class MTLSPeerClient:
         with self._connect() as conn:
             _send_control_frame(conn, {"kind": "m1_manifest", "manifest_digest": manifest_digest})
             resp = _recv_control_frame(conn)
-        if resp.get("status") != "OK":
-            raise MutualTLSError(f"Failed to fetch M1 manifest: {resp}")
-        manifest = PagedByteManifest.from_dict(resp["manifest"])
+            status = resp.get("status")
+            if status == "MANIFEST_STREAM":
+                m_len = int(resp.get("manifest_bytes", 0))
+                if m_len <= 0 or m_len > MAX_MANIFEST_STREAM_BYTES:
+                    raise MutualTLSError(f"Invalid streamed M1 manifest byte length: {m_len}.")
+                raw_m = _recv_exact(conn, m_len)
+                if hashlib.sha256(raw_m).hexdigest() != resp.get("manifest_sha256"):
+                    raise MutualTLSError("Streamed M1 manifest SHA-256 mismatch.")
+                manifest = PagedByteManifest.from_dict(parse_strict_json(raw_m))
+            elif status == "OK":
+                manifest = PagedByteManifest.from_dict(resp["manifest"])
+            else:
+                raise MutualTLSError(f"Failed to fetch M1 manifest: {resp}")
         if manifest.manifest_digest != manifest_digest:
             raise MutualTLSError("Remote M1 manifest digest mismatch.")
         return manifest
@@ -633,24 +673,120 @@ class MTLSPeerClient:
         *,
         max_reconnects: int = 6,
         chunk_size: int = DEFAULT_STREAM_CHUNK_BYTES,
+        _fault_hook_after_pages: Callable[[int], None] | None = None,
     ) -> tuple[PagedByteManifest, int]:
-        """Stream a multi-megabyte M1 object into `target_store`, resuming from exact byte offset on link drop.
+        r"""Stream an M1 object into `target_store` in $O(\text{page\_size})$ constant RAM, resuming across link drops & process loss (`G14`).
 
         Returns `(verified_manifest, reconnect_count)`.
         """
         manifest = self.fetch_manifest(manifest_digest)
-        assembled = bytearray()
-        reconnects = 0
+        if manifest.size_bytes == 0:
+            if target_store.page_size == manifest.page_size:
+                return target_store.register_manifest(manifest), 0
+            return target_store.put_bytes(b"", media_type=manifest.media_type), 0
 
-        while len(assembled) < manifest.size_bytes:
-            offset = len(assembled)
+        eff_chunk = min(DEFAULT_STREAM_CHUNK_BYTES, max(1024, int(chunk_size)))
+        reconnects = 0
+        pages_newly_flushed = 0
+
+        if target_store.page_size == manifest.page_size:
+            # Scan already-persisted contiguous M1 pages (enabling exact suffix resume after os._exit)!
+            content_hasher = hashlib.sha256()
+            next_chunk_idx = 0
+            while next_chunk_idx < len(manifest.chunks):
+                ch = manifest.chunks[next_chunk_idx]
+                if not target_store.backing.has_page(ch.page_digest):
+                    break
+                persisted = target_store.backing.get_page(ch.page_digest)
+                if ch.byte_length < manifest.page_size and any(b != 0 for b in persisted[ch.byte_length :]):
+                    raise MutualTLSError(f"Non-zero canonical padding in persisted M1 page {ch.page_digest}.")
+                content_hasher.update(persisted[: ch.byte_length])
+                next_chunk_idx += 1
+
+            while next_chunk_idx < len(manifest.chunks):
+                offset = next_chunk_idx * manifest.page_size
+                remaining = manifest.size_bytes - offset
+                page_buf = bytearray()
+                conn_remaining = remaining
+                try:
+                    with self._connect() as conn:
+                        _send_control_frame(
+                            conn,
+                            {
+                                "chunk_size": eff_chunk,
+                                "kind": "m1_range_stream",
+                                "length": remaining,
+                                "manifest_digest": manifest_digest,
+                                "offset": offset,
+                            },
+                        )
+                        hdr = _recv_control_frame(conn)
+                        if hdr.get("status") != "STREAM_START":
+                            raise ValueError(f"Stream rejected: {hdr}")
+                        while True:
+                            (clen,) = struct.unpack(">I", _recv_exact(conn, 4))
+                            if clen == 0:
+                                break
+                            if clen > eff_chunk or clen > conn_remaining:
+                                raise ValueError(f"Invalid M1 stream chunk length {clen}.")
+                            chunk = _recv_exact(conn, clen)
+                            expected_sha = _recv_exact(conn, 32)
+                            if hashlib.sha256(chunk).digest() != expected_sha:
+                                raise ValueError("Corrupted M1 stream chunk SHA-256 detected.")
+                            conn_remaining -= clen
+
+                            cursor = 0
+                            while cursor < len(chunk) and next_chunk_idx < len(manifest.chunks):
+                                target_ch = manifest.chunks[next_chunk_idx]
+                                need = target_ch.byte_length - len(page_buf)
+                                take = min(need, len(chunk) - cursor)
+                                page_buf.extend(chunk[cursor : cursor + take])
+                                cursor += take
+                                if len(page_buf) == target_ch.byte_length:
+                                    logical = bytes(page_buf)
+                                    page_buf.clear()
+                                    padded = logical + b"\x00" * (manifest.page_size - target_ch.byte_length)
+                                    if hashlib.sha256(padded).hexdigest() != target_ch.page_digest:
+                                        raise ValueError("Streamed M1 page SHA-256 disagrees with manifest chunk.")
+                                    target_store.backing.put_page(padded)
+                                    content_hasher.update(logical)
+                                    next_chunk_idx += 1
+                                    pages_newly_flushed += 1
+                                    if _fault_hook_after_pages is not None:
+                                        _fault_hook_after_pages(pages_newly_flushed)
+                        if next_chunk_idx < len(manifest.chunks):
+                            raise MutualTLSError("Premature stream EOF before all M1 pages completed.")
+                except ValueError as exc:
+                    raise MutualTLSError(str(exc)) from exc
+                except (MutualTLSError, OSError) as exc:
+                    reconnects += 1
+                    if reconnects > max_reconnects:
+                        raise MutualTLSError(
+                            f"Exceeded max_reconnects={max_reconnects} while streaming M1 {manifest_digest}: {exc}"
+                        ) from exc
+
+            if content_hasher.hexdigest() != manifest.content_digest:
+                raise MutualTLSError("Reassembled M1 object content_digest disagrees with source manifest.")
+            return target_store.register_manifest(manifest), reconnects
+
+        # Heterogeneous page_size fallback: still O(target_store.page_size) constant RAM!
+        tgt_ps = target_store.page_size
+        total_tgt_chunks = (manifest.size_bytes + tgt_ps - 1) // tgt_ps
+        tgt_chunks: list[PageChunkRef] = []
+        content_hasher = hashlib.sha256()
+        next_tgt_idx = 0
+
+        while next_tgt_idx < total_tgt_chunks:
+            offset = next_tgt_idx * tgt_ps
             remaining = manifest.size_bytes - offset
+            page_buf = bytearray()
+            conn_remaining = remaining
             try:
                 with self._connect() as conn:
                     _send_control_frame(
                         conn,
                         {
-                            "chunk_size": chunk_size,
+                            "chunk_size": eff_chunk,
                             "kind": "m1_range_stream",
                             "length": remaining,
                             "manifest_digest": manifest_digest,
@@ -659,16 +795,41 @@ class MTLSPeerClient:
                     )
                     hdr = _recv_control_frame(conn)
                     if hdr.get("status") != "STREAM_START":
-                        raise MutualTLSError(f"Stream rejected: {hdr}")
+                        raise ValueError(f"Stream rejected: {hdr}")
                     while True:
                         (clen,) = struct.unpack(">I", _recv_exact(conn, 4))
                         if clen == 0:
                             break
+                        if clen > eff_chunk or clen > conn_remaining:
+                            raise ValueError(f"Invalid M1 stream chunk length {clen}.")
                         chunk = _recv_exact(conn, clen)
                         expected_sha = _recv_exact(conn, 32)
                         if hashlib.sha256(chunk).digest() != expected_sha:
-                            raise MutualTLSError("Corrupted M1 stream chunk SHA-256 detected.")
-                        assembled.extend(chunk)
+                            raise ValueError("Corrupted M1 stream chunk SHA-256 detected.")
+                        conn_remaining -= clen
+
+                        cursor = 0
+                        while cursor < len(chunk) and next_tgt_idx < total_tgt_chunks:
+                            exp_blen = min(tgt_ps, manifest.size_bytes - next_tgt_idx * tgt_ps)
+                            need = exp_blen - len(page_buf)
+                            take = min(need, len(chunk) - cursor)
+                            page_buf.extend(chunk[cursor : cursor + take])
+                            cursor += take
+                            if len(page_buf) == exp_blen:
+                                logical = bytes(page_buf)
+                                page_buf.clear()
+                                padded = logical + b"\x00" * (tgt_ps - exp_blen)
+                                p_sha = target_store.backing.put_page(padded)
+                                tgt_chunks.append(PageChunkRef(index=next_tgt_idx, page_digest=p_sha, byte_length=exp_blen))
+                                content_hasher.update(logical)
+                                next_tgt_idx += 1
+                                pages_newly_flushed += 1
+                                if _fault_hook_after_pages is not None:
+                                    _fault_hook_after_pages(pages_newly_flushed)
+                    if next_tgt_idx < total_tgt_chunks:
+                        raise MutualTLSError("Premature stream EOF before all target M1 pages completed.")
+            except ValueError as exc:
+                raise MutualTLSError(str(exc)) from exc
             except (MutualTLSError, OSError) as exc:
                 reconnects += 1
                 if reconnects > max_reconnects:
@@ -676,10 +837,16 @@ class MTLSPeerClient:
                         f"Exceeded max_reconnects={max_reconnects} while streaming M1 {manifest_digest}: {exc}"
                     ) from exc
 
-        stored = target_store.put_bytes(bytes(assembled), media_type=manifest.media_type)
-        if stored.content_digest != manifest.content_digest:
+        if content_hasher.hexdigest() != manifest.content_digest:
             raise MutualTLSError("Reassembled M1 object content_digest disagrees with source manifest.")
-        return stored, reconnects
+        rebuilt = PagedByteManifest(
+            media_type=manifest.media_type,
+            size_bytes=manifest.size_bytes,
+            page_size=tgt_ps,
+            content_digest=manifest.content_digest,
+            chunks=tuple(tgt_chunks),
+        )
+        return target_store.register_manifest(rebuilt), reconnects
 
 
 __all__ = [

@@ -560,9 +560,15 @@ def verify_multivariate_capsule(
     if data.get("source_spec_digest") != domain_digest("vld.multivariate-hinge-spec.v1", spec):
         raise ProceduralModelError("Source multivariate spec digest mismatch.")
 
-    d = int(spec["input_dim"])
+    raw_d = spec.get("input_dim") if isinstance(spec, Mapping) else None
+    if isinstance(raw_d, bool) or not isinstance(raw_d, int) or not (1 <= raw_d <= 8):
+        raise ProceduralModelError("Untrusted multivariate capsule input_dim must be an integer in [1, 8].")
+    d = raw_d
     a_spec = [[_parse_canonical_rational(v) for v in row] for row in spec["base_linear"]]
     c_spec = [_parse_canonical_rational(v) for v in spec["base_bias"]]
+    m_out = len(c_spec)
+    if m_out < 1 or len(a_spec) != m_out or any(len(row) != d for row in a_spec):
+        raise ProceduralModelError("Invalid base_linear / base_bias dimensions in multivariate capsule spec.")
     hinges_spec = [
         (
             tuple(_parse_canonical_rational(v) for v in h["normal"]),
@@ -571,7 +577,9 @@ def verify_multivariate_capsule(
         )
         for h in spec["hinges"]
     ]
-    m_out = len(c_spec)
+    for n_vec_h, _beta_h, gamma_h in hinges_spec:
+        if len(n_vec_h) != d or len(gamma_h) != m_out or all(v == 0 for v in n_vec_h):
+            raise ProceduralModelError("Invalid hinge normal or output weight dimensions in multivariate capsule spec.")
 
     net = data["network"]
     if net.get("hidden_activation") != "relu":

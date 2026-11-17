@@ -344,11 +344,11 @@ class ActiveHostFormationPipeline:
         probe_inputs: Sequence[bytes],
     ) -> PathObservationEvidence:
         """Stage 1 (`observe`) for authenticated in-transit byte transformation hops $(h_i, a_i, b_i, k_i, f_i)$."""
-        if not hops or len(probe_inputs) < 2:
-            raise PathGroundError("Transit observation requires >= 1 hop and >= 2 distinct probe inputs.")
+        cur_probes = [bytes(p) for p in probe_inputs]
+        if not hops or len(cur_probes) < 2 or len(set(cur_probes)) < 2 or any(len(p) == 0 for p in cur_probes):
+            raise PathGroundError("Transit observation requires >= 1 hop and >= 2 distinct non-empty probe inputs.")
 
         hop_records: list[dict[str, Any]] = []
-        cur_probes = [bytes(p) for p in probe_inputs]
         for hop_id, decl_a, decl_b, secret, hop_fn in hops:
             next_probes: list[bytes] = []
             valid_macs = True
@@ -392,6 +392,10 @@ class ActiveHostFormationPipeline:
         """Stage 2 (`qualify`): Enforce repeatability AND mandatory negative controls against endpoint-only fakes."""
         obs = evidence.observations
         if evidence.kind == "http_conditional_cache":
+            if obs["status_1"] != 200 or not str(obs["etag"]).strip():
+                raise PathQualificationRefused(
+                    f"Qualification refused on {evidence.locus_id!r}: initial fetch failed or lacked strong ETag."
+                )
             if obs["body_1_sha256"] != obs["body_2_sha256"]:
                 raise PathQualificationRefused(
                     f"Negative control failed on {evidence.locus_id!r}: nondeterministic/mutating response bytes."
@@ -467,9 +471,13 @@ class ActiveHostFormationPipeline:
         if cert.kind == "http_conditional_cache":
             url = f"{p['intermediary_url']}/{p['asset_key']}"
 
+            total_sz = int(p["size_bytes"])
+
             def _nav_http(req: Mapping[str, int]) -> bytes:
                 off = int(req["offset"])
                 ln = int(req["length"])
+                if off < 0 or ln < 0 or off + ln > total_sz:
+                    raise PathGroundError("Requested path-cache byte range out of bounds.")
                 if ln == 0:
                     return b""
                 with urlopen(
@@ -489,6 +497,8 @@ class ActiveHostFormationPipeline:
             def _nav_transit(payload: Mapping[str, Any]) -> bytes:
                 raw = bytes(payload["data"])
                 repeats = int(payload.get("iterations", 1))
+                if repeats < 0:
+                    raise PathGroundError("Transit iterations must be non-negative.")
                 # Algebraic path shortcut: K passes through the multi-hop chain collapse via AffineOrbitLaw!
                 r0 = law.navigate(0, repeats)
                 mul = r0.affine_multiplier

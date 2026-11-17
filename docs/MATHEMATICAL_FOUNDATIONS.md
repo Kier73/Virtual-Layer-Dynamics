@@ -152,17 +152,17 @@ Across distributed recovery authorities $\mathcal{M}$ of fixed membership $N = |
 
 $$2q_{\min} > N \implies \forall Q_1, Q_2 \subseteq \mathcal{M},\; |Q_1| \ge q_{\min} \land |Q_2| \ge q_{\min} \implies |Q_1 \cap Q_2| \ge 1$$
 
-Combined with atomic pre-quorum write-ahead staging and term fencing $t' = t_{\text{hw}} + 1$, `VirtualProcessor` preserves **exact-once** state evolution across `os._exit` process destruction and host replacement (`G22`).
+Combined with Paxos Phase 1b/2a cross-term value locking, atomic pre-quorum write-ahead staging, and exclusive owner-bound term fencing $t' = \max_{m \in Q} t_{\text{promised}}(m) + 1$, `VirtualProcessor` preserves **exact-once** state evolution across `os._exit` process destruction, concurrent recovery races, and host replacement (`G22`).
 
 ### Pre-Execution Gates, Substrate Lifting & Path-Native Negative Controls
 1. **Interval Abstract Interpretation & Strong Bisimulation (`vld.navigation`):**
-   - Galois-sound exact rational intervals $[l_v, u_v] \subseteq \mathbb{Q}$ propagate across DAG operators before execution, classifying safety contracts $[L_v, U_v]$ in $\mathcal{K}_3$.
+   - Galois-sound extended rational intervals $[l_v, u_v] \subseteq \mathbb{Q} \cup \{-\infty, +\infty\}$ propagate across DAG operators before execution (preserving unbounded enclosures across zero-straddling divisions), classifying safety contracts $[L_v, U_v]$ in $\mathcal{K}_3$.
    - Partition refinement over $\Sigma_1 \sqcup \Sigma_2$ computes coarsest strong bisimulation $\sim_{\text{bisim}}$ and extracts a minimal distinguishing action trace via BFS whenever $s_1 \not\sim_{\text{bisim}} s_2$.
-2. **Direct Terminal-to-Terminal Dataflow (`vld.fabric.forwarding`, `G11`):**
-   For DAG edge $u \to v$ across workers $H_1 \to H_2$, bulk M1 pages stream directly $H_1 \to H_2$ over mutually authenticated X.509 v3 TLS (with exact-offset range resumption on link drop) while commit authority (`WorkerExecutionAssignment` + `HashChainedJournal`) remains strictly at Origin Coordinator $C$.
+2. **Direct Terminal-to-Terminal Dataflow (`vld.fabric.forwarding`, `G11`, `G14`):**
+   For DAG edge $u \to v$ across workers $H_1 \to H_2$, bulk M1 pages stream directly $H_1 \to H_2$ over mutually authenticated X.509 v3 TLS in $O(\text{page\_size})$ constant RAM (with page-flushed resumption across both link drops and `os._exit` process loss) while commit authority (`WorkerExecutionAssignment` + `HashChainedJournal`) remains strictly at Origin Coordinator $C$.
 3. **Copy-on-Write, $O(1)$ Delta Tensor Checkpoints & Active Path Formation (`vld.substrates`):**
-   - `VirtualPageSpace` unifies $O(1)$-fork Copy-on-Write pages with zero-allocation `StructuralMemoryRegistry` demand pages and transactional ELF64 / WebAssembly 1.0 binary lifters (`Locate`, `Restore`, `Continue`, `Transform`).
-   - `DeltaTensorCheckpointLog` appends single-tile records in $O(B_M B_N)$ bytes independent of total tiles $K_{\text{tiles}}$, eliminating $O(K_{\text{tiles}}^2)$ prefix-copy overhead.
+   - `VirtualPageSpace` unifies atomic $O(1)$-fork Copy-on-Write pages with zero-allocation `StructuralMemoryRegistry` demand pages and transactional ELF64 / WebAssembly 1.0 binary lifters (`Locate`, `Restore`, `Continue`, `Transform`).
+   - `DeltaTensorCheckpointLog` appends single-tile records in $O(B_M B_N)$ bytes independent of total tiles $K_{\text{tiles}}$, eliminating $O(K_{\text{tiles}}^2)$ prefix-copy overhead while verifying recovered tiles via $O((B_M + B_N)K)$ Freivalds/projection arithmetic oracles against rehashed false arithmetic.
    - `ActiveHostFormationPipeline` (`observe -> qualify -> construct -> admit -> navigate -> verify`) enforces **mandatory negative controls** ($\Delta N_{\text{origin}} = 0$ for in-path HTTP conditional/Range caches; non-identity transform + witness MAC for transit hops) so stateless pass-through endpoint proxies and noisy channels are deterministically refused.
 
 ---

@@ -230,19 +230,32 @@ class TransformerLayerRealizer:
         return [list(emb_table[tid]) for tid in token_ids]
 
     def final_logits(self, hidden_states: Sequence[Sequence[float]]) -> list[list[float]]:
+        if not hidden_states or any(len(row) != self.arch.hidden_size for row in hidden_states):
+            raise RealizerError("Invalid hidden_states shape in final_logits.")
         loaded: list[str] = []
         head_name = "model.embed_tokens.weight" if self.arch.tie_word_embeddings else "lm_head.weight"
         if self.engine.uses_numpy:
+            import numpy as np
+
             x_nd = self.engine.asarray_f32(hidden_states)
+            if not bool(np.isfinite(x_nd).all()):
+                raise RealizerError("Non-finite hidden_states supplied to final_logits.")
             norm_w_nd = self._load_tensor_nd("model.norm.weight", loaded)
             normed_nd = self.engine.rms_norm_nd(x_nd, norm_w_nd, self.arch.rms_norm_eps)
             lm_w_nd = self._load_tensor_nd(head_name, loaded)
             logits_nd = self.engine.linear_x_wt_nd(normed_nd, lm_w_nd)
+            if not bool(np.isfinite(logits_nd).all()):
+                raise RealizerError("Non-finite logits produced in final_logits.")
             return [[float(v) for v in row] for row in logits_nd.tolist()]
+        if any(not math.isfinite(float(v)) for row in hidden_states for v in row):
+            raise RealizerError("Non-finite hidden_states supplied to final_logits.")
         norm_w = self._load_tensor("model.norm.weight", loaded)
         normed = self.engine.rms_norm_2d(hidden_states, norm_w, self.arch.rms_norm_eps)
         lm_w = self._load_tensor(head_name, loaded)
-        return self.engine.linear_x_wt(normed, lm_w)
+        out = self.engine.linear_x_wt(normed, lm_w)
+        if any(not math.isfinite(float(v)) for row in out for v in row):
+            raise RealizerError("Non-finite logits produced in final_logits.")
+        return out
 
     def _forward_layer_numpy(
         self,
@@ -283,8 +296,15 @@ class TransformerLayerRealizer:
         k_rot = self.engine.rope_3d_nd(k_heads, start_position=start_pos, rope_theta=self.arch.rope_theta)
 
         if start_pos > 0:
-            past_k_nd = self.engine.asarray_f32(past_k)
-            past_v_nd = self.engine.asarray_f32(past_v)
+            try:
+                past_k_nd = self.engine.asarray_f32(past_k)
+                past_v_nd = self.engine.asarray_f32(past_v)
+            except ValueError as exc:
+                raise RealizerError(f"Malformed past KV cache: {exc}") from exc
+            if past_k_nd.shape != (start_pos, nkv, hd) or past_v_nd.shape != (start_pos, nkv, hd):
+                raise RealizerError("past_k / past_v head dimensions disagree with architecture.")
+            if not bool(np.isfinite(past_k_nd).all()) or not bool(np.isfinite(past_v_nd).all()):
+                raise RealizerError("Non-finite values in past KV cache.")
             k_full_nd = np.ascontiguousarray(np.concatenate((past_k_nd, k_rot), axis=0), dtype=np.float32)
             v_full_nd = np.ascontiguousarray(np.concatenate((past_v_nd, v_heads), axis=0), dtype=np.float32)
         else:

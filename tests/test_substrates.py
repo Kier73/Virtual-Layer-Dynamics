@@ -293,3 +293,139 @@ def test_portable_computational_room_across_4_realizers_and_rollback_pins() -> N
     rolled_back = {**capsule, "receipts": capsule["receipts"][:2]}
     with pytest.raises(RoomError, match="rollback"):
         verify_room_capsule(rolled_back, expected_head_digest=head)
+
+
+def test_atomic_cow_fault_wasm_edge_cases_simt_publication_and_false_arithmetic_refusal(tmp_path: Path) -> None:
+    """Verify cross-page write atomicity, distributed M1 CoW (`G28`), WASM non-wrapping OOB / valued blocks / div_s overflow,
+    SIMT barrier-published shared memory & max_steps cap, and E-GPU rehashed false arithmetic rejection.
+    """
+    from vld.accel import encode_f32_le
+    from vld.canonical import canonical_bytes
+    from vld.substrates import EGPUError, TileDeltaRecord, WASM_MAGIC
+    from vld.substrates.lifting import _encode_s_leb128, _encode_u_leb128
+
+    # 1. Cross-page write_bytes MUST be 100% atomic when second page hits ResidentQuotaExceededError!
+    vps = VirtualPageSpace(page_size=64, max_resident_pages=1)
+    vps.map_region(0, 128, flags=PF_R | PF_W, initial_bytes=b"A" * 128)
+    with pytest.raises(ResidentQuotaExceededError):
+        vps.write_bytes(60, b"ZZZZZZZZ")
+    assert vps.read_bytes(0, 128) == b"A" * 128
+
+    # Distributed CoW across two independently M1-restored VM processes (`G28`)
+    store = PagedObjectStore(InMemoryPageBacking(page_size=256))
+    k1, k2 = DeterministicVMKernel(), DeterministicVMKernel()
+    p_orig = k1.spawn("base", (VMInstruction("HALT", ()),))
+    p_orig.memory.write_bytes(0, b"SHARED_SNAPSHOT")
+    snap = k1.snapshot_process_to_m1(p_orig, store)
+    r1 = k1.restore_process_from_m1(snap, store)
+    r2 = k2.restore_process_from_m1(snap, store)
+    r1.memory.write_bytes(0, b"MUTATED_BY_R1__")
+    assert r2.memory.read_bytes(0, 15) == b"SHARED_SNAPSHOT"
+
+    # 2. WASM: (a) 0xFFFFFFF0 + 0x20 OOB memory trap, (b) valued if/else + br_table + i64.div_s(-2^63, -1) overflow & -7/2 == -3
+    def _sec(sid: int, payload: bytes) -> bytes:
+        return bytes([sid]) + _encode_u_leb128(len(payload)) + payload
+
+    oob_body = b"\x00\x41" + _encode_s_leb128(-16) + b"\x28\x00\x20\x0b"
+    oob_wasm = (
+        WASM_MAGIC
+        + _sec(1, b"\x01\x60\x00\x01\x7f")
+        + _sec(3, b"\x01\x00")
+        + _sec(5, b"\x01\x00\x01")
+        + _sec(7, b"\x01\x03oob\x00\x00")
+        + _sec(10, b"\x01" + _encode_u_leb128(len(oob_body)) + oob_body)
+    )
+    with pytest.raises(LiftingError, match="out-of-bounds"):
+        WasmRealizer(lift_wasm_module(oob_wasm)).invoke("oob")
+
+    # Valued block + if/else + br_table + i64.div_s(a, b): fn(sel: i32, a: i64, b: i64) -> i64
+    # block (result i64) {
+    #   if sel == 0 (result i64) { a /_s b } else { block { br_table [0, 1] sel } ; i64.const 99 }
+    # }
+    edge_ins = bytearray()
+    edge_ins += b"\x02\x7e"  # block (result i64)
+    edge_ins += b"\x20\x00\x45\x04\x7e"  # local.get 0; i32.eqz; if (result i64)
+    edge_ins += b"\x20\x01\x20\x02\x7f"  # local.get 1; local.get 2; i64.div_s
+    edge_ins += b"\x05"  # else
+    edge_ins += b"\x42" + _encode_s_leb128(42)  # push 42 for outer valued br!
+    edge_ins += b"\x02\x40\x20\x00\x0e\x02\x00\x00\x02\x0b"  # block void { local.get 0; br_table [0, 0, default=2(outer!)]; }
+    edge_ins += b"\x1a\x42" + _encode_s_leb128(99)  # drop 42; push 99
+    edge_ins += b"\x0b\x0b\x0b"  # end if, end outer block, end func
+    edge_body = b"\x00" + bytes(edge_ins)
+    edge_wasm = (
+        WASM_MAGIC
+        + _sec(1, b"\x01\x60\x03\x7f\x7e\x7e\x01\x7e")
+        + _sec(3, b"\x01\x00")
+        + _sec(7, b"\x01\x04edge\x00\x00")
+        + _sec(10, b"\x01" + _encode_u_leb128(len(edge_body)) + edge_body)
+    )
+    edge_runner = WasmRealizer(lift_wasm_module(edge_wasm))
+    # WASM truncated-toward-zero: -7 / 2 == -3 (unsigned 64-bit 2^64 - 3), NOT Python's floor -4!
+    assert edge_runner.invoke("edge", (0, -7, 2)) == ((-3) & 0xFFFFFFFFFFFFFFFF,)
+    # br_table index 1 -> depth 0 -> falls through to 99; index 5 -> default depth 2 -> branches to outer block carrying 42!
+    assert edge_runner.invoke("edge", (1, 0, 1)) == (99,)
+    assert edge_runner.invoke("edge", (5, 0, 1)) == (42,)
+    # -2^63 / -1 MUST trap on signed division overflow!
+    with pytest.raises(LiftingError, match="overflow"):
+        edge_runner.invoke("edge", (0, -(1 << 63), -1))
+
+    # 3. SIMT barrier-published shared memory & infinite-loop max_steps enforcement!
+    simt = SIMTWorkgroupExecutor(workgroup_size=2, shared_elements=4)
+    g_pub, s_pub = simt.execute_kernel(
+        (
+            SIMTInstruction("STORE_SHARED", ("lane_id", "lane_id")),
+            SIMTInstruction("BARRIER", ("b0",)),
+            SIMTInstruction("LOAD_SHARED", ("r1", "r0", 0)),  # Both lanes MUST see pre-epoch 0.0, not 999.0!
+            SIMTInstruction("MOV_IMM", ("r2", 999.0)),
+            SIMTInstruction("STORE_SHARED", ("lane_id", "r2")),
+            SIMTInstruction("BARRIER", ("b1",)),
+            SIMTInstruction("STORE_GLOBAL", ("lane_id", "r1")),
+            SIMTInstruction("HALT", ()),
+        ),
+        [0.0, 0.0],
+    )
+    assert g_pub == [0.0, 0.0] and s_pub[:2] == [999.0, 999.0]
+
+    with pytest.raises(EGPUError, match="max_steps"):
+        simt.execute_kernel((SIMTInstruction("JZ_EVEN_LANE", ("r0", 0)), SIMTInstruction("HALT", ())), [0.0, 0.0], max_steps=25)
+
+    # 4. E-GPU: Completed checkpoint replay dispatches 0 tiles; callback operand mutation is isolated; rehashed false arithmetic is rejected!
+    d_path = tmp_path / "strict_deltas.jsonl"
+    mat_a = [[2.0, 3.0], [4.0, 5.0]]
+    mat_b = [[1.0, 2.0], [3.0, 4.0]]
+    dispatches = {"count": 0}
+
+    def _mutating_worker(_tr: int, _tc: int, a_sl: list[list[float]], b_sl: list[list[float]]) -> list[list[float]]:
+        dispatches["count"] += 1
+        res = [[sum(a_sl[i][p] * b_sl[p][j] for p in range(len(b_sl))) for j in range(len(b_sl[0]))] for i in range(len(a_sl))]
+        # Attempt to poison operands in-place to trick oracle!
+        a_sl[0][0] = -1e9
+        b_sl[0][0] = -1e9
+        return res
+
+    ex = TiledTensorExecutor(tile_m=1, tile_n=2)
+    c1, tel1 = ex.matmul_tiled_recoverable(mat_a, mat_b, checkpoint_log=DeltaTensorCheckpointLog(d_path), tile_compute_fn=_mutating_worker)
+    assert c1 == [[11.0, 16.0], [19.0, 28.0]] and dispatches["count"] == 2
+
+    # Replay of completed checkpoint dispatches ZERO worker calls!
+    c2, tel2 = ex.matmul_tiled_recoverable(mat_a, mat_b, checkpoint_log=DeltaTensorCheckpointLog(d_path), tile_compute_fn=_mutating_worker)
+    assert c2 == c1 and tel2["newly_computed_tiles"] == 0 and dispatches["count"] == 2
+
+    # Rehashed false arithmetic (valid SHA-256 + valid hash chain, wrong matrix product!) MUST raise ForgedTileDigestError!
+    forged_raw = encode_f32_le([-77.0, -88.0])
+    forged_rec = TileDeltaRecord(
+        seq=0,
+        plan_digest=tel1["plan_digest"],
+        operation_id="egpu.matmul:0:0",
+        tile_row=0,
+        tile_col=0,
+        rows=1,
+        cols=2,
+        tile_f32_hex=forged_raw.hex(),
+        tile_sha256=hashlib.sha256(forged_raw).hexdigest(),
+        prev_digest="0" * 64,
+    )
+    d_path.write_bytes(canonical_bytes(forged_rec.to_dict()) + b"\n")
+    with pytest.raises(ForgedTileDigestError, match="arithmetic oracle"):
+        ex.matmul_tiled_recoverable(mat_a, mat_b, checkpoint_log=DeltaTensorCheckpointLog(d_path))
+

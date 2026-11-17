@@ -248,6 +248,8 @@ class ForwardingWorkerNode:
         client_ssl_context: Any,
         allowed_peers: frozenset[str],
         executor_fn: Callable[[ComputationNode, Mapping[str, bytes]], tuple[Any, bytes | None]],
+        allowed_coordinators: frozenset[str] | None = None,
+        coordinator_secret: bytes | None = None,
         drop_stream_after_bytes: int | None = None,
     ) -> None:
         self.worker_dns = worker_dns
@@ -255,6 +257,8 @@ class ForwardingWorkerNode:
         self.store = store
         self._client_ssl = client_ssl_context
         self._executor_fn = executor_fn
+        self._allowed_coordinators = None if allowed_coordinators is None else frozenset(allowed_coordinators)
+        self._coordinator_secret = coordinator_secret
         self.server = MTLSPeerServer(
             peer_id=worker_dns,
             ssl_context=server_ssl_context,
@@ -273,9 +277,21 @@ class ForwardingWorkerNode:
     def _handle_control(self, caller_dns: str, body: dict[str, Any]) -> dict[str, Any]:
         if body.get("op") != "execute_assignment":
             raise ForwardingError(f"Unsupported worker control op: {body.get('op')!r}")
+        if self._allowed_coordinators is not None and caller_dns not in self._allowed_coordinators:
+            raise UnauthorizedCommitError(f"Peer {caller_dns!r} is not an authorized coordinator for {self.worker_dns!r}.")
         assignment = WorkerExecutionAssignment.from_dict(body["assignment"])
         if assignment.assigned_worker_dns != self.worker_dns:
             raise UnauthorizedCommitError("Assignment target DNS does not match this worker.")
+        if self._coordinator_secret is not None:
+            expected_mac = WorkerExecutionAssignment.compute_mac(
+                self._coordinator_secret,
+                dag_id=assignment.dag_id,
+                node_digest=assignment.node.digest,
+                assigned_worker_dns=assignment.assigned_worker_dns,
+                ticket_digests=tuple(t.manifest_digest for t in assignment.upstream_tickets),
+            )
+            if not hmac.compare_digest(assignment.assignment_mac, expected_mac):
+                raise UnauthorizedCommitError("Worker rejected forged coordinator assignment MAC.")
 
         # Pull upstream M1 objects DIRECTLY from predecessor worker hosts over mTLS!
         upstream_bytes: dict[str, bytes] = {}
@@ -428,6 +444,14 @@ class ForwardingCoordinator:
             raise UnauthorizedCommitError("Invalid worker completion MAC.")
 
         if receipt.output_ticket is not None:
+            if receipt.output_ticket.node_id != node.node_id:
+                raise UnauthorizedCommitError(
+                    f"Output ticket node_id {receipt.output_ticket.node_id!r} disagrees with committed node {node.node_id!r}."
+                )
+            if receipt.output_ticket.producer_dns != receipt.worker_dns:
+                raise UnauthorizedCommitError(
+                    f"Output ticket producer_dns {receipt.output_ticket.producer_dns!r} disagrees with worker {receipt.worker_dns!r}."
+                )
             self._tickets_by_node[node.node_id] = receipt.output_ticket
 
         res = self.dag.commit_result(

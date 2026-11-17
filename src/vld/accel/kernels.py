@@ -152,8 +152,9 @@ class NumericEngine:
     def rms_norm_nd(self, x_nd: Any, weight_nd: Any, eps: float) -> Any:
         r"""Contiguous `ndarray`-resident row/last-axis RMSNorm across arbitrary leading rank."""
         assert _np is not None
-        inv_rms = _np.reciprocal(_np.sqrt(_np.mean(x_nd * x_nd, axis=-1, keepdims=True) + _np.float32(eps)))
-        return _np.ascontiguousarray((x_nd * inv_rms) * weight_nd, dtype=_np.float32)
+        x64 = x_nd.astype(_np.float64)
+        inv_rms = _np.reciprocal(_np.sqrt(_np.mean(x64 * x64, axis=-1, keepdims=True) + float(eps)))
+        return _np.ascontiguousarray((x64 * inv_rms) * weight_nd.astype(_np.float64), dtype=_np.float32)
 
     def rope_3d_nd(self, heads_3d_nd: Any, *, start_position: int, rope_theta: float) -> Any:
         r"""Vectorized `ndarray`-resident Rotary Position Embedding over `[seq_len, n_heads, head_dim]`."""
@@ -231,10 +232,10 @@ class NumericEngine:
     ) -> list[list[float]]:
         r"""Compute row-wise $\operatorname{RMSNorm}(x_i) = \frac{x_i}{\sqrt{\frac{1}{D}\sum_j x_{i,j}^2 + \epsilon}} \odot w$."""
         if self.uses_numpy and _np is not None:
-            xa = _np.asarray(x, dtype=_np.float32)
-            wa = _np.asarray(weight, dtype=_np.float32)
-            inv_rms = _np.reciprocal(_np.sqrt(_np.mean(xa * xa, axis=-1, keepdims=True) + _np.float32(eps)))
-            ya = (xa * inv_rms) * wa
+            xa = _np.asarray(x, dtype=_np.float64)
+            wa = _np.asarray(weight, dtype=_np.float64)
+            inv_rms = _np.reciprocal(_np.sqrt(_np.mean(xa * xa, axis=-1, keepdims=True) + float(eps)))
+            ya = ((xa * inv_rms) * wa).astype(_np.float32)
             return [[float(v) for v in row] for row in ya.tolist()]
         d = len(weight)
         out: list[list[float]] = []
@@ -265,9 +266,10 @@ class NumericEngine:
     ) -> list[list[float]]:
         r"""Compute $\operatorname{SiLU}(\text{gate}) \odot \text{up}$ where $\operatorname{SiLU}(z) = \frac{z}{1 + e^{-z}}$."""
         if self.uses_numpy and _np is not None:
-            ga = _np.asarray(gate, dtype=_np.float32)
+            ga = _np.asarray(gate, dtype=_np.float64)
             ua = _np.asarray(up, dtype=_np.float32)
-            ya = (ga / (_np.float32(1.0) + _np.exp(-ga))) * ua
+            sig = _np.where(ga >= 0.0, 1.0 / (1.0 + _np.exp(-ga)), _np.exp(ga) / (1.0 + _np.exp(ga)))
+            ya = (ga * sig).astype(_np.float32) * ua
             return [[float(v) for v in row] for row in ya.tolist()]
         out: list[list[float]] = []
         for g_row, u_row in zip(gate, up):

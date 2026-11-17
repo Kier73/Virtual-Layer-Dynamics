@@ -11,7 +11,7 @@ A `ProofGround` is a finite directed AND/OR hypergraph $\mathcal{H} = (\mathcal{
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Mapping, Sequence
 
@@ -75,7 +75,7 @@ class ProofObligation:
     environment: ProofEnvironment
     goal: Mapping[str, Any]
     local_context: tuple[Mapping[str, Any], ...] = ()
-    metavariables: Mapping[str, Any] = MappingProxyType({})
+    metavariables: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))
     assumptions: tuple[Mapping[str, Any], ...] = ()
 
     def __post_init__(self) -> None:

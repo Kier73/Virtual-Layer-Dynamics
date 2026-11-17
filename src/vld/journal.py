@@ -159,6 +159,12 @@ class HashChainedJournal:
             return len(self._events)
 
     @contextmanager
+    def exclusive_guard(self) -> Iterator[None]:
+        """Public reentrant intra-process and cross-process exclusive file guard."""
+        with self._exclusive_guard():
+            yield
+
+    @contextmanager
     def _exclusive_guard(self) -> Iterator[None]:
         """Acquire intra-process reentrant lock plus cross-process OS lock on `<path>.lock`."""
         with self._thread_lock:

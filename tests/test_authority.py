@@ -339,3 +339,124 @@ vp.step_json(
     shutil.copyfile(session_dir / "checkpoint_000001.json", session_dir / "latest.json")
     with pytest.raises(RollbackDetectedError):
         vp2.session.verify_latest_pointer()
+
+
+def test_cross_term_split_brain_duplicate_targets_and_concurrent_multiprocess_recovery(tmp_path: Path) -> None:
+    """Verify Paxos Phase 1b/2a cross-term locking, duplicate target rejection, Ground freshness, and 2-process race."""
+    from vld.authority import SessionError
+    import json
+
+    # 1. Duplicate member IDs in active_member_ids must NEVER spoof strict majority!
+    membership, members, secrets, coord_a = _build_5node_cluster(tmp_path / "split")
+    coord_b = QuorumLineageCoordinator(
+        membership,
+        members,
+        secrets,
+        ledger_path=tmp_path / "split" / "coordinator_ledger_b.jsonl",
+    )
+    with pytest.raises(QuorumInsufficientError):
+        coord_a.fence_term(2, active_member_ids=("auth-0", "auth-0", "auth-0"))
+
+    # 2. Cross-term split-brain refusal: coord_a seals D_A at (slot=1, term=2) on {0,1,2};
+    #    coord_b fences term=3 on {2,3,4} and proposes conflicting D_B != D_A -> MUST raise QuorumEquivocationError!
+    d_a = domain_digest("test.m1", "manifest-A")
+    d_b = domain_digest("test.m1", "manifest-B")
+    coord_a.propose_and_seal(
+        slot=1,
+        term=2,
+        predecessor_manifest_digest="0" * 64,
+        state_manifest_digest=d_a,
+        proposer_id="host-a",
+        operation_id="op-a",
+        active_member_ids=("auth-0", "auth-1", "auth-2"),
+    )
+    coord_b.fence_term(3, active_member_ids=("auth-2", "auth-3", "auth-4"), owner_id="host-b")
+    with pytest.raises(QuorumEquivocationError, match="Cross-term equivocation"):
+        coord_b.propose_and_seal(
+            slot=1,
+            term=3,
+            predecessor_manifest_digest="0" * 64,
+            state_manifest_digest=d_b,
+            proposer_id="host-b",
+            operation_id="op-b",
+            active_member_ids=("auth-2", "auth-3", "auth-4"),
+        )
+
+    # 3. Repeated pre-quorum recoveries strictly advance term (2 -> 3) & mismatched ground_fingerprint is rejected!
+    race_root = tmp_path / "race"
+    _, _, _, r_coord = _build_5node_cluster(race_root / "cluster")
+    r_store = PagedObjectStore(DiskPageBacking(race_root / "m1", page_size=128))
+    g_fp = domain_digest("test.ground", "race-v1")
+    sess_init = ComputationalSession(
+        session_id="sess-race",
+        processor_id="vp-race",
+        host_id="host-init",
+        ground_fingerprint=g_fp,
+        store=r_store,
+        coordinator=r_coord,
+        session_dir=race_root / "session",
+        term=1,
+    )
+    sess_init.initialize({"val": 1})
+
+    with pytest.raises(SessionError, match="ground_fingerprint"):
+        ComputationalSession(
+            session_id="sess-race",
+            processor_id="vp-race",
+            host_id="host-wrong-ground",
+            ground_fingerprint=domain_digest("test.ground", "invalidated-v2"),
+            store=r_store,
+            coordinator=r_coord,
+            session_dir=race_root / "session",
+            term=1,
+        )
+
+    # 4. Concurrent multi-process VirtualProcessor.recover_on_new_host race against shared 5-node cluster!
+    race_script = """
+import json, sys
+from pathlib import Path
+from vld.authority import QuorumAuthorityMember, QuorumLineageCoordinator, QuorumMembership, VirtualProcessor
+from vld.memory import DiskPageBacking, PagedObjectStore
+
+root = Path(sys.argv[1])
+host_id = sys.argv[2]
+g_fp = sys.argv[3]
+mids = tuple(f"auth-{i}" for i in range(5))
+membership = QuorumMembership("lineage.vp01", mids)
+secrets = {mid: f"secret-key-for-{mid}-0123456789".encode("utf-8") for mid in mids}
+members = [QuorumAuthorityMember(mid, secrets[mid], journal_path=root / "cluster" / "members" / f"{mid}.jsonl") for mid in mids]
+coord = QuorumLineageCoordinator(membership, members, secrets, ledger_path=root / "cluster" / "coordinator_ledger.jsonl")
+store = PagedObjectStore(DiskPageBacking(root / "m1", page_size=128))
+vp = VirtualProcessor.recover_on_new_host(
+    session_id="sess-race",
+    processor_id="vp-race",
+    new_host_id=host_id,
+    ground_fingerprint=g_fp,
+    store=store,
+    coordinator=coord,
+    session_dir=root / "session",
+)
+print(json.dumps({"host_id": host_id, "term": vp.term}))
+"""
+    p_a = subprocess.Popen(
+        [sys.executable, "-c", race_script, str(race_root), "racer-A", g_fp],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    p_b = subprocess.Popen(
+        [sys.executable, "-c", race_script, str(race_root), "racer-B", g_fp],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    out_a, err_a = p_a.communicate(timeout=15)
+    out_b, err_b = p_b.communicate(timeout=15)
+    assert p_a.returncode == 0, err_a
+    assert p_b.returncode == 0, err_b
+    res_a = json.loads(out_a.strip())
+    res_b = json.loads(out_b.strip())
+    # Exclusive epoch ownership guarantees the two racing processes never share the same fencing term!
+    assert res_a["term"] != res_b["term"]
+    assert min(res_a["term"], res_b["term"]) >= 2
+

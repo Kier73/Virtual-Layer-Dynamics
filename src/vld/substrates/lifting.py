@@ -28,6 +28,7 @@ from vld.substrates.vm import (
     PF_R,
     PF_W,
     PF_X,
+    VMError,
     VMInstruction,
     VirtualPageSpace,
 )
@@ -170,6 +171,7 @@ def lift_elf64_image(
     load_bias: int = 0,
     enforce_w_xor_x: bool = True,
     page_size: int = 4096,
+    max_segment_bytes: int = 64 * 1024 * 1024,
 ) -> tuple[LiftedProcessGround, VirtualPageSpace]:
     """Validate an ELF64 binary image and stage its `PT_LOAD` segments into a `VirtualPageSpace`."""
     if not isinstance(raw_elf, bytes) or len(raw_elf) < 64 or raw_elf[:4] != ELF_MAGIC:
@@ -199,12 +201,17 @@ def lift_elf64_image(
         raise LiftingError(f"Unsupported ELF machine {e_machine}.")
     if e_type == ET_EXEC and load_bias != 0:
         raise LiftingError("Non-zero load_bias is only valid for PIE (ET_DYN) ELF images.")
+    if load_bias < 0:
+        raise LiftingError("load_bias must be non-negative.")
     if e_phnum == 0 or e_phnum > 1024 or e_phentsize < 56:
         raise LiftingError("Invalid ELF program header count or entry size.")
     if e_phoff + e_phnum * e_phentsize > len(raw_elf):
         raise LiftingError("ELF program header table exceeds file bounds.")
 
-    vspace = VirtualPageSpace(page_size=page_size)
+    try:
+        vspace = VirtualPageSpace(page_size=page_size)
+    except VMError as exc:
+        raise LiftingError(str(exc)) from exc
     seg_descs: list[ElfSegmentDescriptor] = []
 
     for idx in range(e_phnum):
@@ -216,6 +223,8 @@ def lift_elf64_image(
             continue
         if p_memsz == 0:
             continue
+        if p_memsz > max_segment_bytes:
+            raise LiftingError(f"ELF PT_LOAD segment memsz {p_memsz} exceeds max_segment_bytes ({max_segment_bytes}).")
         if p_filesz > p_memsz or p_offset + p_filesz > len(raw_elf):
             raise LiftingError("ELF PT_LOAD segment bounds invalid.")
         if enforce_w_xor_x and (p_flags & PF_W) and (p_flags & PF_X):
@@ -224,7 +233,10 @@ def lift_elf64_image(
         mapped_vaddr = p_vaddr + load_bias
         seg_bytes = raw_elf[p_offset : p_offset + p_filesz]
         perm = p_flags & (PF_R | PF_W | PF_X)
-        vspace.map_region(mapped_vaddr, p_memsz, flags=perm, initial_bytes=seg_bytes, allow_overwrite=False)
+        try:
+            vspace.map_region(mapped_vaddr, p_memsz, flags=perm, initial_bytes=seg_bytes, allow_overwrite=False)
+        except VMError as exc:
+            raise LiftingError(f"ELF segment mapping failed: {exc}") from exc
         seg_descs.append(
             ElfSegmentDescriptor(
                 vaddr=mapped_vaddr,
@@ -242,6 +254,8 @@ def lift_elf64_image(
     src_sha = hashlib.sha256(raw_elf).hexdigest()
     arch_name = ELF_MACHINES[e_machine]
     entry_vaddr = e_entry + load_bias
+    if not any((s.vaddr <= entry_vaddr < s.vaddr + s.mem_size) and bool(s.flags & PF_X) for s in seg_descs):
+        raise LiftingError(f"ELF64 entrypoint {entry_vaddr:#x} does not reside inside an executable PT_LOAD segment.")
     spec = VirtualGroundSpec(
         ground_id=f"vld.elf64.{src_sha[:16]}",
         version="1.0.0",
@@ -293,11 +307,12 @@ def _encode_s_leb128(val: int) -> bytes:
         out.append(b | 0x80)
 
 
-def _read_u_leb128(buf: bytes, pos: int, max_bits: int = 32) -> tuple[int, int]:
+def _read_u_leb128(buf: bytes, pos: int, max_bits: int = 32, limit: int | None = None) -> tuple[int, int]:
+    bound = len(buf) if limit is None else min(len(buf), limit)
     result = 0
     shift = 0
     while True:
-        if pos >= len(buf):
+        if pos >= bound:
             raise LiftingError("Truncated unsigned LEB128 in WASM binary.")
         b = buf[pos]
         pos += 1
@@ -311,11 +326,12 @@ def _read_u_leb128(buf: bytes, pos: int, max_bits: int = 32) -> tuple[int, int]:
             raise LiftingError("Overlong unsigned LEB128 in WASM binary.")
 
 
-def _read_s_leb128(buf: bytes, pos: int, bits: int = 64) -> tuple[int, int]:
+def _read_s_leb128(buf: bytes, pos: int, bits: int = 64, limit: int | None = None) -> tuple[int, int]:
+    bound = len(buf) if limit is None else min(len(buf), limit)
     result = 0
     shift = 0
     while True:
-        if pos >= len(buf):
+        if pos >= bound:
             raise LiftingError("Truncated signed LEB128 in WASM binary.")
         b = buf[pos]
         pos += 1
@@ -327,6 +343,34 @@ def _read_s_leb128(buf: bytes, pos: int, bits: int = 64) -> tuple[int, int]:
             return result, pos
         if shift >= bits + 7:
             raise LiftingError("Overlong signed LEB128 in WASM binary.")
+
+
+def _to_s32(u: int) -> int:
+    v = u & 0xFFFFFFFF
+    return v - 0x100000000 if (v & 0x80000000) else v
+
+
+def _to_s64(u: int) -> int:
+    v = u & 0xFFFFFFFFFFFFFFFF
+    return v - 0x10000000000000000 if (v & 0x8000000000000000) else v
+
+
+def _wasm_div_s(a_s: int, b_s: int, min_signed: int) -> int:
+    if b_s == 0:
+        raise LiftingError("WASM trap: integer divide by zero.")
+    if a_s == min_signed and b_s == -1:
+        raise LiftingError("WASM trap: signed integer division overflow.")
+    q = abs(a_s) // abs(b_s)
+    return -q if ((a_s < 0) ^ (b_s < 0)) else q
+
+
+def _wasm_rem_s(a_s: int, b_s: int) -> int:
+    if b_s == 0:
+        raise LiftingError("WASM trap: integer remainder by zero.")
+    q = abs(a_s) // abs(b_s)
+    if (a_s < 0) ^ (b_s < 0):
+        q = -q
+    return a_s - q * b_s
 
 
 @dataclass(frozen=True, slots=True)
@@ -369,6 +413,8 @@ def _parse_wasm_expr(code: bytes) -> tuple[WasmDecodedInstr, ...]:
             if pos >= len(code):
                 raise LiftingError("Truncated WASM blocktype.")
             bt = code[pos]
+            if bt not in (0x40, 0x7F, 0x7E):
+                raise LiftingError(f"Unsupported WASM blocktype {bt:#04x}.")
             pos += 1
             raw_ins.append([op, (bt,), None, None])
             ctrl_stack.append((op, idx))
@@ -376,6 +422,8 @@ def _parse_wasm_expr(code: bytes) -> tuple[WasmDecodedInstr, ...]:
             if not ctrl_stack or ctrl_stack[-1][0] != 0x04:
                 raise LiftingError("Misplaced WASM else opcode.")
             _, if_idx = ctrl_stack[-1]
+            if raw_ins[if_idx][2] is not None:
+                raise LiftingError("Duplicate WASM else opcode in same if block.")
             raw_ins.append([op, (), None, None])
             raw_ins[if_idx][2] = idx
         elif op == 0x0B:  # end
@@ -386,9 +434,21 @@ def _parse_wasm_expr(code: bytes) -> tuple[WasmDecodedInstr, ...]:
                 break
             blk_op, blk_idx = ctrl_stack.pop()
             raw_ins[blk_idx][3] = idx
-            if blk_op == 0x04 and raw_ins[blk_idx][2] is not None:
-                else_idx = raw_ins[blk_idx][2]
-                raw_ins[else_idx][3] = idx
+            if blk_op == 0x04:
+                if raw_ins[blk_idx][2] is not None:
+                    else_idx = raw_ins[blk_idx][2]
+                    raw_ins[else_idx][3] = idx
+                elif raw_ins[blk_idx][1][0] != 0x40:
+                    raise LiftingError("Valued WASM if block requires an explicit else branch.")
+        elif op == 0x0E:  # br_table
+            t_cnt, pos = _read_u_leb128(code, pos, 32)
+            if t_cnt > 4096:
+                raise LiftingError("WASM br_table target count exceeds safety cap.")
+            targets: list[int] = []
+            for _ in range(t_cnt + 1):
+                tv, pos = _read_u_leb128(code, pos, 32)
+                targets.append(tv)
+            raw_ins.append([op, tuple(targets), None, None])
         elif op in (0x0C, 0x0D, 0x10, 0x20, 0x21, 0x22):  # br, br_if, call, local.get/set/tee
             v, pos = _read_u_leb128(code, pos, 32)
             raw_ins.append([op, (v,), None, None])
@@ -404,10 +464,10 @@ def _parse_wasm_expr(code: bytes) -> tuple[WasmDecodedInstr, ...]:
             raw_ins.append([op, (v & 0xFFFFFFFFFFFFFFFF,), None, None])
         elif op in (
             0x00, 0x01, 0x0F, 0x1A, 0x1B,
-            0x45, 0x46, 0x47, 0x49, 0x4B,
-            0x50, 0x51, 0x52, 0x54, 0x56,
-            0x6A, 0x6B, 0x6C, 0x70, 0x71, 0x72, 0x73, 0x74, 0x76,
-            0x7C, 0x7D, 0x7E, 0x82, 0x83, 0x84, 0x85, 0x86, 0x88,
+            0x45, 0x46, 0x47, 0x48, 0x49, 0x4A, 0x4B, 0x4C, 0x4D, 0x4E, 0x4F,
+            0x50, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5A,
+            0x6A, 0x6B, 0x6C, 0x6D, 0x6E, 0x6F, 0x70, 0x71, 0x72, 0x73, 0x74, 0x75, 0x76,
+            0x7C, 0x7D, 0x7E, 0x7F, 0x80, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88,
         ):
             raw_ins.append([op, (), None, None])
         else:
@@ -418,7 +478,12 @@ def _parse_wasm_expr(code: bytes) -> tuple[WasmDecodedInstr, ...]:
     return tuple(WasmDecodedInstr(r[0], r[1], r[2], r[3]) for r in raw_ins)
 
 
-def lift_wasm_module(raw_wasm: bytes) -> LiftedWasmModule:
+def lift_wasm_module(
+    raw_wasm: bytes,
+    *,
+    max_memory_pages: int = 256,
+    max_locals_per_func: int = 4096,
+) -> LiftedWasmModule:
     """Parse and validate a binary WebAssembly 1.0 module into a `LiftedWasmModule`."""
     if not isinstance(raw_wasm, bytes) or len(raw_wasm) < 8 or raw_wasm[:8] != WASM_MAGIC:
         raise LiftingError("Invalid WebAssembly binary magic or version.")
@@ -427,6 +492,7 @@ def lift_wasm_module(raw_wasm: bytes) -> LiftedWasmModule:
     func_types: list[tuple[tuple[int, ...], tuple[int, ...]]] = []
     func_type_indices: list[int] = []
     min_mem_pages = 0
+    has_memory = False
     exports: dict[str, tuple[int, int]] = {}
     code_bodies: list[tuple[tuple[int, ...], tuple[WasmDecodedInstr, ...]]] = []
     data_segs: list[tuple[int, bytes]] = []
@@ -447,74 +513,106 @@ def lift_wasm_module(raw_wasm: bytes) -> LiftedWasmModule:
         if sec_id == 0:  # Custom section
             pos = sec_end
         elif sec_id == 1:  # Type section
-            cnt, pos = _read_u_leb128(raw_wasm, pos, 32)
+            cnt, pos = _read_u_leb128(raw_wasm, pos, 32, sec_end)
             for _ in range(cnt):
-                if raw_wasm[pos] != 0x60:
+                if pos >= sec_end or raw_wasm[pos] != 0x60:
                     raise LiftingError("Expected 0x60 func type tag.")
                 pos += 1
-                p_cnt, pos = _read_u_leb128(raw_wasm, pos, 32)
+                p_cnt, pos = _read_u_leb128(raw_wasm, pos, 32, sec_end)
+                if pos + p_cnt > sec_end:
+                    raise LiftingError("Truncated WASM param types.")
                 params = tuple(raw_wasm[pos : pos + p_cnt])
                 pos += p_cnt
-                r_cnt, pos = _read_u_leb128(raw_wasm, pos, 32)
+                r_cnt, pos = _read_u_leb128(raw_wasm, pos, 32, sec_end)
+                if pos + r_cnt > sec_end:
+                    raise LiftingError("Truncated WASM result types.")
                 results = tuple(raw_wasm[pos : pos + r_cnt])
                 pos += r_cnt
+                if any(vt not in (0x7F, 0x7E) for vt in (*params, *results)):
+                    raise LiftingError("Only i32/i64 WASM value types are supported.")
                 func_types.append((params, results))
         elif sec_id == 3:  # Function section
-            cnt, pos = _read_u_leb128(raw_wasm, pos, 32)
+            cnt, pos = _read_u_leb128(raw_wasm, pos, 32, sec_end)
             for _ in range(cnt):
-                t_idx, pos = _read_u_leb128(raw_wasm, pos, 32)
+                t_idx, pos = _read_u_leb128(raw_wasm, pos, 32, sec_end)
                 if t_idx >= len(func_types):
                     raise LiftingError("Function references out-of-bounds type index.")
                 func_type_indices.append(t_idx)
         elif sec_id == 5:  # Memory section
-            cnt, pos = _read_u_leb128(raw_wasm, pos, 32)
+            cnt, pos = _read_u_leb128(raw_wasm, pos, 32, sec_end)
             if cnt > 1:
                 raise LiftingError("WASM 1.0 allows at most 1 linear memory.")
             if cnt == 1:
+                if pos >= sec_end:
+                    raise LiftingError("Truncated WASM memory limits.")
                 lim_flag = raw_wasm[pos]
+                if lim_flag not in (0, 1):
+                    raise LiftingError("Invalid WASM memory limit flag.")
                 pos += 1
-                min_mem_pages, pos = _read_u_leb128(raw_wasm, pos, 32)
+                min_mem_pages, pos = _read_u_leb128(raw_wasm, pos, 32, sec_end)
+                if min_mem_pages > max_memory_pages:
+                    raise LiftingError(f"WASM min_memory_pages {min_mem_pages} exceeds max_memory_pages ({max_memory_pages}).")
                 if lim_flag == 1:
-                    _, pos = _read_u_leb128(raw_wasm, pos, 32)
+                    max_p, pos = _read_u_leb128(raw_wasm, pos, 32, sec_end)
+                    if max_p < min_mem_pages:
+                        raise LiftingError("WASM memory max pages < min pages.")
+                has_memory = True
         elif sec_id == 7:  # Export section
-            cnt, pos = _read_u_leb128(raw_wasm, pos, 32)
+            cnt, pos = _read_u_leb128(raw_wasm, pos, 32, sec_end)
             for _ in range(cnt):
-                n_len, pos = _read_u_leb128(raw_wasm, pos, 32)
-                name = raw_wasm[pos : pos + n_len].decode("utf-8")
+                n_len, pos = _read_u_leb128(raw_wasm, pos, 32, sec_end)
+                if pos + n_len >= sec_end:
+                    raise LiftingError("Truncated WASM export entry.")
+                try:
+                    name = raw_wasm[pos : pos + n_len].decode("utf-8")
+                except UnicodeDecodeError as exc:
+                    raise LiftingError(f"Invalid UTF-8 WASM export name: {exc}") from exc
                 pos += n_len
                 kind = raw_wasm[pos]
                 pos += 1
-                e_idx, pos = _read_u_leb128(raw_wasm, pos, 32)
+                e_idx, pos = _read_u_leb128(raw_wasm, pos, 32, sec_end)
                 if name in exports:
                     raise LiftingError(f"Duplicate WASM export {name!r}.")
                 exports[name] = (kind, e_idx)
         elif sec_id == 10:  # Code section
-            cnt, pos = _read_u_leb128(raw_wasm, pos, 32)
+            cnt, pos = _read_u_leb128(raw_wasm, pos, 32, sec_end)
             for _ in range(cnt):
-                b_size, pos = _read_u_leb128(raw_wasm, pos, 32)
+                b_size, pos = _read_u_leb128(raw_wasm, pos, 32, sec_end)
                 b_end = pos + b_size
-                loc_decls, pos = _read_u_leb128(raw_wasm, pos, 32)
+                if b_end > sec_end:
+                    raise LiftingError("WASM function body exceeds Code section bounds.")
+                loc_decls, pos = _read_u_leb128(raw_wasm, pos, 32, b_end)
                 locals_flat: list[int] = []
                 for _ in range(loc_decls):
-                    l_cnt, pos = _read_u_leb128(raw_wasm, pos, 32)
+                    l_cnt, pos = _read_u_leb128(raw_wasm, pos, 32, b_end)
+                    if pos >= b_end:
+                        raise LiftingError("Truncated WASM local declaration.")
                     l_type = raw_wasm[pos]
+                    if l_type not in (0x7F, 0x7E):
+                        raise LiftingError(f"Unsupported WASM local value type {l_type:#04x}.")
                     pos += 1
+                    if len(locals_flat) + l_cnt > max_locals_per_func:
+                        raise LiftingError(f"WASM function locals exceed max_locals_per_func ({max_locals_per_func}).")
                     locals_flat.extend([l_type] * l_cnt)
                 expr_ins = _parse_wasm_expr(raw_wasm[pos:b_end])
                 pos = b_end
                 code_bodies.append((tuple(locals_flat), expr_ins))
         elif sec_id == 11:  # Data section
-            cnt, pos = _read_u_leb128(raw_wasm, pos, 32)
+            cnt, pos = _read_u_leb128(raw_wasm, pos, 32, sec_end)
             for _ in range(cnt):
-                mem_idx, pos = _read_u_leb128(raw_wasm, pos, 32)
-                if mem_idx != 0 or raw_wasm[pos] != 0x41:
+                if not has_memory:
+                    raise LiftingError("WASM Data section requires a declared Memory section.")
+                mem_idx, pos = _read_u_leb128(raw_wasm, pos, 32, sec_end)
+                if mem_idx != 0 or pos >= sec_end or raw_wasm[pos] != 0x41:
                     raise LiftingError("Only active i32.const WASM data segments supported.")
                 pos += 1
-                d_off, pos = _read_s_leb128(raw_wasm, pos, 32)
-                if raw_wasm[pos] != 0x0B:
+                d_off, pos = _read_s_leb128(raw_wasm, pos, 32, sec_end)
+                if pos >= sec_end or raw_wasm[pos] != 0x0B:
                     raise LiftingError("Expected 0x0B end after data offset expr.")
                 pos += 1
-                d_len, pos = _read_u_leb128(raw_wasm, pos, 32)
+                d_len, pos = _read_u_leb128(raw_wasm, pos, 32, sec_end)
+                if pos + d_len > sec_end:
+                    raise LiftingError("Truncated WASM data segment payload.")
                 d_bytes = raw_wasm[pos : pos + d_len]
                 pos += d_len
                 data_segs.append((d_off, d_bytes))
@@ -536,6 +634,19 @@ def lift_wasm_module(raw_wasm: bytes) -> LiftedWasmModule:
         )
         for t_idx, (locs, ins) in zip(func_type_indices, code_bodies)
     )
+    for kind, e_idx in exports.values():
+        if kind == 0 and e_idx >= len(funcs):
+            raise LiftingError("WASM function export references out-of-bounds function index.")
+    for fn in funcs:
+        total_locs = len(fn.param_types) + len(fn.local_types)
+        for ins in fn.instructions:
+            if ins.opcode in (0x20, 0x21, 0x22) and ins.imm[0] >= total_locs:
+                raise LiftingError("WASM local index out of bounds.")
+            if ins.opcode == 0x10 and ins.imm[0] >= len(funcs):
+                raise LiftingError("WASM call references out-of-bounds function index.")
+            if ins.opcode in (0x28, 0x36) and not has_memory:
+                raise LiftingError("WASM memory instruction requires a declared Memory section.")
+
     src_sha = hashlib.sha256(raw_wasm).hexdigest()
     entry_export = next((k for k, (kind, _) in sorted(exports.items()) if kind == 0), "<none>")
     spec = VirtualGroundSpec(
@@ -567,7 +678,9 @@ def lift_wasm_module(raw_wasm: bytes) -> LiftedWasmModule:
 class WasmRealizer:
     """Deterministic stack + linear-memory realizer for `LiftedWasmModule`."""
 
-    def __init__(self, module: LiftedWasmModule, *, max_fuel: int = 200_000) -> None:
+    def __init__(self, module: LiftedWasmModule, *, max_fuel: int = 200_000, max_memory_pages: int = 256) -> None:
+        if module.min_memory_pages > max_memory_pages:
+            raise LiftingError(f"Module min_memory_pages {module.min_memory_pages} exceeds {max_memory_pages}.")
         self.module = module
         self.max_fuel = max_fuel
         self.memory = bytearray(max(1, module.min_memory_pages) * 65_536)
@@ -598,6 +711,35 @@ class WasmRealizer:
         pc = 0
         M32 = 0xFFFFFFFF
         M64 = 0xFFFFFFFFFFFFFFFF
+        MIN_S32 = -(1 << 31)
+        MIN_S64 = -(1 << 63)
+
+        def _pop() -> int:
+            if not stack:
+                raise LiftingError("WASM operand stack underflow.")
+            return stack.pop()
+
+        def _execute_branch(depth: int) -> int | None:
+            if depth > len(labels):
+                raise LiftingError(f"WASM branch depth {depth} exceeds label stack height {len(labels)}.")
+            if depth == len(labels):
+                return None  # Branch out of implicit function body block!
+            target_idx = len(labels) - 1 - depth
+            blk_op, start_pc, end_pc, arity, base_h = labels[target_idx]
+            if blk_op == 0x03:  # loop re-enters at start_pc (loop params = 0 in WASM 1.0 MVP)
+                del stack[base_h:]
+                del labels[target_idx + 1 :]
+                return start_pc
+            if arity > 0:
+                if len(stack) - base_h < arity:
+                    raise LiftingError("WASM stack underflow carrying block result on branch.")
+                kept = stack[-arity:]
+            else:
+                kept = []
+            del stack[base_h:]
+            stack.extend(kept)
+            del labels[target_idx:]
+            return end_pc + 1
 
         while pc < len(ins_list):
             if fuel_budget[0] <= 0:
@@ -618,7 +760,7 @@ class WasmRealizer:
                 labels.append((op, pc + 1, ins.end_pc, arity, len(stack)))
                 pc += 1
             elif op == 0x04:  # if
-                cond = stack.pop()
+                cond = _pop()
                 bt = ins.imm[0]
                 arity = 0 if bt == 0x40 else 1
                 assert ins.end_pc is not None
@@ -630,42 +772,47 @@ class WasmRealizer:
                 else:
                     labels.pop()
                     pc = ins.end_pc + 1
-            elif op == 0x05:  # else (reached from end of true-branch -> jump past end!)
+            elif op == 0x05:  # else (reached from end of true-branch -> unwind to block result & jump past end!)
                 assert ins.end_pc is not None
-                labels.pop()
+                _, _, _, arity, base_h = labels.pop()
+                kept = stack[-arity:] if arity > 0 else []
+                del stack[base_h:]
+                stack.extend(kept)
                 pc = ins.end_pc + 1
             elif op == 0x0B:  # end
                 if labels:
-                    labels.pop()
+                    _, _, _, arity, base_h = labels.pop()
+                    kept = stack[-arity:] if arity > 0 else []
+                    del stack[base_h:]
+                    stack.extend(kept)
                     pc += 1
                 else:
                     break
             elif op in (0x0C, 0x0D):  # br, br_if
                 depth = ins.imm[0]
-                if op == 0x0D and stack.pop() == 0:
+                if op == 0x0D and _pop() == 0:
                     pc += 1
                     continue
-                if depth >= len(labels):
-                    # Branch out of function body
+                next_pc = _execute_branch(depth)
+                if next_pc is None:
                     break
-                target_idx = len(labels) - 1 - depth
-                blk_op, start_pc, end_pc, arity, base_h = labels[target_idx]
-                if blk_op == 0x03:  # loop re-enters at start_pc (loop params = 0 in WASM 1.0 MVP)
-                    del stack[base_h:]
-                    del labels[target_idx + 1 :]
-                    pc = start_pc
-                else:
-                    kept = stack[-arity:] if arity > 0 else []
-                    del stack[base_h:]
-                    stack.extend(kept)
-                    del labels[target_idx:]
-                    pc = end_pc + 1
+                pc = next_pc
+            elif op == 0x0E:  # br_table
+                idx_u32 = _pop() & M32
+                table = ins.imm
+                chosen_depth = table[idx_u32] if idx_u32 < len(table) - 1 else table[-1]
+                next_pc = _execute_branch(chosen_depth)
+                if next_pc is None:
+                    break
+                pc = next_pc
             elif op == 0x0F:  # return
                 break
             elif op == 0x10:  # call
                 callee_idx = ins.imm[0]
                 callee = self.module.functions[callee_idx]
                 p_len = len(callee.param_types)
+                if len(stack) < p_len:
+                    raise LiftingError("WASM operand stack underflow on call.")
                 call_args = stack[-p_len:] if p_len > 0 else []
                 if p_len > 0:
                     del stack[-p_len:]
@@ -673,139 +820,245 @@ class WasmRealizer:
                 stack.extend(rets)
                 pc += 1
             elif op == 0x1A:  # drop
-                stack.pop()
+                _pop()
                 pc += 1
             elif op == 0x1B:  # select
-                c = stack.pop()
-                v2 = stack.pop()
-                v1 = stack.pop()
+                c = _pop()
+                v2 = _pop()
+                v1 = _pop()
                 stack.append(v1 if c != 0 else v2)
                 pc += 1
             elif op == 0x20:  # local.get
                 stack.append(locals_arr[ins.imm[0]])
                 pc += 1
             elif op == 0x21:  # local.set
-                locals_arr[ins.imm[0]] = stack.pop()
+                locals_arr[ins.imm[0]] = _pop()
                 pc += 1
             elif op == 0x22:  # local.tee
+                if not stack:
+                    raise LiftingError("WASM stack underflow on local.tee.")
                 locals_arr[ins.imm[0]] = stack[-1]
                 pc += 1
-            elif op == 0x28:  # i32.load
-                addr = (stack.pop() + ins.imm[1]) & M32
-                if addr + 4 > len(self.memory):
+            elif op == 0x28:  # i32.load (WASM 1.0 spec §4.4.7: effective address in Z_>=0 WITHOUT mod 2^32 wrap!)
+                base_u32 = _pop() & M32
+                ea = base_u32 + ins.imm[1]
+                if ea + 4 > len(self.memory):
                     raise LiftingError("WASM out-of-bounds i32.load.")
-                stack.append(struct.unpack("<I", self.memory[addr : addr + 4])[0])
+                stack.append(struct.unpack("<I", self.memory[ea : ea + 4])[0])
                 pc += 1
-            elif op == 0x36:  # i32.store
-                val = stack.pop() & M32
-                addr = (stack.pop() + ins.imm[1]) & M32
-                if addr + 4 > len(self.memory):
+            elif op == 0x36:  # i32.store (WASM 1.0 spec §4.4.7: effective address in Z_>=0 WITHOUT mod 2^32 wrap!)
+                val = _pop() & M32
+                base_u32 = _pop() & M32
+                ea = base_u32 + ins.imm[1]
+                if ea + 4 > len(self.memory):
                     raise LiftingError("WASM out-of-bounds i32.store.")
-                self.memory[addr : addr + 4] = struct.pack("<I", val)
+                self.memory[ea : ea + 4] = struct.pack("<I", val)
                 pc += 1
             elif op in (0x41, 0x42):  # i32.const, i64.const
                 stack.append(ins.imm[0])
                 pc += 1
-            elif op in (0x45, 0x50):  # eqz
-                stack.append(1 if stack.pop() == 0 else 0)
+            elif op == 0x45:  # i32.eqz
+                stack.append(1 if (_pop() & M32) == 0 else 0)
+                pc += 1
+            elif op == 0x50:  # i64.eqz
+                stack.append(1 if (_pop() & M64) == 0 else 0)
                 pc += 1
             elif op in (0x46, 0x51):  # eq
-                b, a = stack.pop(), stack.pop()
-                stack.append(1 if a == b else 0)
+                b, a = _pop(), _pop()
+                m = M32 if op == 0x46 else M64
+                stack.append(1 if (a & m) == (b & m) else 0)
                 pc += 1
             elif op in (0x47, 0x52):  # ne
-                b, a = stack.pop(), stack.pop()
-                stack.append(1 if a != b else 0)
+                b, a = _pop(), _pop()
+                m = M32 if op == 0x47 else M64
+                stack.append(1 if (a & m) != (b & m) else 0)
                 pc += 1
-            elif op in (0x49, 0x54):  # lt_u
-                b, a = stack.pop(), stack.pop()
+            elif op == 0x48:  # i32.lt_s
+                b, a = _pop(), _pop()
+                stack.append(1 if _to_s32(a) < _to_s32(b) else 0)
+                pc += 1
+            elif op == 0x49:  # i32.lt_u
+                b, a = _pop() & M32, _pop() & M32
                 stack.append(1 if a < b else 0)
                 pc += 1
-            elif op in (0x4B, 0x56):  # gt_u
-                b, a = stack.pop(), stack.pop()
+            elif op == 0x4A:  # i32.gt_s
+                b, a = _pop(), _pop()
+                stack.append(1 if _to_s32(a) > _to_s32(b) else 0)
+                pc += 1
+            elif op == 0x4B:  # i32.gt_u
+                b, a = _pop() & M32, _pop() & M32
                 stack.append(1 if a > b else 0)
                 pc += 1
-            elif op == 0x6A:
-                b, a = stack.pop(), stack.pop()
+            elif op == 0x4C:  # i32.le_s
+                b, a = _pop(), _pop()
+                stack.append(1 if _to_s32(a) <= _to_s32(b) else 0)
+                pc += 1
+            elif op == 0x4D:  # i32.le_u
+                b, a = _pop() & M32, _pop() & M32
+                stack.append(1 if a <= b else 0)
+                pc += 1
+            elif op == 0x4E:  # i32.ge_s
+                b, a = _pop(), _pop()
+                stack.append(1 if _to_s32(a) >= _to_s32(b) else 0)
+                pc += 1
+            elif op == 0x4F:  # i32.ge_u
+                b, a = _pop() & M32, _pop() & M32
+                stack.append(1 if a >= b else 0)
+                pc += 1
+            elif op == 0x53:  # i64.lt_s
+                b, a = _pop(), _pop()
+                stack.append(1 if _to_s64(a) < _to_s64(b) else 0)
+                pc += 1
+            elif op == 0x54:  # i64.lt_u
+                b, a = _pop() & M64, _pop() & M64
+                stack.append(1 if a < b else 0)
+                pc += 1
+            elif op == 0x55:  # i64.gt_s
+                b, a = _pop(), _pop()
+                stack.append(1 if _to_s64(a) > _to_s64(b) else 0)
+                pc += 1
+            elif op == 0x56:  # i64.gt_u
+                b, a = _pop() & M64, _pop() & M64
+                stack.append(1 if a > b else 0)
+                pc += 1
+            elif op == 0x57:  # i64.le_s
+                b, a = _pop(), _pop()
+                stack.append(1 if _to_s64(a) <= _to_s64(b) else 0)
+                pc += 1
+            elif op == 0x58:  # i64.le_u
+                b, a = _pop() & M64, _pop() & M64
+                stack.append(1 if a <= b else 0)
+                pc += 1
+            elif op == 0x59:  # i64.ge_s
+                b, a = _pop(), _pop()
+                stack.append(1 if _to_s64(a) >= _to_s64(b) else 0)
+                pc += 1
+            elif op == 0x5A:  # i64.ge_u
+                b, a = _pop() & M64, _pop() & M64
+                stack.append(1 if a >= b else 0)
+                pc += 1
+            elif op == 0x6A:  # i32.add
+                b, a = _pop(), _pop()
                 stack.append((a + b) & M32)
                 pc += 1
-            elif op == 0x6B:
-                b, a = stack.pop(), stack.pop()
+            elif op == 0x6B:  # i32.sub
+                b, a = _pop(), _pop()
                 stack.append((a - b) & M32)
                 pc += 1
-            elif op == 0x6C:
-                b, a = stack.pop(), stack.pop()
+            elif op == 0x6C:  # i32.mul
+                b, a = _pop(), _pop()
                 stack.append((a * b) & M32)
                 pc += 1
-            elif op == 0x70:
-                b, a = stack.pop(), stack.pop()
+            elif op == 0x6D:  # i32.div_s
+                b, a = _pop(), _pop()
+                stack.append(_wasm_div_s(_to_s32(a), _to_s32(b), MIN_S32) & M32)
+                pc += 1
+            elif op == 0x6E:  # i32.div_u
+                b, a = _pop() & M32, _pop() & M32
+                if b == 0:
+                    raise LiftingError("WASM trap: i32.div_u by zero.")
+                stack.append((a // b) & M32)
+                pc += 1
+            elif op == 0x6F:  # i32.rem_s
+                b, a = _pop(), _pop()
+                stack.append(_wasm_rem_s(_to_s32(a), _to_s32(b)) & M32)
+                pc += 1
+            elif op == 0x70:  # i32.rem_u
+                b, a = _pop() & M32, _pop() & M32
                 if b == 0:
                     raise LiftingError("WASM trap: i32.rem_u by zero.")
                 stack.append((a % b) & M32)
                 pc += 1
-            elif op == 0x71:
-                b, a = stack.pop(), stack.pop()
+            elif op == 0x71:  # i32.and
+                b, a = _pop(), _pop()
                 stack.append((a & b) & M32)
                 pc += 1
-            elif op == 0x72:
-                b, a = stack.pop(), stack.pop()
+            elif op == 0x72:  # i32.or
+                b, a = _pop(), _pop()
                 stack.append((a | b) & M32)
                 pc += 1
-            elif op == 0x73:
-                b, a = stack.pop(), stack.pop()
+            elif op == 0x73:  # i32.xor
+                b, a = _pop(), _pop()
                 stack.append((a ^ b) & M32)
                 pc += 1
-            elif op == 0x74:
-                b, a = stack.pop(), stack.pop()
+            elif op == 0x74:  # i32.shl
+                b, a = _pop(), _pop()
                 stack.append((a << (b & 31)) & M32)
                 pc += 1
-            elif op == 0x76:
-                b, a = stack.pop(), stack.pop()
-                stack.append((a >> (b & 31)) & M32)
+            elif op == 0x75:  # i32.shr_s
+                b, a = _pop(), _pop()
+                stack.append((_to_s32(a) >> (b & 31)) & M32)
                 pc += 1
-            elif op == 0x7C:
-                b, a = stack.pop(), stack.pop()
+            elif op == 0x76:  # i32.shr_u
+                b, a = _pop(), _pop()
+                stack.append(((a & M32) >> (b & 31)) & M32)
+                pc += 1
+            elif op == 0x7C:  # i64.add
+                b, a = _pop(), _pop()
                 stack.append((a + b) & M64)
                 pc += 1
-            elif op == 0x7D:
-                b, a = stack.pop(), stack.pop()
+            elif op == 0x7D:  # i64.sub
+                b, a = _pop(), _pop()
                 stack.append((a - b) & M64)
                 pc += 1
-            elif op == 0x7E:
-                b, a = stack.pop(), stack.pop()
+            elif op == 0x7E:  # i64.mul
+                b, a = _pop(), _pop()
                 stack.append((a * b) & M64)
                 pc += 1
-            elif op == 0x82:
-                b, a = stack.pop(), stack.pop()
+            elif op == 0x7F:  # i64.div_s
+                b, a = _pop(), _pop()
+                stack.append(_wasm_div_s(_to_s64(a), _to_s64(b), MIN_S64) & M64)
+                pc += 1
+            elif op == 0x80:  # i64.div_u
+                b, a = _pop() & M64, _pop() & M64
+                if b == 0:
+                    raise LiftingError("WASM trap: i64.div_u by zero.")
+                stack.append((a // b) & M64)
+                pc += 1
+            elif op == 0x81:  # i64.rem_s
+                b, a = _pop(), _pop()
+                stack.append(_wasm_rem_s(_to_s64(a), _to_s64(b)) & M64)
+                pc += 1
+            elif op == 0x82:  # i64.rem_u
+                b, a = _pop() & M64, _pop() & M64
                 if b == 0:
                     raise LiftingError("WASM trap: i64.rem_u by zero.")
                 stack.append((a % b) & M64)
                 pc += 1
-            elif op == 0x83:
-                b, a = stack.pop(), stack.pop()
+            elif op == 0x83:  # i64.and
+                b, a = _pop(), _pop()
                 stack.append((a & b) & M64)
                 pc += 1
-            elif op == 0x84:
-                b, a = stack.pop(), stack.pop()
+            elif op == 0x84:  # i64.or
+                b, a = _pop(), _pop()
                 stack.append((a | b) & M64)
                 pc += 1
-            elif op == 0x85:
-                b, a = stack.pop(), stack.pop()
+            elif op == 0x85:  # i64.xor
+                b, a = _pop(), _pop()
                 stack.append((a ^ b) & M64)
                 pc += 1
-            elif op == 0x86:
-                b, a = stack.pop(), stack.pop()
+            elif op == 0x86:  # i64.shl
+                b, a = _pop(), _pop()
                 stack.append((a << (b & 63)) & M64)
                 pc += 1
-            elif op == 0x88:
-                b, a = stack.pop(), stack.pop()
-                stack.append((a >> (b & 63)) & M64)
+            elif op == 0x87:  # i64.shr_s
+                b, a = _pop(), _pop()
+                stack.append((_to_s64(a) >> (b & 63)) & M64)
+                pc += 1
+            elif op == 0x88:  # i64.shr_u
+                b, a = _pop(), _pop()
+                stack.append(((a & M64) >> (b & 63)) & M64)
                 pc += 1
             else:
                 raise LiftingError(f"Unhandled WASM opcode {op:#04x}.")
 
         r_len = len(fn.result_types)
-        return tuple(stack[-r_len:]) if r_len > 0 else ()
+        if len(stack) < r_len:
+            raise LiftingError("WASM stack underflow at function return.")
+        return tuple(
+            (v & (M32 if rt == 0x7F else M64))
+            for v, rt in zip(stack[-r_len:], fn.result_types)
+        ) if r_len > 0 else ()
 
 
 def assemble_wasm_affine_orbit_module() -> bytes:

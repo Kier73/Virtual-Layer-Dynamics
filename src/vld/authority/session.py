@@ -9,8 +9,9 @@ Mathematical contract:
    Before invoking quorum sealing for slot $r+1$, the processor atomically stages a write-ahead
    pending transition record binding `(operation_id, r+1, next_manifest)`. Upon hard-kill at *any*
    instruction boundary (pre-quorum or post-quorum) and rehoming onto a fresh host under fenced
-   term $t' > t$, recovery reconciles pending intent with the quorum high-water mark so semantic
-   transitions execute **at most once** while stale zombie hosts in term $t < t'$ are deterministically refused.
+   term $t' = \max_{m \in Q} t_{\text{promised}}(m) + 1$, recovery reconciles pending intent with the
+   quorum high-water mark so semantic transitions execute **at most once** while stale zombie hosts in
+   term $t < t'$ (or rival hosts racing the same term) are deterministically refused.
 """
 
 from __future__ import annotations
@@ -20,11 +21,14 @@ import hashlib
 import os
 from pathlib import Path
 import re
+import threading
+import time
 from typing import Any, Callable, Mapping, Sequence
 
 from vld.authority.quorum import (
     QuorumCommitCertificate,
     QuorumError,
+    QuorumInsufficientError,
     QuorumLineageCoordinator,
     RollbackDetectedError,
     StaleTermError,
@@ -51,7 +55,7 @@ class StaleEpochError(SessionError):
 
 def _atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
     raw = canonical_bytes(dict(payload))
     with tmp.open("wb") as fh:
         fh.write(raw)
@@ -175,6 +179,12 @@ class ComputationalSession:
         term: int = 1,
         scheduler_id: str | None = None,
     ) -> None:
+        if not session_id.strip() or not processor_id.strip() or not host_id.strip():
+            raise SessionError("session_id, processor_id, and host_id must be non-empty.")
+        if not isinstance(ground_fingerprint, str) or _SHA256_RE.fullmatch(ground_fingerprint) is None:
+            raise SessionError("ground_fingerprint must be a 64-char SHA-256 hex digest.")
+        if isinstance(term, bool) or not isinstance(term, int) or term <= 0:
+            raise SessionError("term must be a positive integer.")
         self.session_id = session_id
         self.processor_id = processor_id
         self.host_id = host_id
@@ -198,17 +208,45 @@ class ComputationalSession:
     def _pending_path(self) -> Path:
         return self.session_dir / "pending_transition.json"
 
+    def _validate_checkpoint_identity(self, ckpt: SessionCheckpoint) -> None:
+        if ckpt.session_id != self.session_id:
+            raise SessionError(
+                f"SessionCheckpoint session_id {ckpt.session_id!r} disagrees with session {self.session_id!r}."
+            )
+        if ckpt.processor_id != self.processor_id:
+            raise SessionError(
+                f"SessionCheckpoint processor_id {ckpt.processor_id!r} disagrees with processor {self.processor_id!r}."
+            )
+        if ckpt.ground_fingerprint != self.ground_fingerprint:
+            raise SessionError(
+                f"SessionCheckpoint ground_fingerprint {ckpt.ground_fingerprint} disagrees with active Ground {self.ground_fingerprint}."
+            )
+
     def _load_disk_checkpoints(self) -> None:
         for p in sorted(self.session_dir.glob("checkpoint_*.json")):
             ckpt = SessionCheckpoint.from_dict(parse_strict_json(p.read_bytes()))
+            self._validate_checkpoint_identity(ckpt)
+            self.store.register_manifest(ckpt.state_manifest)
             self._checkpoints_by_rev[ckpt.revision] = ckpt
             self._ops_index[ckpt.operation_id] = (ckpt.input_digest, ckpt.revision)
 
     def _persist_checkpoint(self, ckpt: SessionCheckpoint) -> None:
+        self._validate_checkpoint_identity(ckpt)
+        self.store.register_manifest(ckpt.state_manifest)
         _atomic_write_json(self._ckpt_path(ckpt.revision), ckpt.to_dict())
         _atomic_write_json(self._latest_path(), ckpt.to_dict())
         self._checkpoints_by_rev[ckpt.revision] = ckpt
         self._ops_index[ckpt.operation_id] = (ckpt.input_digest, ckpt.revision)
+
+    def _fence_active_epoch(self, active_member_ids: Sequence[str] | None = None) -> None:
+        try:
+            self.coordinator.fence_term(
+                self.term,
+                active_member_ids=active_member_ids,
+                owner_id=self.host_id,
+            )
+        except StaleTermError as exc:
+            raise StaleEpochError(str(exc)) from exc
 
     @property
     def current_checkpoint(self) -> SessionCheckpoint | None:
@@ -230,10 +268,12 @@ class ComputationalSession:
         if not lp.exists():
             raise RollbackDetectedError("Session latest.json is missing.")
         ckpt = SessionCheckpoint.from_dict(parse_strict_json(lp.read_bytes()))
+        self._validate_checkpoint_identity(ckpt)
         self.coordinator.verify_fresh_checkpoint(
             slot=ckpt.revision,
             state_manifest_digest=ckpt.state_manifest.manifest_digest,
         )
+        self.store.register_manifest(ckpt.state_manifest)
         raw = self.store.read_bytes(ckpt.state_manifest)
         if hashlib.sha256(raw).hexdigest() != ckpt.state_digest:
             raise SessionError("Corrupted M1 state bytes for SessionCheckpoint.")
@@ -255,6 +295,7 @@ class ComputationalSession:
         active_member_ids: Sequence[str] | None = None,
     ) -> SessionCheckpoint:
         """Initialize revision 1 of the session if not already initialized."""
+        self._load_disk_checkpoints()
         if self._checkpoints_by_rev:
             raise SessionConflictError("Session is already initialized.")
         raw = canonical_bytes(dict(initial_state)) if isinstance(initial_state, Mapping) else bytes(initial_state)
@@ -265,8 +306,8 @@ class ComputationalSession:
             clock=VectorClock().advance(self.processor_id, 1),
         )
         input_digest = hashlib.sha256(raw).hexdigest()
+        self._fence_active_epoch(active_member_ids)
         try:
-            self.coordinator.fence_term(self.term, active_member_ids=active_member_ids)
             cert = self.coordinator.propose_and_seal(
                 slot=1,
                 term=self.term,
@@ -298,16 +339,22 @@ class ComputationalSession:
 
     def reconcile_pending(self, *, active_member_ids: Sequence[str] | None = None) -> SessionCheckpoint | None:
         """Complete or finalize any crash-interrupted staged transition under the active fencing term."""
+        self._fence_active_epoch(active_member_ids)
         self._load_disk_checkpoints()
         pp = self._pending_path()
         if not pp.exists():
             return self.current_checkpoint
 
-        pending = parse_strict_json(pp.read_bytes())
+        try:
+            pending = parse_strict_json(pp.read_bytes())
+        except FileNotFoundError:
+            return self.current_checkpoint
+
         slot = int(pending["slot"])
+        pending_term = int(pending["term"])
         next_manifest = PagedByteManifest.from_dict(pending["state_manifest"])
+        self.store.register_manifest(next_manifest)
         t_coord = TemporalCoordinate.from_dict(pending["temporal_coord"])
-        # Re-scope temporal coordinate epoch if recovered under a higher term
         if t_coord.epoch != self.term:
             t_coord = TemporalCoordinate(
                 scheduler_id=t_coord.scheduler_id,
@@ -316,13 +363,26 @@ class ComputationalSession:
             )
 
         hw_cert = self.coordinator.high_water_certificate
-        try:
-            self.coordinator.fence_term(self.term, active_member_ids=active_member_ids)
-            if hw_cert is not None and hw_cert.proposal.slot == slot:
-                if hw_cert.proposal.state_manifest_digest != next_manifest.manifest_digest:
-                    raise SessionConflictError("Staged pending transition conflicts with quorum-sealed slot.")
-                cert = hw_cert
-            elif (hw_cert is None and slot == 1) or (hw_cert is not None and hw_cert.proposal.slot + 1 == slot):
+        if hw_cert is not None and hw_cert.proposal.slot > slot:
+            # Quorum has already advanced beyond this superseded pending file; remove stale pending file!
+            try:
+                pp.unlink()
+            except FileNotFoundError:
+                pass
+            return self.current_checkpoint
+
+        if hw_cert is not None and hw_cert.proposal.slot == slot:
+            if hw_cert.proposal.state_manifest_digest != next_manifest.manifest_digest:
+                if pending_term < hw_cert.proposal.term and slot in self._checkpoints_by_rev:
+                    try:
+                        pp.unlink()
+                    except FileNotFoundError:
+                        pass
+                    return self.current_checkpoint
+                raise SessionConflictError("Staged pending transition conflicts with quorum-sealed slot.")
+            cert = hw_cert
+        elif (hw_cert is None and slot == 1) or (hw_cert is not None and hw_cert.proposal.slot + 1 == slot):
+            try:
                 cert = self.coordinator.propose_and_seal(
                     slot=slot,
                     term=self.term,
@@ -332,10 +392,10 @@ class ComputationalSession:
                     operation_id=str(pending["operation_id"]),
                     active_member_ids=active_member_ids,
                 )
-            else:
-                raise RollbackDetectedError(f"Cannot reconcile pending slot {slot} against quorum state.")
-        except StaleTermError as exc:
-            raise StaleEpochError(str(exc)) from exc
+            except StaleTermError as exc:
+                raise StaleEpochError(str(exc)) from exc
+        else:
+            raise RollbackDetectedError(f"Cannot reconcile pending slot {slot} against quorum state.")
 
         ckpt = SessionCheckpoint(
             session_id=self.session_id,
@@ -352,8 +412,10 @@ class ComputationalSession:
             quorum_certificate=cert,
         )
         self._persist_checkpoint(ckpt)
-        if pp.exists():
+        try:
             pp.unlink()
+        except FileNotFoundError:
+            pass
         return ckpt
 
     def cas_transition(
@@ -372,25 +434,23 @@ class ComputationalSession:
 
         Returns `(checkpoint, replayed_from_log)`.
         """
+        # Enforce live epoch fencing BEFORE serving idempotent replays so zombie hosts always fail!
+        self._fence_active_epoch(active_member_ids)
         self._load_disk_checkpoints()
         input_digest = domain_digest("vld.session-op-input.v1", parse_strict_json(canonical_json(input_payload)))
 
-        # Idempotent replay check by operation_id
         if operation_id in self._ops_index:
             prev_in_digest, committed_rev = self._ops_index[operation_id]
             if prev_in_digest != input_digest:
                 raise SessionConflictError(
                     f"Idempotency conflict on operation_id {operation_id!r}: input digest differs."
                 )
+            # Also verify quorum freshness of current head so rolled-back disk cannot replay stale!
+            _ = self.current_checkpoint
             return self._checkpoints_by_rev[committed_rev], True
 
         if self._pending_path().exists():
             raise SessionConflictError("Unreconciled pending transition exists; call reconcile_pending() first.")
-
-        try:
-            self.coordinator.fence_term(self.term, active_member_ids=active_member_ids)
-        except StaleTermError as exc:
-            raise StaleEpochError(str(exc)) from exc
 
         cur = self.current_checkpoint
         if cur is None:
@@ -416,6 +476,9 @@ class ComputationalSession:
             clock=base_clock,
         )
         next_slot = cur.revision + 1
+
+        # Re-verify epoch right before staging WAL so a fenced zombie never clobbers pending_transition.json!
+        self._fence_active_epoch(active_member_ids)
 
         pending_doc = {
             "input_digest": input_digest,
@@ -466,8 +529,10 @@ class ComputationalSession:
             quorum_certificate=cert,
         )
         self._persist_checkpoint(ckpt)
-        if self._pending_path().exists():
+        try:
             self._pending_path().unlink()
+        except FileNotFoundError:
+            pass
         return ckpt, False
 
 
@@ -500,6 +565,8 @@ class VirtualProcessor:
         _fault_hook_after_quorum: Callable[[], None] | None = None,
     ) -> tuple[SessionCheckpoint, bool]:
         """Advance JSON-encoded processor state by one CAS + quorum-fenced transition."""
+        self.session._fence_active_epoch(active_member_ids)
+        self.session._load_disk_checkpoints()
         if operation_id in self.session._ops_index:
             return self.session.cas_transition(
                 operation_id=operation_id,
@@ -509,10 +576,6 @@ class VirtualProcessor:
                 transition_fn=lambda b: b,
                 active_member_ids=active_member_ids,
             )
-        try:
-            self.session.coordinator.fence_term(self.session.term, active_member_ids=active_member_ids)
-        except StaleTermError as exc:
-            raise StaleEpochError(str(exc)) from exc
         cur = self.session.current_checkpoint
         if cur is None:
             raise SessionError("VirtualProcessor session is not initialized.")
@@ -546,24 +609,44 @@ class VirtualProcessor:
         coordinator: QuorumLineageCoordinator,
         session_dir: str | Path,
         active_member_ids: Sequence[str] | None = None,
+        max_election_attempts: int = 16,
     ) -> VirtualProcessor:
-        r"""Rehome processor onto `new_host_id`, fence off prior host epoch ($t' = t_{\text{hw}} + 1$), and reconcile pending WAL."""
-        hw = coordinator.high_water_certificate
-        base_term = hw.proposal.term if hw is not None else 1
-        fenced_term = base_term + 1
-        coordinator.fence_term(fenced_term, active_member_ids=active_member_ids)
-        sess = ComputationalSession(
-            session_id=session_id,
-            processor_id=processor_id,
-            host_id=new_host_id,
-            ground_fingerprint=ground_fingerprint,
-            store=store,
-            coordinator=coordinator,
-            session_dir=session_dir,
-            term=fenced_term,
-        )
-        sess.reconcile_pending(active_member_ids=active_member_ids)
-        return cls(sess)
+        r"""Rehome processor onto `new_host_id`, fence off all prior host epochs ($t' = t_{\max} + 1$), and reconcile WAL."""
+        if not new_host_id.strip():
+            raise SessionError("new_host_id must be non-empty.")
+        jitter_seed = hashlib.sha256(f"{new_host_id}:{os.getpid()}:{threading.get_ident()}".encode("utf-8")).digest()[0]
+
+        last_err: Exception | None = None
+        for attempt in range(max_election_attempts):
+            observed = max(1, coordinator.max_observed_term(active_member_ids=active_member_ids))
+            fenced_term = observed + 1
+            try:
+                coordinator.fence_term(
+                    fenced_term,
+                    active_member_ids=active_member_ids,
+                    owner_id=new_host_id,
+                )
+                sess = ComputationalSession(
+                    session_id=session_id,
+                    processor_id=processor_id,
+                    host_id=new_host_id,
+                    ground_fingerprint=ground_fingerprint,
+                    store=store,
+                    coordinator=coordinator,
+                    session_dir=session_dir,
+                    term=fenced_term,
+                )
+                sess.reconcile_pending(active_member_ids=active_member_ids)
+                return cls(sess)
+            except (StaleTermError, StaleEpochError, QuorumInsufficientError) as exc:
+                last_err = exc
+                # If genuine insufficient reachable members (not a split-vote contention), inspect count:
+                if isinstance(exc, QuorumInsufficientError) and "already promised" not in str(exc) and "stale term" not in str(exc):
+                    raise
+                # Split-vote or concurrent coordinator contention: deterministic asymmetric backoff and retry next term!
+                time.sleep(0.002 * (((jitter_seed + attempt * 7) % 11) + 1))
+
+        raise StaleEpochError(f"Failed to win exclusive recovery term for {new_host_id!r}: {last_err}")
 
 
 __all__ = [

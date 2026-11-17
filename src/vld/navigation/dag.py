@@ -211,6 +211,7 @@ class NavigableComputationDAG:
         self._expanded_thunks: set[str] = set()
         self._committed: dict[str, CommittedNodeResult] = {}
         self._pruned: set[str] = set()
+        self._approved_guards: set[str] = set()
 
     @property
     def nodes(self) -> dict[str, ComputationNode]:
@@ -329,6 +330,7 @@ class NavigableComputationDAG:
         self._propagate_pruning()
 
         pending_prunes: set[str] = set()
+        pending_approved: set[str] = set()
         ready: list[ComputationNode] = []
         for nid in sorted(self._nodes.keys()):
             if nid in self._committed or nid in self._pruned:
@@ -336,20 +338,23 @@ class NavigableComputationDAG:
             node = self._nodes[nid]
             if not all(d in self._committed for d in node.dependencies):
                 continue
-            if node.guard_key is not None:
+            if node.guard_key is not None and nid not in self._approved_guards:
                 if guard_evaluator is None:
                     raise IndeterminateGuardTrap(
                         f"Node {nid!r} declares guard_key={node.guard_key!r} but no guard_evaluator was supplied."
                     )
                 disp = guard_evaluator(node, self._committed)
                 if disp is TruthDisposition.INDETERMINATE:
-                    # Atomic trap: mutate neither _committed nor _pruned!
+                    # Atomic trap: mutate neither _committed, _pruned, nor _approved_guards!
                     raise IndeterminateGuardTrap(f"Dynamic DAG guard {node.guard_key!r} on {nid!r} is INDETERMINATE.")
                 if disp is TruthDisposition.FALSE:
                     pending_prunes.add(nid)
                     continue
+                pending_approved.add(nid)
             ready.append(node)
 
+        if pending_approved:
+            self._approved_guards.update(pending_approved)
         if pending_prunes:
             self._pruned.update(pending_prunes)
             self._propagate_pruning()
@@ -361,6 +366,7 @@ class NavigableComputationDAG:
         value: Any,
         *,
         m1_manifest_digest: str | None = None,
+        guard_evaluator: Callable[[ComputationNode, Mapping[str, CommittedNodeResult]], TruthDisposition] | None = None,
     ) -> CommittedNodeResult:
         """Commit verified output for a ready `ComputationNode` (idempotent on identical value)."""
         node = self._nodes.get(node_id)
@@ -370,6 +376,19 @@ class NavigableComputationDAG:
             raise ComputationDAGError(f"Cannot commit pruned node {node_id!r}.")
         if not all(d in self._committed for d in node.dependencies):
             raise ComputationDAGError(f"Cannot commit {node_id!r}: upstream dependencies incomplete.")
+        if node.guard_key is not None and node_id not in self._approved_guards and node_id not in self._committed:
+            if guard_evaluator is None:
+                raise IndeterminateGuardTrap(
+                    f"Cannot commit guarded node {node_id!r} before dynamic guard {node.guard_key!r} evaluates TRUE."
+                )
+            disp = guard_evaluator(node, self._committed)
+            if disp is TruthDisposition.INDETERMINATE:
+                raise IndeterminateGuardTrap(f"Dynamic DAG guard {node.guard_key!r} on {node_id!r} is INDETERMINATE.")
+            if disp is TruthDisposition.FALSE:
+                self._pruned.add(node_id)
+                self._propagate_pruning()
+                raise ComputationDAGError(f"Cannot commit {node_id!r}: dynamic guard evaluated FALSE and pruned node.")
+            self._approved_guards.add(node_id)
 
         candidate = CommittedNodeResult(
             node_id=node_id,
@@ -391,6 +410,7 @@ class NavigableComputationDAG:
 
     def _checkpoint_body(self) -> dict[str, Any]:
         return {
+            "approved_guards": sorted(self._approved_guards),
             "committed": {nid: res.to_dict() for nid, res in sorted(self._committed.items())},
             "dag_id": self.dag_id,
             "expanded_thunks": sorted(self._expanded_thunks),
@@ -411,7 +431,7 @@ class NavigableComputationDAG:
         *,
         thunks: Iterable[SubgraphThunk] = (),
     ) -> NavigableComputationDAG:
-        req = {
+        base_req = {
             "checkpoint_digest",
             "committed",
             "dag_id",
@@ -421,30 +441,55 @@ class NavigableComputationDAG:
             "pruned",
             "schema",
         }
-        if not isinstance(data, Mapping) or set(data.keys()) != req or data["schema"] != "vld.dag-checkpoint.v1":
+        if not isinstance(data, Mapping) or not base_req.issubset(data.keys()) or (set(data.keys()) - base_req - {"approved_guards"}):
             raise ComputationDAGError("Invalid DAG checkpoint payload.")
+        if data["schema"] != "vld.dag-checkpoint.v1":
+            raise ComputationDAGError("Invalid DAG checkpoint schema.")
         body = {k: v for k, v in data.items() if k != "checkpoint_digest"}
         if domain_digest("vld.dag-checkpoint.v1", body) != data["checkpoint_digest"]:
             raise ComputationDAGError("DAG checkpoint digest mismatch.")
 
         dag = cls(dag_id=data["dag_id"], max_nodes=data["max_nodes"])
-        # Load nodes in topological order
-        raw_nodes = {nid: ComputationNode.from_dict(nd) for nid, nd in data["nodes"].items()}
+        if not isinstance(data["nodes"], Mapping) or len(data["nodes"]) > dag.max_nodes:
+            raise ComputationDAGError("Checkpoint nodes invalid or exceed max_nodes budget.")
+        raw_nodes: dict[str, ComputationNode] = {}
+        for nid, nd in data["nodes"].items():
+            parsed_node = ComputationNode.from_dict(nd)
+            if parsed_node.node_id != nid:
+                raise ComputationDAGError(f"Checkpoint node key {nid!r} != node_id {parsed_node.node_id!r}.")
+            raw_nodes[nid] = parsed_node
         dag._nodes = raw_nodes
         topo = dag._verify_acyclic()
 
         for thunk in thunks:
             dag.add_subgraph_thunk(thunk)
         dag._expanded_thunks = set(data["expanded_thunks"])
-        dag._pruned = set(data["pruned"])
+
+        pruned_set = set(data["pruned"])
+        if not pruned_set.issubset(raw_nodes.keys()):
+            raise ComputationDAGError("Checkpoint pruned set references unknown node_id.")
+        dag._pruned = set(pruned_set)
+        dag._propagate_pruning()
+        if dag._pruned != pruned_set:
+            raise ComputationDAGError("Checkpoint pruned set is not closed under downstream propagation.")
+
+        if not isinstance(data["committed"], Mapping) or not set(data["committed"].keys()).issubset(raw_nodes.keys()):
+            raise ComputationDAGError("Checkpoint committed map references unknown node_id.")
+
+        approved_set = set(data.get("approved_guards", ()))
+        if not approved_set.issubset(raw_nodes.keys()):
+            raise ComputationDAGError("Checkpoint approved_guards references unknown node_id.")
+        dag._approved_guards = approved_set
 
         for nid in topo:
             if nid in data["committed"]:
                 res = CommittedNodeResult.from_dict(data["committed"][nid])
-                if res.node_digest != raw_nodes[nid].digest or nid in dag._pruned:
+                if res.node_id != nid or res.node_digest != raw_nodes[nid].digest or nid in dag._pruned:
                     raise ComputationDAGError(f"Corrupted committed node {nid!r} in DAG checkpoint.")
                 if not all(d in dag._committed for d in raw_nodes[nid].dependencies):
                     raise ComputationDAGError(f"Committed node {nid!r} lacks committed dependency in checkpoint.")
+                if raw_nodes[nid].guard_key is not None:
+                    dag._approved_guards.add(nid)
                 dag._committed[nid] = res
         return dag
 

@@ -126,6 +126,8 @@ class VirtualPageSpace:
             raise VMError("initial_bytes exceeds mapped region size.")
         start_page = vaddr // self.page_size
         end_page = (vaddr + size - 1) // self.page_size
+        if end_page - start_page + 1 > 262_144:
+            raise VMError("Mapped region exceeds maximum page count budget (262,144 pages).")
         if not allow_overwrite:
             for p_idx in range(start_page, end_page + 1):
                 if p_idx in self._pages:
@@ -262,8 +264,25 @@ class VirtualPageSpace:
     def write_bytes(self, vaddr: int, data: bytes) -> None:
         if vaddr < 0:
             raise PageFaultError("Negative virtual address.")
-        pos = 0
         n = len(data)
+        if n == 0:
+            return
+        # Pre-validate permissions and resident CoW quota across ALL touched pages for strict atomicity!
+        first_p = vaddr // self.page_size
+        last_p = (vaddr + n - 1) // self.page_size
+        needed_cow = 0
+        for p_idx in range(first_p, last_p + 1):
+            desc = self._pages.get(p_idx)
+            if desc is None:
+                raise PageFaultError(f"Unmapped virtual page {p_idx:#x}.")
+            if not (desc.flags & PF_W):
+                raise PageFaultError(f"Write permission fault on read-only page {p_idx:#x}.")
+            if desc.private_data is None:
+                needed_cow += 1
+        if needed_cow > 0:
+            self._check_private_quota(needed_cow)
+
+        pos = 0
         while pos < n:
             cur = vaddr + pos
             p_idx = cur // self.page_size

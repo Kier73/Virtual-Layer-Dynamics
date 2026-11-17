@@ -662,6 +662,8 @@ def test_multivariate_polyhedral_compilation_dyadic_rescaling_replacement_and_hy
 
 
 def test_high_hinge_multivariate_arrangement_scalability_and_chamber_budget() -> None:
+    from vld.accel import NumericEngine
+    from vld.canonical import domain_digest
     from vld.models import (
         compile_multivariate_hinge_relu,
         evaluate_multivariate_capsule,
@@ -693,4 +695,29 @@ def test_high_hinge_multivariate_arrangement_scalability_and_chamber_budget() ->
 
     with pytest.raises(ProceduralModelError, match="max_chambers"):
         verify_multivariate_capsule(cap_26, max_chambers=5)
+
+    # Crafted multivariate capsule with recomputed digests but truncated/mismatched hinge normal dimensions MUST be refused!
+    bad_spec = {
+        "base_bias": ["0"],
+        "base_linear": [["1", "0"]],
+        "hinges": [{"normal": ["1", "0", "999"], "offset": "0", "weights": ["1"]}],
+        "input_dim": 2,
+    }
+    bad_body = {
+        "network": cap_26["network"],
+        "schema": "vld.snc-multivariate-relu-capsule.v1",
+        "source_spec": bad_spec,
+        "source_spec_digest": domain_digest("vld.multivariate-hinge-spec.v1", bad_spec),
+    }
+    bad_cap = {**bad_body, "capsule_digest": domain_digest("vld.snc-multivariate-relu-capsule.v1", bad_body)}
+    with pytest.raises(ProceduralModelError, match="dimensions"):
+        verify_multivariate_capsule(bad_cap)
+
+    # Large-magnitude RMSNorm float32 squaring overflow safety (2e19^2 overflows binary32 without float64 mean_sq!)
+    eng_np = NumericEngine("numpy")
+    eng_py = NumericEngine("stdlib")
+    large_row = [[2.0e19, -2.0e19, 1.0e19, -1.0e19]]
+    w_ones = [1.0, 1.0, 1.0, 1.0]
+    assert NumericEngine.max_abs_diff(eng_np.rms_norm_2d(large_row, w_ones, 1e-6), eng_py.rms_norm_2d(large_row, w_ones, 1e-6)) < 1e-5
+
 

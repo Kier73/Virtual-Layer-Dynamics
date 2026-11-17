@@ -405,3 +405,162 @@ def test_mtls_cluster_multi_megabyte_terminal_to_terminal_forwarding_g11(tmp_pat
     finally:
         worker_a.close()
         worker_b.close()
+
+
+def test_galois_sound_extended_intervals_milner_bisimulation_and_crash_resumable_mtls_pages(tmp_path: Path) -> None:
+    """Verify extended-interval soundness, Milner nondeterministic bisimulation, guard bypass refusal,
+    >64 KiB 1,024-page M1 manifest streaming, subprocess os._exit page-flush resume (`G14`), and worker auth.
+    """
+    import subprocess
+    import sys
+    from vld.fabric import M1ForwardingTicket
+    from vld.memory import DiskPageBacking
+
+    ctx = domain_digest("test.ctx", "hardening-phase4")
+    # 1. commit_result MUST refuse guarded node before guard_key evaluates TRUE!
+    g_dag = NavigableComputationDAG("dag.guarded")
+    g_dag.add_node(ComputationNode("gated", 1, "op", "/r", ctx, (), {}, guard_key="must_pass"))
+    with pytest.raises(IndeterminateGuardTrap):
+        g_dag.commit_result("gated", {"bad": True})
+
+    # 2. Galois soundness on zero-straddling division (10^20 / [-1, 1]) & rational mod_residue (79/10 mod 4 = 3.9)!
+    i_dag = NavigableComputationDAG("dag.soundness")
+    i_dag.add_node(ComputationNode("big", 1, "const", "/r", ctx, (), {"value": "100000000000000000000"}))
+    i_dag.add_node(ComputationNode("den", 1, "const", "/r", ctx, (), {"value": "1"}))
+    i_dag.add_node(ComputationNode("quot", 1, "div", "/r", ctx, ("big", "den"), {}))
+    i_dag.add_node(ComputationNode("rem", 1, "mod_residue", "/r", ctx, ("den",), {"modulus": 4}))
+
+    rep_div = analyze_dag_intervals(
+        i_dag,
+        input_bounds={"den": IntervalBound(Fraction(-1), Fraction(1))},
+        safety_contracts={"quot": IntervalBound(Fraction(-10**19), Fraction(10**19))},
+    )
+    assert rep_div.bounds["quot"] == IntervalBound.unbounded()
+    assert rep_div.dispositions["quot"] is TruthDisposition.INDETERMINATE
+
+    rep_mod = analyze_dag_intervals(
+        i_dag,
+        input_bounds={"den": IntervalBound(Fraction(79, 10), Fraction(81, 10))},
+    )
+    assert rep_mod.bounds["rem"].lo <= Fraction(39, 10) <= rep_mod.bounds["rem"].hi
+
+    # 3. Classic Milner nondeterministic branching counterexample: a.(b.1 + b.2) vs a.b.1 + a.b.2
+    milner = check_strong_bisimulation(
+        actions=("a", "b"),
+        left_states=("l0", "l1", "l2", "l3", "l4"),
+        left_transitions={
+            ("l0", "a"): ("l1", "l2"),
+            ("l1", "b"): ("l3",),
+            ("l2", "b"): ("l4",),
+        },
+        left_observations={"l0": 0, "l1": 0, "l2": 0, "l3": 1, "l4": 2},
+        left_initial="l0",
+        right_states=("r0", "r1", "r2", "r3"),
+        right_transitions={
+            ("r0", "a"): ("r1",),
+            ("r1", "b"): ("r2", "r3"),
+        },
+        right_observations={"r0": 0, "r1": 0, "r2": 1, "r3": 2},
+        right_initial="r0",
+    )
+    assert milner.equivalent is False
+    assert milner.distinguishing_trace == ("a", "b")
+
+    # 4. 4 MiB M1 object with 1,024 DISTINCT 4 KiB pages (>117 KB manifest!) + subprocess os._exit mid-stream resume!
+    pki = generate_ephemeral_mtls_pki(tmp_path / "pki_g14", ["srv.vld.local", "cli.vld.local", "peer.vld.local"])
+    src_store = PagedObjectStore(InMemoryPageBacking(page_size=4096))
+    payload_4mb = b"".join(
+        p_idx.to_bytes(4, "little") + bytes(((p_idx + i) * 73 + 19) % 256 for i in range(4092))
+        for p_idx in range(1024)
+    )
+    m_4mb = src_store.put_bytes(payload_4mb)
+
+    disk_dir = tmp_path / "client_m1_disk"
+    with MTLSPeerServer(
+        peer_id="srv.vld.local",
+        ssl_context=create_mtls_server_context(pki["srv.vld.local"]),
+        allowed_peer_dns=frozenset({"cli.vld.local", "peer.vld.local"}),
+        store=src_store,
+    ) as srv:
+        host, port = srv.endpoint
+        # Subprocess 1 fetches 300 pages onto DiskPageBacking then hard-kills via os._exit(94)!
+        kill_cli_script = f"""
+import os
+from pathlib import Path
+from vld.fabric import MTLSPeerClient, PeerIdentityBundle, create_mtls_client_context
+from vld.memory import DiskPageBacking, PagedObjectStore
+
+b = PeerIdentityBundle("cli.vld.local", Path({str(pki['cli.vld.local'].ca_cert_path)!r}), Path({str(pki['cli.vld.local'].cert_path)!r}), Path({str(pki['cli.vld.local'].key_path)!r}))
+cli = MTLSPeerClient(host={host!r}, port={port}, expected_server_dns="srv.vld.local", ssl_context=create_mtls_client_context(b))
+tgt = PagedObjectStore(DiskPageBacking(Path({str(disk_dir)!r}), page_size=4096))
+cli.fetch_m1_object_resumable(
+    {m_4mb.manifest_digest!r},
+    tgt,
+    _fault_hook_after_pages=lambda n: os._exit(94) if n >= 300 else None,
+)
+"""
+        p_kill = subprocess.run([sys.executable, "-c", kill_cli_script], capture_output=True, text=True)
+        assert p_kill.returncode == 94, p_kill.stderr
+        bytes_before_resume = srv.bulk_bytes_streamed
+
+        # Fresh client resumes from DiskPageBacking: streams ONLY the remaining 724 pages (not all 1,024)!
+        cli_resume = MTLSPeerClient(
+            host=host,
+            port=port,
+            expected_server_dns="srv.vld.local",
+            ssl_context=create_mtls_client_context(pki["cli.vld.local"]),
+        )
+        tgt_resume = PagedObjectStore(DiskPageBacking(disk_dir, page_size=4096))
+        got_m, recon = cli_resume.fetch_m1_object_resumable(m_4mb.manifest_digest, tgt_resume)
+        resumed_delta_bytes = srv.bulk_bytes_streamed - bytes_before_resume
+        assert recon == 0
+        assert resumed_delta_bytes == (1024 - 300) * 4096
+        assert tgt_resume.read_bytes(got_m) == payload_4mb
+
+    # 5. ForwardingWorkerNode rejects non-coordinator peer execute_assignment & coordinator rejects spoofed output_ticket.node_id!
+    sec_c = b"coord-secret-key-0123456789abcde"
+    sec_w = b"worker-secret-key-0123456789abcd"
+    f_dag = NavigableComputationDAG("dag.auth")
+    f_dag.add_node(ComputationNode("n1", 1, "op", "/r", ctx, (), {}))
+    f_coord = ForwardingCoordinator(f_dag, coordinator_secret=sec_c, worker_secrets={"srv.vld.local": sec_w})
+    assign = f_coord.issue_assignment("n1", "srv.vld.local")
+
+    w_node = ForwardingWorkerNode(
+        worker_dns="srv.vld.local",
+        worker_secret=sec_w,
+        store=PagedObjectStore(InMemoryPageBacking(page_size=4096)),
+        server_ssl_context=create_mtls_server_context(pki["srv.vld.local"]),
+        client_ssl_context=create_mtls_client_context(pki["srv.vld.local"]),
+        allowed_peers=frozenset({"cli.vld.local", "peer.vld.local"}),
+        allowed_coordinators=frozenset({"cli.vld.local"}),
+        coordinator_secret=sec_c,
+        executor_fn=lambda _n, _u: ({"ok": 1}, None),
+    )
+    wh, wp = w_node.start()
+    try:
+        peer_cli = MTLSPeerClient(
+            host=wh,
+            port=wp,
+            expected_server_dns="srv.vld.local",
+            ssl_context=create_mtls_client_context(pki["peer.vld.local"]),
+        )
+        with pytest.raises(MutualTLSError, match="not an authorized coordinator"):
+            peer_cli.invoke_control({"assignment": assign.to_dict(), "op": "execute_assignment"})
+    finally:
+        w_node.close()
+
+    bad_ticket = M1ForwardingTicket("WRONG_NODE", m_4mb.manifest_digest, m_4mb.content_digest, m_4mb.size_bytes, "srv.vld.local", "127.0.0.1", 9999)
+    bad_sig = WorkerCompletionReceipt.compute_worker_mac(
+        sec_w,
+        dag_id="dag.auth",
+        node_id="n1",
+        node_digest=assign.node.digest,
+        worker_dns="srv.vld.local",
+        assignment_mac=assign.assignment_mac,
+        summary_value={"ok": 1},
+        output_manifest_digest=bad_ticket.manifest_digest,
+    )
+    bad_rcpt = WorkerCompletionReceipt("dag.auth", "n1", assign.node.digest, "srv.vld.local", assign.assignment_mac, {"ok": 1}, bad_ticket, 0, bad_sig)
+    with pytest.raises(UnauthorizedCommitError, match="node_id"):
+        f_coord.verify_and_commit_receipt(bad_rcpt)
+
