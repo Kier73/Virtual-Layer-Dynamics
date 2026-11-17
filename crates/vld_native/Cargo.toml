@@ -1,0 +1,15 @@
+[package]
+name = "vld_native"
+version = "0.1.0"
+edition = "2021"
+description = "Optional LLVM-compiled C-ABI native numeric and algebraic kernels for Virtual Layer Dynamics."
+license = "MIT"
+
+[lib]
+name = "vld_native"
+crate-type = ["cdylib"]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

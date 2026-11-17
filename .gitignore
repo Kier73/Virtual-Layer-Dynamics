@@ -20,7 +20,11 @@ __pycache__/
 *.py[cod]
 *$py.class
 *.so
+*.dll
+*.dylib
 *.pyd
+crates/**/target/
+Cargo.lock
 build/
 dist/
 downloads/
