@@ -12,16 +12,17 @@ src/vld/
 ├── triad.py            # [Phase 0 - Done] Kleene K_3 guards, Myhill-Nerode quotient, erasure bits
 ├── ground.py           # [Phase 0 - Done] VirtualGroundSpec, ByteLens, AffineOrbitLaw, Pareto costs
 ├── journal.py          # [Phase 0 - Done] Atomic hash-chained receipt journal & idempotency fencing
-├── cli.py              # [Phase 0 - Done] Unified `vld` verification & inspection CLI
-├── signal/             # [Phase 1] Phasor/cyclic & multi-domain backends, typed IR, footprints
-├── memory/             # [Phase 2] Structural Memory registry, law certifiers, M1 paged byte store
-├── inquiry/            # [Phase 2] Active perception, partial-probe policies, counterexample revision
-├── authority/          # [Phase 3] Receiver Hypervisor, capability algebra, CAS sessions & quorum lineage
-├── navigation/         # [Phase 4] NavigableComputationDAG, contextual BFS, abstract intervals, bisimulation
-├── fabric/             # [Phase 4] Reliable channels, mTLS peer discovery, terminal-to-terminal dataflow
-├── substrates/         # [Phase 5] MailCPU/HeadlessOS VM, ELF/WASM lifting, SIMT/tensor recovery, path Grounds
-├── models/             # [Phase 6-7] MWS lazy weights, HFRSafetensors, Qwen3 dense/MoE layers, SNC/PNF synthesis
-└── agents/             # [Phase 7] Model-native Virtual Layer controllers, ProofGround & advisory hypervisors
+├── cli.py              # [Phase 0-7 - Done] Unified `vld` verify, navigate, benchmark & serve CLI
+├── signal/             # [Phase 1 - Done] Phasor/ring/rational backends, typed IR, static footprints
+├── memory/             # [Phase 2 - Done] Structural Memory registry, 5-rung certifier, M1 paged store
+├── inquiry/            # [Phase 2 - Done] Active perception, greedy/beam/minimax probes, revision ledger
+├── accel/              # [Accel - Done] StructuralLinearOperator, semigroup leaps, NumPy + Rust CDLL
+├── fabric/             # [Vantage - Done] Multi-framing VantageEnvelope, pipe & HTTP 206 Range hosting
+├── models/             # [Phase 6-7 - Done] Safetensors HFR, BPE, Qwen3 dense/MoE, orbit recovery, SNC/PNF
+├── agents/             # [Phase 7 - Done] ProofGround, ReceiverHypervisor CAS/capabilities & ModelAgents
+├── authority/          # [Phase 3 - Next] Distributed multi-node quorum sessions & temporal clocks
+├── navigation/         # [Phase 4 - Next] Hierarchical lazy NavigableComputationDAG & mTLS peer mesh
+└── substrates/         # [Phase 5 - Next] HeadlessOS VM, ELF/WASM lifting & E-GPU delta checkpoints
 ```
 
 Every layer obeys a strict acyclic dependency order:

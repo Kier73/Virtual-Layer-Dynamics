@@ -10,80 +10,80 @@ Can communication paths, sensors, queues, services, and hosts—anything capable
 
 **Virtual Layer Dynamics (`vld`)** is the consolidated, production-grade implementation unifying four predecessor research programmes:
 
-1. **E-CPU (`mailcpu`):** Computational Grounds, Structural Memory, receiver-owned Hypervisor authority, content-addressed byte objects & quorum-fenced sessions, authenticated multi-hop fabric, SIMT/tensor recovery, and Internet/path-native substrates.
-2. **Virtual Ground Interpreter (`vgi`):** Signal-valued cyclic phasor execution ($\mathbb{Z}/8\mathbb{Z}$), observer-coordinate reframing, three-valued phase-uncertainty guards (`TRUE | FALSE | INDETERMINATE`), predictive transition compilation, active perception, and `ProofGround` obligations.
+1. **E-CPU (`mailcpu`):** Computational Grounds, Structural Memory, receiver-owned Hypervisor authority, content-addressed M1 byte objects, authenticated vantage infrastructure, and neural weight/layer Grounds.
+2. **Virtual Ground Interpreter (`vgi`):** Signal-valued cyclic phasor execution ($\mathbb{Z}/8\mathbb{Z}$), multi-domain observer-covariant backends, three-valued Kleene $\mathcal{K}_3$ guards, multi-digit predictive transition compilation, active perception, and `ProofGround` hypergraphs.
 3. **E-CPU Virtual Processor (`vp`):** Persistent processor identity and hash-chained journals across disposable hosts, dual-derivation affine orbit navigation, and sparse Mixture-of-Experts (`Qwen3-30B-A3B` / `Qwen3-235B-A22B`) architectural routing frontiers.
-4. **In-Formation-Space (`ifs`):** Portable encounter & temporal provenance contracts, blind cold-start handoffs, bounded external model structure readers, constructive semantic-to-neural hinge compilation, procedural Net2Wider neural formation, and capability-bounded model controllers.
+4. **In-Formation-Space (`ifs`):** Portable information-flow envelopes, bounded Safetensors header/range observers (`HFR`), constructive semantic-to-neural hinge & FSM compilation (`SNC`), procedural Net2Wider neural formation (`PNF`), and capability-bounded model agents.
 
 ---
 
 ## Governing Mathematical Shape
 
 ### 1. Lifting Bytes into a Virtual Ground
-Any hardware or software system representable in finite bytes $x \in (\mathbb{Z}/256\mathbb{Z})^N$—CPU/GPU state, OS pages, network datagrams, sensor streams, or neural weights—lifts through a declared, verifiable coordinate lens $\Lambda: (\mathbb{Z}/256\mathbb{Z})^N \rightharpoonup \Sigma_{\mathcal{G}}$ into a versioned **Virtual Ground**:
+Any hardware or software system representable in finite bytes $x \in (\mathbb{Z}/256\mathbb{Z})^N$—CPU/GPU state, OS pages, network datagrams, sensor streams, or neural weights—lifts through a declared, round-trip verified coordinate lens $\Lambda: (\mathbb{Z}/256\mathbb{Z})^N \rightharpoonup \Sigma_{\mathcal{G}}$ into a versioned **Virtual Ground**:
 
 $$\mathcal{G} = (\mathcal{L}, \Sigma_{\mathcal{G}}, \Delta_{\mathcal{G}}, \mathcal{I}_{\mathcal{G}}, \mathcal{O}_{\mathcal{G}}, \mathcal{C}_{\mathcal{G}}, \mathcal{E}_{\mathcal{G}}, \nu_{\mathcal{G}})$$
-
-where $\mathcal{L}$ is the representation language, $\Sigma_{\mathcal{G}}$ the denoted state space, $\Delta_{\mathcal{G}}$ admitted transitions, $\mathcal{I}_{\mathcal{G}}$ invariants and admission predicates, $\mathcal{O}_{\mathcal{G}}$ observer projections, $\mathcal{C}_{\mathcal{G}}$ multi-objective cost vectors, $\mathcal{E}_{\mathcal{G}}$ verification evidence, and $\nu_{\mathcal{G}}$ immutable schema version.
 
 ### 2. Expressive Capacity vs. Predictive Quotient & Information Triad
 Relative to an observer projection $P \in \mathcal{O}_{\mathcal{G}}$ and context $c$, states collapse under behavioral/predictive equivalence (Moore / Myhill-Nerode quotient):
 
 $$s_1 \sim_{P,c} s_2 \iff \forall \pi \in \Delta_{\mathcal{G}}^{*},\; P(\pi(s_1), c) = P(\pi(s_2), c), \qquad \widetilde{\Sigma}_{P,c} = \Sigma_{\mathcal{G}} / {\sim_{P,c}}$$
 
-Every transition $(s, a) \mapsto \Delta_{\mathcal{G}}(s, a)$ is classified into an explicit predictability and information-flow triad:
-
-- **Predictable & Information-Preserving ($\Delta_{\text{iso}}$):** Deterministic and locally injective ($|\delta_a^{-1}(s')| = 1$, $H_{\text{erasure}} = 0$). Admits algebraic/group shortcuts ($O(1)$ or $O(\log n)$ orbit jumps) without stepping intermediate states.
-- **Predictable & Information-Removing ($\Delta_{\text{contract}}$):** Deterministic many-to-one maps ($|\delta_a^{-1}(s')| > 1$, erasing $H(S \mid \delta_a(S)) > 0$ bits of history). Enables compact sufficient-state checkpoints, cache coalescing, and quotient state reduction.
-- **Information-Producing ($\Delta_{\text{open}}$):** Sensor, channel, or multi-host encounters injecting external mutual information $I(S'; \text{Env} \mid S, A) > 0$, governed by active probe planning.
-- **Underdetermined / Ambiguous ($\Delta_{\text{amb}}$):** Unobserved (`UNKNOWN`), conflicting (`AMBIGUOUS`), or boundary-uncertain (`INDETERMINATE`) transitions—which trap atomically or request disambiguating observations rather than fabricating state.
-
-### 3. When the Virtual Layer Outperforms Physical Step Execution
-For an $n$-step trajectory, let $\mathbf{C}_{\text{phys}}(n)$ be the multi-objective cost vector (latency, compute operations, bytes transferred, verification work) of step-by-step physical emulation, and let $(\sigma, g)$ be an admitted Virtual Layer shortcut with guard $g$ and certified-pocket exit rate $p_{\text{exit}}$:
-
-$$\mathbf{C}_{\text{VLD}}(\sigma, g, n) = \mathbf{C}_{\text{lift}} + \mathbf{C}_g + \mathbf{C}_\sigma(n) + p_{\text{exit}} \cdot \mathbf{C}_{\text{fallback}}(n)$$
-
-Whenever algebraic orbit laws ($\mathbf{C}_\sigma(n) = O(\log n)$), predictive state quotients ($|\widetilde{\Sigma}_{P,c}| \ll |\Sigma_{\mathcal{G}}|$), sparse expert frontiers ($k \ll E$), or in-transit observer-host compositions ($F_\pi = T_{h_m} \circ \dots \circ T_{h_0}$) apply, the Virtual Layer achieves strict Pareto dominance $\mathbf{C}_{\text{VLD}} \prec \mathbf{C}_{\text{phys}}$ while preserving exact or tolerance-certified observations.
+### 3. Changing the Shape of Computation (Pareto Dominance Over Brute-Force Compute)
+For an $n$-step trajectory or $M \times N$ operator evaluation, Virtual Layer Dynamics shifts asymptotic complexity whenever structural laws hold:
+- **Sufficient-Statistic Operator Contraction (`vld.accel.StructuralLinearOperator`):** Contracts generative/structured matrices $W = W_{\text{bilinear}} + W_{\text{orbit}} + U V^\top + \Delta_{\text{sparse}}$ directly against input sufficient statistics in $O(M + N + M P + R(M + N) + |\operatorname{supp}(\Delta)|) \ll \Theta(MN)$ FLOPs and zero dense allocation.
+- **Monoid & Semigroup Horizon Leaping (`AffineOrbitLaw`, `LinearRecurrenceGround`, `lfsr_jump_gf2`):** Advances scalar, $\operatorname{GF}(2)$, and contractive vector recurrences across $T$ coordinates in $O(\log T)$ binary compositions with zero intermediate state expansion.
+- **Active-Expert-Only Sparse MoE & Range Vantage Execution (`vld.models`, `vld.fabric`):** Evaluates top-$k$ MoE layers ($k \ll E$) and remote `.safetensors` checkpoints via bounded M1 / HTTP `206 Partial Content` `Range` slices without materializing inactive experts.
 
 ---
 
 ## Documentation Map
 
-- [**Mathematical Foundations**](docs/MATHEMATICAL_FOUNDATIONS.md) — Formal equations governing byte lifting, Virtual Grounds, Kleene $\mathcal{K}_3$ guards, predictive quotients, cost dominance, path composition, and neural/procedural model Grounds.
+- [**Mathematical Foundations**](docs/MATHEMATICAL_FOUNDATIONS.md) — Formal equations governing byte lifting, Virtual Grounds, Kleene $\mathcal{K}_3$ guards, multi-rung law certification, operator contraction, and neural/procedural model Grounds.
 - [**Research State & Lineage**](docs/RESEARCH_STATE_AND_LINEAGE.md) — Audited status of all four predecessor codebases, verified capabilities, empirical baseline findings, and strict epistemic boundaries.
-- [**Master Development Plan**](docs/DEVELOPMENT_PLAN.md) — Phased architecture and gate-driven engineering roadmap (`Phase 0` through `Phase 7`) from core mathematical kernel to distributed substrates and Virtual-Layer-native LLMs/hypervisors.
+- [**Master Development Plan**](docs/DEVELOPMENT_PLAN.md) — Phased architecture and gate-driven engineering roadmap (`Phase 0` through `Phase 7`).
 
 ---
 
-## Repository Layout (`Phase 0` Foundation)
+## Consolidated Repository Layout (`v0.2.0`)
 
 ```text
 Virtual-Layer-Dynamics/
-├── pyproject.toml                  # Zero-dependency core package (`virtual-layer-dynamics` / `vld`)
+├── pyproject.toml                  # Zero-mandatory-dependency core (`virtual-layer-dynamics` / `vld`)
+├── crates/vld_native/              # Optional LLVM-compiled Rust C-ABI accelerator kernels (`cdylib`)
 ├── docs/
-│   ├── MATHEMATICAL_FOUNDATIONS.md # Formal equations & invariants
+│   ├── MATHEMATICAL_FOUNDATIONS.md
 │   ├── RESEARCH_STATE_AND_LINEAGE.md
-│   └── DEVELOPMENT_PLAN.md         # Consolidated Phase 0–7 engineering roadmap
+│   └── DEVELOPMENT_PLAN.md
 ├── src/vld/
 │   ├── canonical.py                # Deterministic JSON & domain-separated SHA-256 addressing
 │   ├── triad.py                    # Kleene K_3 guards, Myhill-Nerode quotient & erasure entropy
 │   ├── ground.py                   # VirtualGroundSpec, ByteLens, dual-derivation AffineOrbitLaw, Pareto cost
-│   ├── journal.py                  # Atomic hash-chained receipt journal with idempotency fencing
-│   └── cli.py                      # `vld` command-line verifier & navigator
-└── tests/                          # Unit, edge-case, regression & documentation-integrity tests
+│   ├── journal.py                  # Multi-process hash-chained receipt journal & idempotency fencing
+│   ├── signal/                     # Signal8, ModularRing & ExactRational backends, footprints, base-8 compiler
+│   ├── memory/                     # M1 PagedObjectStore, 5-rung Law Certifier, 2-adic inverses, demotion
+│   ├── inquiry/                    # Greedy, beam & exact minimax probe planners + HypothesisRevisionLedger
+│   ├── accel/                      # StructuralLinearOperator, LinearRecurrenceGround, NumPy + Rust CDLL
+│   ├── fabric/                     # Multi-framing VantageEnvelope codec, StreamPipe & HTTP Range Vantage
+│   ├── models/                     # Safetensors HFR, BPE Tokenizer, Qwen3 dense/MoE, orbit recovery, SNC/PNF
+│   ├── agents/                     # ProofGround AND/OR hypergraph, ReceiverHypervisor & InLayerModelAgent
+│   └── cli.py                      # `vld` CLI (`info`, `verify`, `navigate`, `benchmark`, `serve`)
+└── tests/                          # 50+ invariant, differential, crash-recovery & hygiene tests
 ```
 
 ---
 
 ## Quickstart & Verification
 
-Requires **Python 3.11+**. The core `vld` runtime uses only the Python standard library.
+Requires **Python 3.11+**. The core `vld` runtime requires zero third-party dependencies, and automatically activates `numpy` SIMD/BLAS and compiled `rustc` native C-ABI kernels when available on the host.
 
 ```bash
 python -m pip install -e ".[dev]"
 python -m pytest -v
 python -m vld verify
+python -m vld benchmark --dim 1024 --steps 25000
 python -m vld navigate --seed 73 --coordinate 1000000000000
+python -m vld serve --host 127.0.0.1 --port 8730
 ```
 
 ---

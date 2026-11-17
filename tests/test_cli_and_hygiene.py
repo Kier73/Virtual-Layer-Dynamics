@@ -24,7 +24,12 @@ def test_cli_info_verify_and_navigate(capsys: pytest.CaptureFixture[str]) -> Non
     assert main(["verify"]) == 0
     verify_out = json.loads(capsys.readouterr().out)
     assert verify_out["status"] == "PASS"
-    assert verify_out["total_assertions"] >= 50
+    assert verify_out["total_assertions"] >= 5300
+
+    assert main(["benchmark", "--dim", "256", "--steps", "2000"]) == 0
+    bench_out = json.loads(capsys.readouterr().out)
+    assert bench_out["structural_operator_contraction"]["pareto_dominates_dense_flops_and_bytes"] is True
+    assert bench_out["linear_recurrence_leap"]["pareto_dominates_traditional"] is True
 
     assert main(["navigate", "--seed", "73", "--coordinate", "1000000000000"]) == 0
     nav_out = json.loads(capsys.readouterr().out)

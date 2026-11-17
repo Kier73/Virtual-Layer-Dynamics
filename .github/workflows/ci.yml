@@ -14,7 +14,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  verify:
+  verify-stdlib:
     strategy:
       fail-fast: false
       matrix:
@@ -30,7 +30,7 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Install package and dev dependencies
+      - name: Install package and dev dependencies (zero runtime deps)
         run: |
           python -m pip install --upgrade pip
           python -m pip install -e ".[dev]"
@@ -38,8 +38,31 @@ jobs:
       - name: Run unit and invariant test suite
         run: python -m pytest -v
 
-      - name: Run CLI mathematical self-verification
-        run: python -m vld verify
+      - name: Run CLI mathematical self-verification and Pareto benchmark
+        run: |
+          python -m vld verify
+          python -m vld benchmark --dim 512 --steps 5000
 
       - name: Verify sdist and wheel build cleanly
         run: python -m build
+
+  verify-accelerated:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install package with optional numerics
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev,numerics]"
+
+      - name: Run accelerated test suite and self-verification
+        run: |
+          python -m pytest -v
+          python -m vld verify
