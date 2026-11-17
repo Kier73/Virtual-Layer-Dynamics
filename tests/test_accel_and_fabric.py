@@ -217,3 +217,88 @@ def test_live_http_vantage_server_auth_idempotency_and_m1_range_streaming() -> N
         # Out-of-range HTTP Range request raises VantageError (HTTP 416)
         with pytest.raises(VantageError):
             auth_client.fetch_m1_range(manifest.manifest_digest, 600, 100)
+
+
+def test_bf16_overflow_operator_fingerprint_uniqueness_and_spectral_guard() -> None:
+    # 1. Finite float32 exceeding BF16 max (~3.3895e38) must raise ValueError instead of encoding +Inf
+    assert len(encode_bf16_le([3.38e38, -3.38e38])) == 4
+    with pytest.raises(ValueError, match="overflows bfloat16"):
+        encode_bf16_le([3.4028234e38])
+
+    # 2. Distinct low-rank and sparse StructuralLinearOperators must have distinct fingerprints
+    op1 = StructuralLinearOperator(
+        rows=2,
+        cols=2,
+        low_rank_u=((1.0,), (0.0,)),
+        low_rank_v=((1.0,), (0.0,)),
+        sparse_entries=((0, 0, 5.0),),
+    )
+    op2 = StructuralLinearOperator(
+        rows=2,
+        cols=2,
+        low_rank_u=((0.0,), (99.0,)),
+        low_rank_v=((0.0,), (-7.0,)),
+        sparse_entries=((1, 1, -42.0),),
+    )
+    assert op1.fingerprint != op2.fingerprint
+    with pytest.raises(ValueError):
+        op1.entry(-1, 0)
+
+    # 3. Unstable single-eigenvalue matrix diag(1.4, 0) (where ||A||_F^2 = 1.96 <= d = 2!) MUST be refused!
+    with pytest.raises(ValueError, match="unstable"):
+        LinearRecurrenceGround(((1.4, 0.0), (0.0, 0.0)), (0.0, 0.0))
+
+    # Exact orthogonal rotation (||R||_2 = 1, ||R||_inf = sqrt(2) > 1) MUST be admitted!
+    ang = 0.4
+    orth = LinearRecurrenceGround(((math.cos(ang), -math.sin(ang)), (math.sin(ang), math.cos(ang))), (0.0, 0.0))
+    h_end, _ = orth.navigate_horizon((1.0, 0.0), 1000)
+    assert math.isclose(math.hypot(h_end[0], h_end[1]), 1.0, abs_tol=1e-9)
+
+    native = get_native_accelerator()
+    if native.available:
+        with pytest.raises(ValueError):
+            native.rms_norm_f32([[1.0, 2.0], [3.0]], [1.0, 1.0], 1e-6)
+
+
+def test_concurrent_http_vantage_with_disk_backing_and_persisted_reentrant_journal(tmp_path) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+    from vld.journal import HashChainedJournal
+    from vld.memory import DiskPageBacking
+
+    secret = b"concurrent-vantage-hmac-secret-32b!"
+    journal = HashChainedJournal(tmp_path / "vantage.jsonl")
+    backing = DiskPageBacking(tmp_path / "m1_disk", page_size=64)
+    store = PagedObjectStore(backing)
+    node = VLDVantageNode("persisted-http-node", store=store, journal=journal, capability_secret=secret)
+
+    seed_blob = bytes((i * 23 + 7) % 256 for i in range(512))
+    seed_manifest = store.put_bytes(seed_blob)
+
+    with VLDHttpVantageServer(node) as server:
+        def _worker(tid: int) -> bool:
+            c = VLDHttpVantageClient(server.base_url, client_id=f"worker-{tid}", capability_secret=secret)
+            mem_id = f"worker.mem.{tid}"
+            r_admit = c.invoke_op(
+                "admit_structural_law",
+                {"declared_modulus": 97, "domain": "Z/97Z", "memory_id": mem_id, "samples": [90, 95, 3, 8, 13]},
+                request_id=f"req-admit-{tid}",
+            )
+            assert r_admit.payload["result"]["family"] == "int"
+            r_read = c.invoke_op(
+                "structural_read",
+                {"coordinate_start": 10_000 + tid, "length": 2, "memory_id": mem_id},
+                request_id=f"req-read-{tid}",
+            )
+            assert r_read.payload["result"]["values"][0] == (90 + 5 * (10_000 + tid)) % 97
+            sl = c.fetch_m1_range(seed_manifest.manifest_digest, tid * 16, 64)
+            assert sl == seed_blob[tid * 16 : tid * 16 + 64]
+            return True
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            results = list(pool.map(_worker, range(8)))
+        assert all(results)
+
+    # Verify full persisted hash-chained journal integrity across reentrant child/parent ops!
+    assert len(journal) == 32  # 8 workers * (sm.admit + vantage.admit + sm.read + vantage.read)
+    reloaded = HashChainedJournal(tmp_path / "vantage.jsonl")
+    assert reloaded.verify() == journal.head_digest

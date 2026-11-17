@@ -30,10 +30,11 @@ def _shared_lib_suffix() -> str:
 
 
 def _default_rust_source() -> Path:
-    # Locate repo-relative crates/vld_native/src/lib.rs when running from source checkout
     here = Path(__file__).resolve()
-    candidate = here.parents[3] / "crates" / "vld_native" / "src" / "lib.rs"
-    return candidate
+    packaged = here.with_name("vld_native.rs")
+    if packaged.is_file():
+        return packaged
+    return here.parents[3] / "crates" / "vld_native" / "src" / "lib.rs"
 
 
 class NativeRustAccelerator:
@@ -156,6 +157,8 @@ class NativeRustAccelerator:
     ) -> list[float]:
         if self._dll is None:
             raise RuntimeError("NativeRustAccelerator is not available on this host.")
+        if rows < 0 or cols < 0 or stride < 0 or len(x) != cols:
+            raise ValueError("Invalid dimensions, negative stride, or input length mismatch.")
         period = len(orbit)
         orbit_arr = (ctypes.c_double * max(1, period))(*orbit) if period > 0 else (ctypes.c_double * 1)(0.0)
         x_arr = (ctypes.c_double * max(1, cols))(*x) if cols > 0 else (ctypes.c_double * 1)(0.0)
@@ -184,6 +187,8 @@ class NativeRustAccelerator:
             raise RuntimeError("NativeRustAccelerator is not available on this host.")
         rows = len(x_2d)
         cols = len(weight)
+        if cols == 0 or any(len(row) != cols for row in x_2d):
+            raise ValueError("Each row of x_2d must have non-zero length matching len(weight).")
         flat = [float(val) for row in x_2d for val in row]
         x_arr = (ctypes.c_float * max(1, rows * cols))(*flat)
         w_arr = (ctypes.c_float * cols)(*(float(w) for w in weight))

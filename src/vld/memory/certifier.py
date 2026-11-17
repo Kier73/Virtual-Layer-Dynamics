@@ -215,7 +215,7 @@ def locate_lcg_bsgs(
 
 def locate_gf2_bit(coeffs: Sequence[int], init_state: Sequence[int], target: int) -> int | None:
     r"""Locate smallest coordinate $t \ge 0$ emitting `target` $\in \{0, 1\}$ in $O(L)$ checks."""
-    if isinstance(target, bool) or not isinstance(target, int) or target not in (0, 1):
+    if isinstance(target, bool) or not isinstance(target, int) or target not in (0, 1) or not init_state:
         return None
     for idx, bit in enumerate(init_state):
         if bit == target:
@@ -225,6 +225,8 @@ def locate_gf2_bit(coeffs: Sequence[int], init_state: Sequence[int], target: int
         return None  # Zero state is an absorbing fixed point for homogeneous GF(2) LFSR.
     # All-1 initial state: next bit at coordinate L is sum_{j=1..L} coeffs[j] mod 2.
     order = len(init_state)
+    if len(coeffs) < order + 1:
+        return None
     next_bit = sum(coeffs[j] for j in range(1, order + 1)) & 1
     return order if next_bit == target else None
 
@@ -389,9 +391,15 @@ def certify_sequence_law(
     """
     if len(samples) < 4:
         raise LawCertificationRefused("At least 4 observations are required to certify a generative law.")
+    if declared_modulus is not None and (
+        isinstance(declared_modulus, bool) or not isinstance(declared_modulus, int) or declared_modulus < 2
+    ):
+        raise LawCertificationRefused("declared_modulus must be an exact int >= 2 when supplied.")
     for idx, x in enumerate(samples):
         if isinstance(x, bool) or not isinstance(x, int):
             raise LawCertificationRefused(f"Observation at index {idx} must be an exact int.")
+        if declared_modulus is not None and not (0 <= x < declared_modulus):
+            raise LawCertificationRefused("Observation falls outside declared_modulus.")
 
     # 1. Optional GF(2) binary stream rung when samples are bits and prefer_gf2 or declared_modulus == 2
     if (prefer_gf2 or declared_modulus == 2) and all(x in (0, 1) for x in samples):
@@ -444,27 +452,10 @@ def certify_sequence_law(
             if all(cand.evaluate(t) == samples[t] for t in range(len(samples))):
                 return cand
 
-    # 5. Rung 4: Exact Newton Binomial Polynomial (`poly`) over Z or Z/MZ
-    if allow_unbounded_poly or declared_modulus is not None:
-        # Compute forward differences over Z first; if declared_modulus is given and unwrapped fails, check mod M
-        diffs = [list(samples)]
-        while len(diffs[-1]) > 1 and len(diffs) <= max_poly_degree + 2:
-            prev = diffs[-1]
-            diffs.append([prev[i + 1] - prev[i] for i in range(len(prev) - 1)])
-        for deg in range(1, min(max_poly_degree, len(samples) - 3) + 1):
-            # Require zero (deg+1)-th forward difference across >= 2 held-out steps (len >= deg + 3)
-            rem_diffs = diffs[deg + 1]
-            if len(rem_diffs) >= 2 and all(d == 0 for d in rem_diffs):
-                newton_coeffs = [diffs[k][0] for k in range(deg + 1)]
-                params: dict[str, Any] = {"newton_coeffs": newton_coeffs}
-                if declared_modulus is not None:
-                    params["mod"] = declared_modulus
-                cand = CertifiedLaw("poly", params, order=deg)
-                if all(cand.evaluate(t) == samples[t] for t in range(len(samples))):
-                    return cand
-
-    # 6. Rung 5: Eventual periodic finite state map (`fgraph`)
-    # Requires deterministic single-step map f(x_t) = x_{t+1} and at least one full cycle repeat (N >= mu + 2*lam)
+    # Precompute eventual periodic finite-state candidate (`fgraph`) so bounded low-period cycles
+    # are never mis-certified as high-degree unbounded polynomials on short prefixes.
+    fgraph_cand: CertifiedLaw | None = None
+    fgraph_complexity: int | None = None
     next_map: dict[int, int] = {}
     deterministic_map = True
     for i in range(len(samples) - 1):
@@ -485,9 +476,45 @@ def certify_sequence_law(
             first_seen[val] = t
         if mu is not None and lam is not None and lam >= 1 and len(samples) >= mu + 2 * lam:
             orbit = list(samples[: mu + lam])
-            cand = CertifiedLaw("fgraph", {"lam": lam, "mu": mu, "orbit": orbit}, order=lam)
-            if all(cand.evaluate(t) == samples[t] for t in range(len(samples))):
-                return cand
+            cand_fg = CertifiedLaw("fgraph", {"lam": lam, "mu": mu, "orbit": orbit}, order=lam)
+            if all(cand_fg.evaluate(t) == samples[t] for t in range(len(samples))):
+                fgraph_cand = cand_fg
+                fgraph_complexity = mu + lam
+
+    # 5. Rung 4: Exact Newton Binomial Polynomial (`poly`) over Z or Z/MZ
+    if allow_unbounded_poly or declared_modulus is not None:
+        max_deg = min(max_poly_degree, len(samples) - 3)
+        if allow_unbounded_poly and declared_modulus is None:
+            diffs = [list(samples)]
+            while len(diffs[-1]) > 1 and len(diffs) <= max_poly_degree + 2:
+                prev = diffs[-1]
+                diffs.append([prev[i + 1] - prev[i] for i in range(len(prev) - 1)])
+            for deg in range(1, max_deg + 1):
+                rem_diffs = diffs[deg + 1]
+                if len(rem_diffs) >= 2 and all(d == 0 for d in rem_diffs):
+                    if fgraph_cand is not None and fgraph_complexity is not None and fgraph_complexity <= deg:
+                        return fgraph_cand
+                    newton_coeffs = [diffs[k][0] for k in range(deg + 1)]
+                    cand = CertifiedLaw("poly", {"newton_coeffs": newton_coeffs}, order=deg)
+                    if all(cand.evaluate(t) == samples[t] for t in range(len(samples))):
+                        return cand
+        elif declared_modulus is not None:
+            m = declared_modulus
+            diffs_mod = [[x % m for x in samples]]
+            while len(diffs_mod[-1]) > 1 and len(diffs_mod) <= max_poly_degree + 2:
+                prev = diffs_mod[-1]
+                diffs_mod.append([(prev[i + 1] - prev[i]) % m for i in range(len(prev) - 1)])
+            for deg in range(1, max_deg + 1):
+                rem_diffs = diffs_mod[deg + 1]
+                if len(rem_diffs) >= 2 and all(d == 0 for d in rem_diffs):
+                    newton_coeffs = [diffs_mod[k][0] for k in range(deg + 1)]
+                    cand = CertifiedLaw("poly", {"mod": m, "newton_coeffs": newton_coeffs}, order=deg)
+                    if all(cand.evaluate(t) == samples[t] for t in range(len(samples))):
+                        return cand
+
+    # 6. Rung 5: Eventual periodic finite state map (`fgraph`)
+    if fgraph_cand is not None:
+        return fgraph_cand
 
     _ = canonical_json(list(samples[:8]))
     raise LawCertificationRefused(

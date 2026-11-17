@@ -77,3 +77,39 @@ def test_tracked_markdown_links_resolve() -> None:
             assert not rel_to_root.startswith(ignored_prefixes), (
                 f"Tracked doc {md_path.name} links to gitignored path {rel_to_root}"
             )
+
+
+def test_packaged_rust_source_synced_and_dag_acyclic() -> None:
+    crate_rs = REPO_ROOT / "crates" / "vld_native" / "src" / "lib.rs"
+    packaged_rs = REPO_ROOT / "src" / "vld" / "accel" / "vld_native.rs"
+    assert packaged_rs.is_file()
+    assert packaged_rs.read_bytes() == crate_rs.read_bytes()
+
+    # Verify strict acyclic package dependency order across all vld submodules
+    adj: dict[str, set[str]] = {}
+    for py_path in sorted((REPO_ROOT / "src" / "vld").rglob("*.py")):
+        rel = py_path.relative_to(REPO_ROOT / "src" / "vld")
+        pkg = rel.parts[0].replace(".py", "")
+        edges = adj.setdefault(pkg, set())
+        tree = ast.parse(py_path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module and node.module.startswith("vld"):
+                parts = node.module.split(".")
+                if len(parts) > 1 and parts[1] != pkg:
+                    edges.add(parts[1])
+
+    visiting: set[str] = set()
+    visited: set[str] = set()
+
+    def _dfs(u: str) -> None:
+        assert u not in visiting, f"Cycle detected in vld package imports at {u!r}"
+        if u in visited:
+            return
+        visiting.add(u)
+        for v in adj.get(u, ()):
+            _dfs(v)
+        visiting.remove(u)
+        visited.add(u)
+
+    for node_name in adj:
+        _dfs(node_name)

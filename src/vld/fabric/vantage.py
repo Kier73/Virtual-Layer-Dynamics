@@ -246,13 +246,16 @@ class VLDVantageNode:
             return val
 
     def register_ground(self, spec: VirtualGroundSpec) -> str:
-        self._grounds[spec.ground_id] = spec
+        with self._seq_lock:
+            self._grounds[spec.ground_id] = spec
         return spec.fingerprint
 
     def health_summary(self) -> dict[str, Any]:
+        with self._seq_lock:
+            hosted = sorted(self._grounds.keys())
         return {
             "capability_protected": self._capability_secret is not None,
-            "hosted_grounds": sorted(self._grounds.keys()),
+            "hosted_grounds": hosted,
             "journal_events": len(self.journal),
             "journal_head_digest": self.journal.head_digest,
             "node_id": self.node_id,
@@ -547,6 +550,7 @@ class VLDHttpVantageClient:
         self._capability_secret = capability_secret
         self.timeout_s = timeout_s
         self._opener = build_opener(_StrictNoRedirect)
+        self._seq_lock = threading.Lock()
         self._seq = 0
 
     def health(self) -> dict[str, Any]:
@@ -607,13 +611,15 @@ class VLDHttpVantageClient:
         }
         if ground_fingerprint is not None:
             payload["ground_fingerprint"] = ground_fingerprint
+        with self._seq_lock:
+            seq = self._seq
+            self._seq += 1
         env = VantageEnvelope(
             vantage_id=self.client_id,
             flow_kind="op_request",
-            sequence=self._seq,
+            sequence=seq,
             payload=payload,
         )
-        self._seq += 1
         if self._capability_secret is not None:
             env = env.with_hmac(self._capability_secret)
 

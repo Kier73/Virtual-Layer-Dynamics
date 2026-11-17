@@ -487,3 +487,175 @@ def test_proof_ground_and_autonomous_model_agent_with_hypervisor_refusals() -> N
     hypervisor.journal.verify()
     refusal_events = [e for e in hypervisor.journal.events if e.operation == "hypervisor.refusal"]
     assert len(refusal_events) == 5
+
+
+def test_partial_prefix_cache_hit_with_mid_layer_prefill_crash_and_remote_kv_tamper() -> None:
+    arch = TransformerArchitectureSpec(
+        source_model="Qwen/Qwen3-PrefixCrash",
+        revision="d" * 40,
+        model_type="qwen3",
+        hidden_size=16,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=4,
+        intermediate_size=32,
+        vocab_size=24,
+        max_position_embeddings=64,
+        tie_word_embeddings=True,
+        dtype="BF16",
+    )
+    raw_weights = _make_deterministic_weights(arch)
+    store = PagedObjectStore(InMemoryPageBacking(page_size=256))
+    snap = ModelWeightSnapshot.publish_tensors(arch.build_parameter_space(), store, raw_weights)
+
+    # Tampered remote KV bytes must be rejected by SHA-256 verification!
+    kv_check = PagedKVCacheGround(store)
+    kv_page = kv_check.store_layer_kv(
+        arch,
+        layer_index=0,
+        token_prefix=(1, 2),
+        k_3d=[[[0.5] * 4, [0.25] * 4], [[0.1] * 4, [0.2] * 4]],
+        v_3d=[[[0.3] * 4, [0.4] * 4], [[0.6] * 4, [0.7] * 4]],
+    )
+    with pytest.raises(ModelOrbitError, match="SHA-256"):
+        kv_check.load_layer_kv(kv_page, remote_range_fetcher=lambda _d, _o, ln: b"\x00" * ln)
+
+    # Host A populates prefix cache for (3, 7), then starts (3, 7, 11, 15) hitting prefix (3, 7)
+    # and crashes mid-layer (after layer 0) during suffix prefill of (11, 15)!
+    runner_ref = AutoregressiveModelRunner(arch, snap, store)
+    expected_full = runner_ref.generate((3, 7, 11, 15), max_new_tokens=2)
+
+    runner_a = AutoregressiveModelRunner(arch, snap, store)
+    runner_a.generate((3, 7), max_new_tokens=1)  # caches prefix (3, 7) across all layers
+    hit_len, _ = runner_a.kv_ground.lookup_longest_prefix(arch, (3, 7, 11, 15))
+    assert hit_len == 2
+
+    captured: list[ModelOrbitCheckpoint] = []
+
+    def _crash_suffix_prefill(ckpt: ModelOrbitCheckpoint, gen_idx: int, layer_idx: int) -> None:
+        if gen_idx == 0 and layer_idx == 0:
+            captured.append(ckpt)
+            raise RuntimeError("simulated_mid_prefill_crash")
+
+    with pytest.raises(RuntimeError, match="simulated_mid_prefill_crash"):
+        runner_a.generate((3, 7, 11, 15), max_new_tokens=2, on_checkpoint=_crash_suffix_prefill)
+
+    assert len(captured) == 1
+    assert captured[0].active_step_tokens == (11, 15)
+
+    # Fresh Host B resumes mid-prefill checkpoint, matches uninterrupted tokens/logits, AND indexes full prefix!
+    runner_b = AutoregressiveModelRunner(arch, snap, store)
+    with pytest.raises(ModelOrbitError, match="disagrees"):
+        runner_b.generate((9, 9, 9, 9), max_new_tokens=2, resume_checkpoint=captured[0])
+
+    resumed = runner_b.generate((3, 7, 11, 15), max_new_tokens=2, resume_checkpoint=captured[0])
+    assert resumed.generated_tokens == expected_full.generated_tokens
+    assert NumericEngine.max_abs_diff(resumed.last_step_logits, expected_full.last_step_logits) < 1e-6
+    pref_b, _ = runner_b.kv_ground.lookup_longest_prefix(arch, (3, 7, 11, 15, 20))
+    assert pref_b == 4
+
+
+def test_multivariate_polyhedral_compilation_dyadic_rescaling_replacement_and_hypervisor_scope() -> None:
+    from vld.canonical import domain_digest
+    from vld.models import (
+        compile_multivariate_hinge_relu,
+        evaluate_multivariate_capsule,
+        rescale_block_dyadic,
+        verify_multivariate_capsule,
+    )
+
+    # 1. Exact 2D polyhedral ReLU compilation & whole-domain Fourier-Motzkin chamber verification
+    mv_cap = compile_multivariate_hinge_relu(
+        input_dim=2,
+        base_linear=[["1", "-2"], ["0", "1"]],
+        base_bias=["3/2", "-1"],
+        hinges=[
+            {"normal": ["1", "1"], "offset": "-1", "weights": ["2", "-1"]},
+            {"normal": ["2", "-1"], "offset": "0", "weights": ["-3", "4"]},
+        ],
+    )
+    mv_rep = verify_multivariate_capsule(mv_cap)
+    assert mv_rep["status"] == "VERIFIED_WHOLE_DOMAIN"
+    # 3 lines through (0,0) {x0=0, x1=0, 2x0-x1=0} -> 6 cones, cut by x0+x1=1 -> 6 + 4 = 10 Zaslavsky chambers!
+    assert mv_rep["chambers_verified"] == 10
+    # At x = (1, 1): x0+x1-1 = 1 > 0, 2*x0-x1 = 1 > 0
+    # out0 = (1 - 2 + 3/2) + 2*(1) + (-3)*(1) = 1/2 - 1 = -1/2
+    # out1 = (0 + 1 - 1) + (-1)*(1) + 4*(1) = 3
+    assert evaluate_multivariate_capsule(mv_cap, [1, 1]) == [Fraction(-1, 2), Fraction(3)]
+
+    # Tampered multivariate weight with recomputed digest MUST fail chamber equivalence!
+    bad_mv = json.loads(json.dumps(mv_cap))
+    bad_mv["network"]["output_bias"][0] = "99"
+    bad_mv_body = {k: v for k, v in bad_mv.items() if k != "capsule_digest"}
+    bad_mv["capsule_digest"] = domain_digest("vld.snc-multivariate-relu-capsule.v1", bad_mv_body)
+    with pytest.raises(ProceduralModelError, match="disagrees with source_spec"):
+        verify_multivariate_capsule(bad_mv)
+
+    # 2. Compensated dyadic positive rescaling symmetry on ReLU FeedForwardBlock
+    relu_blk = FeedForwardBlock(
+        up_weight=((0.5, -1.25), (0.75, 0.25)),
+        up_bias=(0.125, -0.5),
+        down_weight=((1.5, -0.25), (-0.75, 2.0)),
+        down_bias=(0.5, -0.5),
+        activation="relu",
+    )
+    rescaled, r_cert = rescale_block_dyadic(relu_blk, [3, -2])
+    assert r_cert["morphism"] == "dyadic_positive_rescale"
+    pts = [[-2.0, 1.5], [0.25, -3.0], [1.0, 1.0]]
+    assert relu_blk.evaluate(pts) == rescaled.evaluate(pts)  # exact binary32 bit-for-bit equality!
+
+    # 3. GenerativeWeightGround stored & sparse chunk-replacement recipes
+    store = PagedObjectStore(InMemoryPageBacking(page_size=64))
+    p_space = ModelParameterSpace("delta.test", {"v": 1}, (TensorSpace("w", "U8", (8, 16)),))
+    base_bytes = bytes(range(128))
+    base_snap = ModelWeightSnapshot.publish_tensors(p_space, store, {"w": base_bytes})
+    stored_rec = GenerativeWeightGround.build_stored_recipe(
+        p_space, "w", store, source_snapshot_id="snap0", snapshot=base_snap, chunk_size=64
+    )
+    assert GenerativeWeightGround.read_verified_chunk(
+        p_space, stored_rec, 1, store=store, source_snapshots={"snap0": base_snap}
+    ) == base_bytes[64:128]
+
+    patch_chunk1 = bytes([255] * 64)
+    repl_rec = GenerativeWeightGround.build_replacement_recipe(
+        p_space,
+        "w",
+        store,
+        base_snapshot_id="snap0",
+        base_snapshot=base_snap,
+        replacement_chunks={1: patch_chunk1},
+        chunk_size=64,
+    )
+    assert GenerativeWeightGround.read_verified_chunk(
+        p_space, repl_rec, 0, store=store, source_snapshots={"snap0": base_snap}
+    ) == base_bytes[:64]
+    assert GenerativeWeightGround.read_verified_chunk(p_space, repl_rec, 1) == patch_chunk1
+
+    # 4. ReceiverHypervisor enforces memory scope on navigate_certified_orbit & journals malformed capsule/cost refusals
+    hyp = ReceiverHypervisor()
+    hyp.structural_memory.certify_and_admit("vault.secret", [90, 95, 3, 8, 13], domain="Z/97Z")
+    hyp.register_agent(
+        CapabilityGrant(
+            "sandboxed",
+            frozenset({AgentCapability.NAVIGATE_ORBIT, AgentCapability.ADMIT_NEURAL_CAPSULE, AgentCapability.SELECT_PROBE}),
+            allowed_memory_prefix="sandbox.",
+        )
+    )
+    with pytest.raises(HypervisorRefusalError, match="outside agent scope"):
+        hyp.navigate_certified_orbit("sandboxed", memory_id="vault.secret", coordinate=0)
+
+    # Multivariate valid capsule is admitted by Hypervisor; malformed capsule dict is refused & journaled (no KeyError!)
+    assert hyp.admit_neural_capsule("sandboxed", mv_cap)["status"] == "VERIFIED_WHOLE_DOMAIN"
+    empty_body = {"schema": "vld.snc-relu-capsule.v1"}
+    malformed_cap = {**empty_body, "capsule_digest": domain_digest("vld.snc-relu-capsule.v1", empty_body)}
+    with pytest.raises(HypervisorRefusalError, match="failed independent verification"):
+        hyp.admit_neural_capsule("sandboxed", malformed_cap)
+
+    with pytest.raises(HypervisorRefusalError):
+        hyp.authorize_probe("sandboxed", probe_label="bad-float", cost=0.5)  # type: ignore[arg-type]
+    with pytest.raises(HypervisorRefusalError):
+        hyp.authorize_probe("sandboxed", probe_label="bad-neg", cost=0)
+
+    refusals = [e for e in hyp.journal.events if e.operation == "hypervisor.refusal"]
+    assert len(refusals) == 4

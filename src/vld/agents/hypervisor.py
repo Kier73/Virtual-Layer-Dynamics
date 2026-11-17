@@ -20,7 +20,7 @@ from typing import Any, Mapping, Sequence
 from vld.canonical import canonical_json, domain_digest, parse_strict_json
 from vld.journal import HashChainedJournal
 from vld.memory import LawCertificationRefused, StructuralMemoryError, StructuralMemoryRegistry
-from vld.models.procedural import ProceduralModelError, verify_compiled_capsule
+from vld.models.procedural import ProceduralModelError, verify_compiled_capsule, verify_multivariate_capsule
 
 
 class HypervisorRefusalError(PermissionError):
@@ -133,8 +133,16 @@ class ReceiverHypervisor:
     def authorize_probe(self, agent_id: str, *, probe_label: str, cost: int | Fraction) -> Fraction:
         """Deduct `cost` from agent's probe budget if permitted, else deterministically refuse."""
         self._require_capability(agent_id, AgentCapability.SELECT_PROBE)
-        c = Fraction(cost)
+        if isinstance(cost, (bool, float)):
+            self._record_refusal(agent_id, "invalid_probe_cost_type", {"probe_label": probe_label, "type": type(cost).__name__})
+            raise HypervisorRefusalError("Probe cost must be an exact int or Fraction, not bool/float.")
+        try:
+            c = Fraction(cost)
+        except (TypeError, ValueError, ZeroDivisionError) as exc:
+            self._record_refusal(agent_id, "invalid_probe_cost", {"error": str(exc), "probe_label": probe_label})
+            raise HypervisorRefusalError(f"Invalid probe cost: {exc}") from exc
         if c <= 0:
+            self._record_refusal(agent_id, "non_positive_probe_cost", {"cost": str(c), "probe_label": probe_label})
             raise HypervisorRefusalError("Probe cost must be positive.")
         rem = self.remaining_budget(agent_id)
         if c > rem:
@@ -197,7 +205,12 @@ class ReceiverHypervisor:
         coordinate: int,
     ) -> dict[str, Any]:
         """Navigate to distant coordinate `coordinate` using a certified Structural Memory Ground."""
-        self._require_capability(agent_id, AgentCapability.NAVIGATE_ORBIT)
+        grant = self._require_capability(agent_id, AgentCapability.NAVIGATE_ORBIT)
+        if grant.allowed_memory_prefix and not memory_id.startswith(grant.allowed_memory_prefix):
+            self._record_refusal(agent_id, "memory_scope_violation", {"memory_id": memory_id})
+            raise HypervisorRefusalError(
+                f"memory_id {memory_id!r} outside agent scope prefix {grant.allowed_memory_prefix!r}."
+            )
         try:
             val, receipt = self.structural_memory.read(memory_id, coordinate)
         except (StructuralMemoryError, LawCertificationRefused, ValueError) as exc:
@@ -215,8 +228,13 @@ class ReceiverHypervisor:
         """Independently verify whole-domain equivalence before admitting a compiled neural capsule."""
         self._require_capability(agent_id, AgentCapability.ADMIT_NEURAL_CAPSULE)
         try:
-            report = verify_compiled_capsule(capsule)
-        except ProceduralModelError as exc:
+            if not isinstance(capsule, Mapping):
+                raise ProceduralModelError("capsule must be a mapping.")
+            if capsule.get("schema") == "vld.snc-multivariate-relu-capsule.v1":
+                report = verify_multivariate_capsule(capsule)
+            else:
+                report = verify_compiled_capsule(capsule)
+        except (ProceduralModelError, KeyError, TypeError, ValueError) as exc:
             self._record_refusal(agent_id, "neural_capsule_verification_failed", {"error": str(exc)})
             raise HypervisorRefusalError(f"Neural capsule failed independent verification: {exc}") from exc
         cdigest = str(report["capsule_digest"])

@@ -3,6 +3,7 @@ r"""Phase 6 — Paged KV-State Ground & Crash-Resumable Multi-Host Model-Orbit C
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 from typing import Any, Callable, Mapping, Sequence
 
 from vld.accel import NumericEngine, decode_f32_le, encode_f32_le
@@ -96,6 +97,22 @@ class PagedKVCacheGround:
         self._prefix_index.setdefault(key, {})[layer_index] = page
         return page
 
+    def register_prefix_pages(
+        self,
+        arch: TransformerArchitectureSpec,
+        token_prefix: Sequence[int],
+        pages_by_layer: Mapping[int, LayerKVPage],
+    ) -> None:
+        """Index verified layer KV pages for `token_prefix` on a resumed host."""
+        tok_tup = tuple(int(t) for t in token_prefix)
+        if not tok_tup or not pages_by_layer:
+            return
+        slot = self._prefix_index.setdefault((arch.fingerprint, tok_tup), {})
+        for l_idx, page in pages_by_layer.items():
+            if page.model_fingerprint != arch.fingerprint or page.seq_len != len(tok_tup):
+                raise ModelOrbitError("KV page metadata disagrees with registered token_prefix.")
+            slot[int(l_idx)] = page
+
     def load_layer_kv(
         self,
         page: LayerKVPage,
@@ -105,6 +122,8 @@ class PagedKVCacheGround:
         def _read(m: PagedByteManifest) -> list[float]:
             if remote_range_fetcher is not None:
                 raw = remote_range_fetcher(m.manifest_digest, 0, m.size_bytes)
+                if len(raw) != m.size_bytes or hashlib.sha256(raw).hexdigest() != m.content_digest:
+                    raise ModelOrbitError("Remote KV page failed SHA-256 content_digest verification.")
             else:
                 raw = self.store.read_bytes(m)
             return decode_f32_le(raw)
@@ -113,6 +132,8 @@ class PagedKVCacheGround:
         fv = _read(page.v_manifest)
         s, nh, hd = page.seq_len, page.num_kv_heads, page.head_dim
         stride_s = nh * hd
+        if len(fk) != s * stride_s or len(fv) != s * stride_s:
+            raise ModelOrbitError("Decoded KV page float count disagrees with LayerKVPage dimensions.")
         k_3d = [
             [fk[t * stride_s + h * hd : t * stride_s + (h + 1) * hd] for h in range(nh)]
             for t in range(s)
@@ -276,17 +297,45 @@ class AutoregressiveModelRunner:
                 or resume_checkpoint.weight_snapshot_identity != self.snapshot.identity
             ):
                 raise ModelOrbitError("Resume checkpoint belongs to a different model or weight snapshot.")
+            if prompt_tokens and tuple(int(t) for t in prompt_tokens) != resume_checkpoint.prompt_tokens:
+                raise ModelOrbitError("Supplied prompt_tokens disagrees with resume_checkpoint.prompt_tokens.")
             prompt_tup = resume_checkpoint.prompt_tokens
+            if not prompt_tup:
+                raise ModelOrbitError("Checkpoint prompt_tokens cannot be empty.")
             generated = list(resume_checkpoint.generated_tokens)
+            if len(generated) > max_new_tokens:
+                raise ModelOrbitError("Checkpoint already exceeds requested max_new_tokens.")
             committed_kv = dict(resume_checkpoint.kv_pages_by_layer)
             step_tokens = list(resume_checkpoint.active_step_tokens)
             start_layer = resume_checkpoint.completed_layers_in_step
             step_kv = dict(resume_checkpoint.step_kv_pages_by_layer)
+            if not (0 <= start_layer <= self.arch.num_hidden_layers):
+                raise ModelOrbitError("Checkpoint completed_layers_in_step out of bounds.")
+            if not step_tokens:
+                raise ModelOrbitError("Checkpoint active_step_tokens cannot be empty.")
+            if start_layer > 0:
+                if (
+                    resume_checkpoint.hidden_manifest is None
+                    or resume_checkpoint.hidden_seq_len != len(step_tokens)
+                    or resume_checkpoint.hidden_dim != self.arch.hidden_size
+                    or set(step_kv.keys()) != set(range(start_layer))
+                ):
+                    raise ModelOrbitError(
+                        "Malformed mid-layer orbit checkpoint: missing hidden_manifest or partial layer KV pages."
+                    )
             hidden: list[list[float]] | None = (
                 self._load_hidden(resume_checkpoint.hidden_manifest, resume_checkpoint.hidden_seq_len)
                 if resume_checkpoint.hidden_manifest is not None
                 else None
             )
+            full_cur_tokens = (*prompt_tup, *generated)
+            if committed_kv:
+                committed_len = next(iter(committed_kv.values())).seq_len
+                if committed_len + len(step_tokens) != len(full_cur_tokens) and len(generated) < max_new_tokens:
+                    raise ModelOrbitError("Checkpoint KV prefix length + active_step_tokens disagrees with sequence length.")
+                self.kv_ground.register_prefix_pages(self.arch, full_cur_tokens[:committed_len], committed_kv)
+            if step_kv:
+                self.kv_ground.register_prefix_pages(self.arch, full_cur_tokens, step_kv)
         else:
             if not prompt_tokens:
                 raise ModelOrbitError("prompt_tokens must be non-empty.")

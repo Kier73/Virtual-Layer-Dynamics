@@ -73,7 +73,8 @@ pub unsafe extern "C" fn vld_bilinear_periodic_matvec_f64(
         let fi = i as f64;
         let mut acc = (alpha + beta * fi) * s0 + (gamma + delta * fi) * s1;
         if period > 0 {
-            let shift = (stride * i) % period;
+            let p128 = period as u128;
+            let shift = (((stride % period) as u128 * (i as u128)) % p128) as usize;
             for q in 0..period {
                 let idx = (q + period - shift) % period;
                 acc += orbit[idx] * folded[q];

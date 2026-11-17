@@ -243,10 +243,11 @@ class TaskCompiler:
             raise TaskCompileError("TaskCompiler.compile requires a TaskSpec.")
         self._insts: list[tuple[str, dict[str, Any]]] = []
         self._reg_counter = 0
-        for out in task.outputs:
-            reg = self._lower_expr(out.expression)
-            self._emit("STORE", src=reg, address=f"output.{out.label}")
-            self._emit("EMIT", src=reg, label=out.label)
+        # Evaluate all expressions (and any indeterminate branch guards) BEFORE committing STORE / EMIT side effects!
+        evaluated_outputs = [(out.label, self._lower_expr(out.expression)) for out in task.outputs]
+        for label, reg in evaluated_outputs:
+            self._emit("STORE", src=reg, address=f"output.{label}")
+            self._emit("EMIT", src=reg, label=label)
         self._emit("HALT")
         return Program(
             name=task.name,

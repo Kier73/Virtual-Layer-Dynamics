@@ -31,12 +31,14 @@ from vld.ground import (
     propose_modular_progression,
 )
 from vld.journal import HashChainedJournal, IdempotencyConflictError
-from vld.memory import InMemoryPageBacking, PagedObjectStore, StructuralMemoryRegistry, certify_sequence_law
+from vld.memory import DiskPageBacking, InMemoryPageBacking, PagedObjectStore, StructuralMemoryRegistry, certify_sequence_law
 from vld.models import (
     TransformerArchitectureSpec,
+    compile_multivariate_hinge_relu,
     compile_piecewise_affine_relu,
     route_moe_topk,
     verify_compiled_capsule,
+    verify_multivariate_capsule,
 )
 from vld.signal import verify_differential_backends, verify_signal8_ground
 from vld.triad import (
@@ -163,9 +165,11 @@ def run_self_verification() -> dict[str, Any]:
     _, late_rcpt = sm_reg.read("verify.mem", 100)
     sm_reg.inject_counterexample("verify.mem", 10, 0)
     assert sm_reg.verify_read_receipt(late_rcpt)[0] is False
-    checks["phase2_m1_and_structural_memory"] = 5
+    wrap_poly = certify_sequence_law([(t * t + 3 * t + 5) % 97 for t in range(12)], declared_modulus=97)
+    assert wrap_poly.family == "poly" and wrap_poly.evaluate(10_000) == (10_000 * 10_000 + 30_005) % 97
+    checks["phase2_m1_and_structural_memory"] = 6
 
-    # 7. Phases 6 & 7: MoE routing, SNC whole-domain ReLU compilation & Hypervisor-governed Model Agent
+    # 7. Phases 6 & 7: MoE routing, 1D + R^d SNC whole-domain ReLU compilation & Hypervisor-governed Model Agent
     moe_spec = TransformerArchitectureSpec.from_published_profile("qwen3-235b-a22b")
     moe_route = route_moe_topk(
         moe_spec,
@@ -183,6 +187,13 @@ def run_self_verification() -> dict[str, Any]:
         ]
     )
     assert verify_compiled_capsule(capsule)["status"] == "VERIFIED_WHOLE_DOMAIN"
+    mv_capsule = compile_multivariate_hinge_relu(
+        input_dim=2,
+        base_linear=[["1", "-1"]],
+        base_bias=["0"],
+        hinges=[{"normal": ["1", "1"], "offset": "-1", "weights": ["2"]}],
+    )
+    assert verify_multivariate_capsule(mv_capsule)["status"] == "VERIFIED_WHOLE_DOMAIN"
 
     hyp = ReceiverHypervisor()
     hyp.register_agent(create_default_exploration_grant("verify-agent", probe_budget=Fraction(10)))
@@ -194,7 +205,7 @@ def run_self_verification() -> dict[str, Any]:
         raise AssertionError("Expected HypervisorRefusalError")
     except HypervisorRefusalError:
         pass
-    checks["phases6_7_models_snc_and_agent_hypervisor"] = 6
+    checks["phases6_7_models_snc_and_agent_hypervisor"] = 7
 
     # 8. Pareto shortcut inequality & HashChainedJournal idempotency
     physical = NavigationCostVector(latency_ms=120.0, compute_ops=1_000_000.0, bytes_moved=65536.0, verification_ops=10.0)
@@ -282,6 +293,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     serve.add_argument("--host", type=str, default="127.0.0.1", help="Bind address (default: 127.0.0.1).")
     serve.add_argument("--port", type=int, default=8730, help="Bind port (default: 8730).")
     serve.add_argument("--node-id", type=str, default="vld.vantage.local", help="Logical receiver node ID.")
+    serve.add_argument("--journal", type=str, default="", help="Optional path for durable HashChainedJournal.")
+    serve.add_argument("--storage-dir", type=str, default="", help="Optional directory for durable M1 DiskPageBacking.")
 
     args = parser.parse_args(argv)
     if args.command == "info":
@@ -346,7 +359,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     if args.command == "serve":
-        node = VLDVantageNode(args.node_id)
+        srv_journal = HashChainedJournal(args.journal) if args.journal else None
+        srv_store = PagedObjectStore(DiskPageBacking(args.storage_dir)) if args.storage_dir else None
+        node = VLDVantageNode(args.node_id, store=srv_store, journal=srv_journal)
         server = VLDHttpVantageServer(node, host=args.host, port=args.port)
         print(json.dumps({"base_url": server.base_url, "node_id": node.node_id, "status": "LISTENING"}, sort_keys=True), flush=True)
         try:

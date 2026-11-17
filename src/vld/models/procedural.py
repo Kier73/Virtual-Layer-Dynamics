@@ -164,7 +164,17 @@ def compile_piecewise_affine_relu(
 
 def evaluate_compiled_capsule(capsule: Mapping[str, Any], x: int | float | Fraction | str) -> list[Fraction]:
     """Evaluate a compiled rational ReLU capsule at exact rational/numeric input `x`."""
-    qx = Fraction(x) if not isinstance(x, float) else Fraction(str(x))
+    if isinstance(x, bool):
+        raise ProceduralModelError("Boolean input rejected in evaluate_compiled_capsule.")
+    if isinstance(x, float):
+        if not math.isfinite(x):
+            raise ProceduralModelError("Non-finite float input rejected in evaluate_compiled_capsule.")
+        qx = Fraction(str(x))
+    else:
+        try:
+            qx = Fraction(x)
+        except (TypeError, ValueError, ZeroDivisionError) as exc:
+            raise ProceduralModelError(f"Invalid rational input {x!r}: {exc}") from exc
     net = capsule["network"]
     w1 = [[_parse_canonical_rational(v) for v in row] for row in net["hidden_weight"]]
     b1 = [_parse_canonical_rational(v) for v in net["hidden_bias"]]
@@ -180,7 +190,10 @@ def evaluate_compiled_capsule(capsule: Mapping[str, Any], x: int | float | Fract
 
 def verify_compiled_capsule(capsule: Mapping[str, Any] | str | bytes) -> dict[str, Any]:
     r"""Independently verify whole-domain symbolic equivalence of a serialized ReLU capsule without compiler internals."""
-    data = parse_strict_json(capsule) if isinstance(capsule, (str, bytes)) else dict(capsule)
+    try:
+        data = parse_strict_json(capsule) if isinstance(capsule, (str, bytes)) else dict(capsule)
+    except Exception as exc:
+        raise ProceduralModelError(f"Malformed capsule JSON: {exc}") from exc
     if not isinstance(data, Mapping) or data.get("schema") != "vld.snc-relu-capsule.v1":
         raise ProceduralModelError("Unsupported capsule schema.")
     supplied_digest = data.get("capsule_digest")
@@ -188,6 +201,8 @@ def verify_compiled_capsule(capsule: Mapping[str, Any] | str | bytes) -> dict[st
     if supplied_digest != domain_digest("vld.snc-relu-capsule.v1", body):
         raise ProceduralModelError("Capsule digest mismatch.")
 
+    if "source_atlas" not in data or "network" not in data or not isinstance(data["network"], Mapping):
+        raise ProceduralModelError("Capsule missing required 'source_atlas' or 'network' mapping.")
     atlas = data["source_atlas"]
     if data.get("source_atlas_digest") != domain_digest("vld.semantic-atlas.v1", atlas):
         raise ProceduralModelError("Source atlas digest mismatch.")
@@ -195,6 +210,9 @@ def verify_compiled_capsule(capsule: Mapping[str, Any] | str | bytes) -> dict[st
     net = data["network"]
     if net.get("hidden_activation") != "relu":
         raise ProceduralModelError("Only exact ReLU hidden activation is verifiable over Q.")
+    for req_key in ("hidden_weight", "hidden_bias", "output_weight", "output_bias"):
+        if req_key not in net or not isinstance(net[req_key], (list, tuple)):
+            raise ProceduralModelError(f"Capsule network missing list field {req_key!r}.")
     w1 = [[_parse_canonical_rational(v) for v in row] for row in net["hidden_weight"]]
     b1 = [_parse_canonical_rational(v) for v in net["hidden_bias"]]
     w2 = [[_parse_canonical_rational(v) for v in row] for row in net["output_weight"]]
@@ -267,6 +285,299 @@ def verify_compiled_capsule(capsule: Mapping[str, Any] | str | bytes) -> dict[st
         "capsule_digest": supplied_digest,
         "elementary_cells_checked": len(elementary_bounds),
         "reconstructed_regions": len(reconstructed_json),
+        "status": "VERIFIED_WHOLE_DOMAIN",
+    }
+
+
+def _find_strict_polyhedron_interior(
+    constraints: Sequence[tuple[tuple[Fraction, ...], Fraction]],
+    dim: int,
+) -> tuple[Fraction, ...] | None:
+    r"""Find an exact interior witness $x \in \mathbb{Q}^d$ satisfying $\langle a_q, x \rangle + \delta_q > 0$ via Fourier-Motzkin."""
+    if dim == 0:
+        return () if all(delta > 0 for _, delta in constraints) else None
+
+    zero_c: list[tuple[tuple[Fraction, ...], Fraction]] = []
+    lowers: list[tuple[tuple[Fraction, ...], Fraction]] = []
+    uppers: list[tuple[tuple[Fraction, ...], Fraction]] = []
+    seen_proj: set[tuple[tuple[Fraction, ...], Fraction]] = set()
+
+    def _add_proj(vec: tuple[Fraction, ...], d_val: Fraction) -> None:
+        # Scale by positive L_inf norm when non-zero to deduplicate positive scalar multiples!
+        scale = max((abs(c) for c in vec), default=Fraction(0))
+        key = (tuple(c / scale for c in vec), d_val / scale) if scale > 0 else (vec, Fraction(1 if d_val > 0 else (-1 if d_val < 0 else 0)))
+        if key not in seen_proj:
+            seen_proj.add(key)
+            zero_c.append((vec, d_val))
+
+    for a_vec, delta in constraints:
+        last = a_vec[dim - 1]
+        prefix = a_vec[: dim - 1]
+        if last == 0:
+            if all(c == 0 for c in prefix) and delta <= 0:
+                return None
+            _add_proj(prefix, delta)
+        elif last > 0:
+            lowers.append((tuple(-c / last for c in prefix), -delta / last))
+        else:
+            uppers.append((tuple(-c / last for c in prefix), -delta / last))
+
+    for l_vec, l_c in lowers:
+        for u_vec, u_c in uppers:
+            diff_vec = tuple(u_i - l_i for u_i, l_i in zip(u_vec, l_vec))
+            diff_c = u_c - l_c
+            if all(c == 0 for c in diff_vec) and diff_c <= 0:
+                return None
+            _add_proj(diff_vec, diff_c)
+
+    sub_x = _find_strict_polyhedron_interior(zero_c, dim - 1)
+    if sub_x is None:
+        return None
+
+    lb = max((sum((c * x_i for c, x_i in zip(l_vec, sub_x)), start=l_c) for l_vec, l_c in lowers), default=None)
+    ub = min((sum((c * x_i for c, x_i in zip(u_vec, sub_x)), start=u_c) for u_vec, u_c in uppers), default=None)
+    if lb is not None and ub is not None:
+        if not (lb < ub):
+            return None
+        coord = (lb + ub) / 2
+    elif lb is not None:
+        coord = lb + 1
+    elif ub is not None:
+        coord = ub - 1
+    else:
+        coord = Fraction(0)
+    return (*sub_x, coord)
+
+
+def compile_multivariate_hinge_relu(
+    *,
+    input_dim: int,
+    base_linear: Sequence[Sequence[str]],
+    base_bias: Sequence[str],
+    hinges: Sequence[Mapping[str, Any]] = (),
+    max_hinges: int = 24,
+) -> dict[str, Any]:
+    r"""Compile a multivariate polyhedral hinge specification $f: \mathbb{Q}^d \to \mathbb{Q}^m$ into an exact ReLU capsule."""
+    if isinstance(input_dim, bool) or not isinstance(input_dim, int) or not (1 <= input_dim <= 8):
+        raise ProceduralModelError("input_dim must be an integer in [1, 8].")
+    out_dim = len(base_bias)
+    if not (1 <= out_dim <= 16) or len(base_linear) != out_dim:
+        raise ProceduralModelError("base_linear / base_bias output dimensions must match and lie in [1, 16].")
+    if len(hinges) > max_hinges:
+        raise ProceduralModelError(f"hinges count exceeds max_hinges={max_hinges}.")
+
+    a_mat = [[_parse_canonical_rational(v) for v in row] for row in base_linear]
+    if any(len(row) != input_dim for row in a_mat):
+        raise ProceduralModelError("Each row of base_linear must have length input_dim.")
+    c_vec = [_parse_canonical_rational(v) for v in base_bias]
+
+    parsed_hinges: list[tuple[list[Fraction], Fraction, list[Fraction]]] = []
+    for h in hinges:
+        if not isinstance(h, Mapping) or set(h.keys()) != {"normal", "offset", "weights"}:
+            raise ProceduralModelError("Each hinge requires exact keys {'normal', 'offset', 'weights'}.")
+        n_vec = [_parse_canonical_rational(v) for v in h["normal"]]
+        if len(n_vec) != input_dim or all(v == 0 for v in n_vec):
+            raise ProceduralModelError("Hinge normal must be a non-zero vector of length input_dim.")
+        beta = _parse_canonical_rational(h["offset"])
+        gamma = [_parse_canonical_rational(v) for v in h["weights"]]
+        if len(gamma) != out_dim:
+            raise ProceduralModelError("Hinge weights length must match output dimension.")
+        parsed_hinges.append((n_vec, beta, gamma))
+
+    # Hidden units: [ReLU(x_0), ReLU(-x_0), ..., ReLU(x_{d-1}), ReLU(-x_{d-1}), ReLU(<n_1, x> + beta_1), ...]
+    w1: list[list[str]] = []
+    b1: list[str] = []
+    for i in range(input_dim):
+        pos_row = ["1" if j == i else "0" for j in range(input_dim)]
+        neg_row = ["-1" if j == i else "0" for j in range(input_dim)]
+        w1.extend([pos_row, neg_row])
+        b1.extend(["0", "0"])
+    for n_vec, beta, _ in parsed_hinges:
+        w1.append([_format_rational(v) for v in n_vec])
+        b1.append(_format_rational(beta))
+
+    w2: list[list[str]] = []
+    for out_i in range(out_dim):
+        row: list[str] = []
+        for in_j in range(input_dim):
+            a_ij = a_mat[out_i][in_j]
+            row.extend([_format_rational(a_ij), _format_rational(-a_ij)])
+        for _, _, gamma in parsed_hinges:
+            row.append(_format_rational(gamma[out_i]))
+        w2.append(row)
+    b2 = [_format_rational(v) for v in c_vec]
+
+    canonical_spec = {
+        "base_bias": [_format_rational(v) for v in c_vec],
+        "base_linear": [[_format_rational(v) for v in row] for row in a_mat],
+        "hinges": [
+            {
+                "normal": [_format_rational(v) for v in n_vec],
+                "offset": _format_rational(beta),
+                "weights": [_format_rational(v) for v in gamma],
+            }
+            for n_vec, beta, gamma in parsed_hinges
+        ],
+        "input_dim": input_dim,
+    }
+    body = {
+        "network": {
+            "hidden_activation": "relu",
+            "hidden_bias": b1,
+            "hidden_weight": w1,
+            "output_bias": b2,
+            "output_weight": w2,
+        },
+        "schema": "vld.snc-multivariate-relu-capsule.v1",
+        "source_spec": canonical_spec,
+        "source_spec_digest": domain_digest("vld.multivariate-hinge-spec.v1", canonical_spec),
+    }
+    capsule = {**body, "capsule_digest": domain_digest("vld.snc-multivariate-relu-capsule.v1", body)}
+    verify_multivariate_capsule(capsule)
+    return capsule
+
+
+def evaluate_multivariate_capsule(
+    capsule: Mapping[str, Any],
+    x: Sequence[int | float | Fraction | str],
+) -> list[Fraction]:
+    r"""Evaluate a compiled multivariate rational ReLU capsule at $x \in \mathbb{Q}^d$."""
+    qx: list[Fraction] = []
+    for val in x:
+        if isinstance(val, bool):
+            raise ProceduralModelError("Boolean coordinate rejected.")
+        if isinstance(val, float):
+            if not math.isfinite(val):
+                raise ProceduralModelError("Non-finite float coordinate rejected.")
+            qx.append(Fraction(str(val)))
+        else:
+            qx.append(Fraction(val))
+    net = capsule["network"]
+    w1 = [[_parse_canonical_rational(v) for v in row] for row in net["hidden_weight"]]
+    b1 = [_parse_canonical_rational(v) for v in net["hidden_bias"]]
+    w2 = [[_parse_canonical_rational(v) for v in row] for row in net["output_weight"]]
+    b2 = [_parse_canonical_rational(v) for v in net["output_bias"]]
+    if not w1 or len(qx) != len(w1[0]):
+        raise ProceduralModelError("Input vector length disagrees with multivariate capsule input_dim.")
+
+    hidden = [
+        max(Fraction(0), sum((w_ij * x_j for w_ij, x_j in zip(row, qx)), start=bias))
+        for row, bias in zip(w1, b1)
+    ]
+    return [
+        sum((w_ij * h_j for w_ij, h_j in zip(out_row, hidden)), start=out_bias)
+        for out_row, out_bias in zip(w2, b2)
+    ]
+
+
+def verify_multivariate_capsule(capsule: Mapping[str, Any] | str | bytes) -> dict[str, Any]:
+    r"""Independently verify whole-domain $\mathbb{R}^d$ equivalence across all polyhedral hyperplane chambers."""
+    try:
+        data = parse_strict_json(capsule) if isinstance(capsule, (str, bytes)) else dict(capsule)
+    except Exception as exc:
+        raise ProceduralModelError(f"Malformed multivariate capsule JSON: {exc}") from exc
+    if not isinstance(data, Mapping) or data.get("schema") != "vld.snc-multivariate-relu-capsule.v1":
+        raise ProceduralModelError("Unsupported multivariate capsule schema.")
+    supplied_digest = data.get("capsule_digest")
+    body = {k: v for k, v in data.items() if k != "capsule_digest"}
+    if supplied_digest != domain_digest("vld.snc-multivariate-relu-capsule.v1", body):
+        raise ProceduralModelError("Multivariate capsule digest mismatch.")
+    if "source_spec" not in data or "network" not in data or not isinstance(data["network"], Mapping):
+        raise ProceduralModelError("Capsule missing 'source_spec' or 'network'.")
+
+    spec = data["source_spec"]
+    if data.get("source_spec_digest") != domain_digest("vld.multivariate-hinge-spec.v1", spec):
+        raise ProceduralModelError("Source multivariate spec digest mismatch.")
+
+    d = int(spec["input_dim"])
+    a_spec = [[_parse_canonical_rational(v) for v in row] for row in spec["base_linear"]]
+    c_spec = [_parse_canonical_rational(v) for v in spec["base_bias"]]
+    hinges_spec = [
+        (
+            tuple(_parse_canonical_rational(v) for v in h["normal"]),
+            _parse_canonical_rational(h["offset"]),
+            tuple(_parse_canonical_rational(v) for v in h["weights"]),
+        )
+        for h in spec["hinges"]
+    ]
+    m_out = len(c_spec)
+
+    net = data["network"]
+    if net.get("hidden_activation") != "relu":
+        raise ProceduralModelError("Only exact ReLU hidden activation is verifiable over Q^d.")
+    w1 = [tuple(_parse_canonical_rational(v) for v in row) for row in net["hidden_weight"]]
+    b1 = [_parse_canonical_rational(v) for v in net["hidden_bias"]]
+    w2 = [[_parse_canonical_rational(v) for v in row] for row in net["output_weight"]]
+    b2 = [_parse_canonical_rational(v) for v in net["output_bias"]]
+    if len(w1) != len(b1) or any(len(row) != d for row in w1) or len(w2) != m_out or any(len(r) != len(w1) for r in w2):
+        raise ProceduralModelError("Invalid multivariate network dimensions.")
+
+    # Collect canonical unique arrangement hyperplanes from BOTH network hidden units and source hinges!
+    hyperplanes: list[tuple[tuple[Fraction, ...], Fraction]] = []
+    seen_hp: set[tuple[tuple[Fraction, ...], Fraction]] = set()
+    for n_vec, beta in [*(zip(w1, b1)), *((h[0], h[1]) for h in hinges_spec)]:
+        first_nz = next((v for v in n_vec if v != 0), Fraction(0))
+        if first_nz == 0:
+            continue
+        scale = abs(first_nz)
+        sgn = 1 if first_nz > 0 else -1
+        canon = (tuple((sgn * v) / scale for v in n_vec), (sgn * beta) / scale)
+        if canon not in seen_hp:
+            seen_hp.add(canon)
+            hyperplanes.append(canon)
+
+    # Enumerate every non-empty full-dimensional polyhedral chamber via incremental Fourier-Motzkin pruning
+    chambers: list[tuple[Fraction, ...]] = []
+
+    def _enumerate(idx: int, active_ineqs: list[tuple[tuple[Fraction, ...], Fraction]]) -> None:
+        witness = _find_strict_polyhedron_interior(active_ineqs, d)
+        if witness is None:
+            return
+        if idx == len(hyperplanes):
+            chambers.append(witness)
+            return
+        n_vec, beta = hyperplanes[idx]
+        neg_n = tuple(-v for v in n_vec)
+        _enumerate(idx + 1, [*active_ineqs, (n_vec, beta)])
+        _enumerate(idx + 1, [*active_ineqs, (neg_n, -beta)])
+
+    _enumerate(0, [])
+    if not chambers:
+        raise ProceduralModelError("Empty polyhedral domain arrangement.")
+
+    for witness in chambers:
+        # 1. Exact affine law induced by ReLU network on this chamber
+        net_jac = [[Fraction(0)] * d for _ in range(m_out)]
+        net_bias = list(b2)
+        for u_idx, (row, bi) in enumerate(zip(w1, b1)):
+            pre = sum((w_j * x_j for w_j, x_j in zip(row, witness)), start=bi)
+            if pre > 0:
+                for out_i in range(m_out):
+                    coeff = w2[out_i][u_idx]
+                    net_bias[out_i] += coeff * bi
+                    for col_j in range(d):
+                        net_jac[out_i][col_j] += coeff * row[col_j]
+
+        # 2. Exact affine law required by source specification on this chamber
+        exp_jac = [list(r) for r in a_spec]
+        exp_bias = list(c_spec)
+        for n_vec, beta, gamma in hinges_spec:
+            if sum((n_j * x_j for n_j, x_j in zip(n_vec, witness)), start=beta) > 0:
+                for out_i in range(m_out):
+                    exp_bias[out_i] += gamma[out_i] * beta
+                    for col_j in range(d):
+                        exp_jac[out_i][col_j] += gamma[out_i] * n_vec[col_j]
+
+        if net_jac != exp_jac or net_bias != exp_bias:
+            raise ProceduralModelError(
+                f"Multivariate ReLU network affine law disagrees with source_spec on chamber containing {witness}."
+            )
+
+    return {
+        "capsule_digest": supplied_digest,
+        "chambers_verified": len(chambers),
+        "hyperplanes": len(hyperplanes),
+        "input_dim": d,
         "status": "VERIFIED_WHOLE_DOMAIN",
     }
 
@@ -555,6 +866,53 @@ def permute_hidden_units(source: FeedForwardBlock, permutation: Sequence[int]) -
     return FeedForwardBlock(new_up_w, new_up_b, new_down_w, source.down_bias, activation=source.activation)
 
 
+def rescale_block_dyadic(
+    source: FeedForwardBlock,
+    exponents: Sequence[int],
+) -> tuple[FeedForwardBlock, dict[str, Any]]:
+    r"""Apply positive-homogeneous dyadic rescaling $W_{:,j} \mapsto 2^{e_j} W_{:,j},\; V_{j,:} \mapsto 2^{-e_j} V_{j,:}$ on ReLU blocks."""
+    if source.activation != "relu":
+        raise ProceduralModelError("Compensated positive rescaling symmetry requires positive-homogeneous 'relu' activation.")
+    in_d, hid_d, out_d = source.dims
+    exps = [int(e) for e in exponents]
+    if any(isinstance(e, bool) for e in exponents) or len(exps) != hid_d or any(abs(e) > 60 for e in exps):
+        raise ProceduralModelError("exponents must contain exact integers in [-60, 60] of length hidden_dim.")
+
+    scales_up = [math.ldexp(1.0, e) for e in exps]
+    scales_down = [math.ldexp(1.0, -e) for e in exps]
+
+    def _checked_scale(val: float, factor: float, inv_factor: float) -> float:
+        if val == 0.0:
+            return 0.0
+        cand = val * factor
+        if not math.isfinite(cand):
+            raise ProceduralModelError("Dyadic rescaling overflowed IEEE 754 binary32.")
+        rounded = _f32_round(cand)
+        if not math.isfinite(rounded) or abs(rounded) < _MIN_NORMAL_F32 or _f32_round(rounded * inv_factor) != val:
+            raise ProceduralModelError("Dyadic rescaling overflowed or underflowed into binary32 subnormal.")
+        return rounded
+
+    new_up_w = tuple(
+        tuple(_checked_scale(source.up_weight[i][j], scales_up[j], scales_down[j]) for j in range(hid_d))
+        for i in range(in_d)
+    )
+    new_up_b = tuple(_checked_scale(source.up_bias[j], scales_up[j], scales_down[j]) for j in range(hid_d))
+    new_down_w = tuple(
+        tuple(_checked_scale(source.down_weight[j][k], scales_down[j], scales_up[j]) for k in range(out_d))
+        for j in range(hid_d)
+    )
+    child = FeedForwardBlock(new_up_w, new_up_b, new_down_w, source.down_bias, activation="relu")
+    cert_body = {
+        "child_digest": child.digest,
+        "exponents": exps,
+        "morphism": "dyadic_positive_rescale",
+        "parent_digest": source.digest,
+        "schema": "vld.morphism-certificate.v1",
+    }
+    cert = {**cert_body, "certificate_digest": domain_digest("vld.morphism-certificate.v1", cert_body)}
+    return child, cert
+
+
 # ============================================================================
 # 4. Generative Weight Grounds (MWS-002: Structural-Memory & Delta Recipes)
 # ============================================================================
@@ -643,6 +1001,90 @@ class GenerativeWeightGround:
         )
 
     @staticmethod
+    def build_stored_recipe(
+        space: ModelParameterSpace,
+        tensor_name: str,
+        store: PagedObjectStore,
+        *,
+        source_snapshot_id: str,
+        snapshot: ModelWeightSnapshot,
+        chunk_size: int = 256,
+    ) -> TensorRecipe:
+        t = space.tensor(tensor_name)
+        if snapshot.space.identity != space.identity:
+            raise ProceduralModelError("Snapshot parameter space disagrees with space.")
+        if chunk_size <= 0 or (chunk_size & (chunk_size - 1)) != 0:
+            raise ProceduralModelError("chunk_size must be a power of two.")
+        m = snapshot.manifests[tensor_name]
+        whole = hashlib.sha256()
+        c_digests: list[str] = []
+        offset = 0
+        while offset < t.byte_size:
+            length = min(chunk_size, t.byte_size - offset)
+            raw = store.read_range(m, offset, length)
+            whole.update(raw)
+            c_digests.append(hashlib.sha256(raw).hexdigest())
+            offset += length
+        return TensorRecipe(
+            space_digest=space.identity,
+            tensor_name=tensor_name,
+            kind="stored",
+            target_digest=whole.hexdigest(),
+            byte_size=t.byte_size,
+            chunk_size=chunk_size,
+            chunk_digests=tuple(c_digests),
+            body={"source_snapshot": source_snapshot_id},
+        )
+
+    @staticmethod
+    def build_replacement_recipe(
+        space: ModelParameterSpace,
+        tensor_name: str,
+        store: PagedObjectStore,
+        *,
+        base_snapshot_id: str,
+        base_snapshot: ModelWeightSnapshot,
+        replacement_chunks: Mapping[int, bytes],
+        chunk_size: int = 256,
+    ) -> TensorRecipe:
+        """Synthesize a chunk-committed sparse delta recipe replacing selected chunks over `base_snapshot`."""
+        t = space.tensor(tensor_name)
+        if base_snapshot.space.identity != space.identity:
+            raise ProceduralModelError("Base snapshot parameter space disagrees with space.")
+        if chunk_size <= 0 or (chunk_size & (chunk_size - 1)) != 0:
+            raise ProceduralModelError("chunk_size must be a power of two.")
+        total_chunks = (t.byte_size + chunk_size - 1) // chunk_size
+        m = base_snapshot.manifests[tensor_name]
+        repl_hex: dict[str, str] = {}
+        for c_idx, raw_patch in sorted(replacement_chunks.items()):
+            if isinstance(c_idx, bool) or not isinstance(c_idx, int) or not (0 <= c_idx < total_chunks):
+                raise ProceduralModelError(f"Replacement chunk index {c_idx!r} out of bounds.")
+            exp_len = min(chunk_size, t.byte_size - c_idx * chunk_size)
+            if not isinstance(raw_patch, bytes) or len(raw_patch) != exp_len:
+                raise ProceduralModelError(f"Replacement chunk {c_idx} byte length mismatch.")
+            repl_hex[str(c_idx)] = raw_patch.hex()
+
+        whole = hashlib.sha256()
+        c_digests: list[str] = []
+        for c_idx in range(total_chunks):
+            offset = c_idx * chunk_size
+            length = min(chunk_size, t.byte_size - offset)
+            raw = replacement_chunks[c_idx] if c_idx in replacement_chunks else store.read_range(m, offset, length)
+            whole.update(raw)
+            c_digests.append(hashlib.sha256(raw).hexdigest())
+
+        return TensorRecipe(
+            space_digest=space.identity,
+            tensor_name=tensor_name,
+            kind="replacement",
+            target_digest=whole.hexdigest(),
+            byte_size=t.byte_size,
+            chunk_size=chunk_size,
+            chunk_digests=tuple(c_digests),
+            body={"base_snapshot": base_snapshot_id, "replacements_hex": repl_hex},
+        )
+
+    @staticmethod
     def read_verified_chunk(
         space: ModelParameterSpace,
         recipe: TensorRecipe,
@@ -685,6 +1127,16 @@ class GenerativeWeightGround:
                 raise ProceduralModelError("store and source_snapshots required for stored recipe.")
             snap = source_snapshots[str(b["source_snapshot"])]
             raw = store.read_range(snap.manifests[recipe.tensor_name], offset, length)
+        elif recipe.kind == "replacement":
+            repl_map = b.get("replacements_hex", {})
+            key = str(chunk_index)
+            if isinstance(repl_map, Mapping) and key in repl_map:
+                raw = bytes.fromhex(str(repl_map[key]))
+            else:
+                if store is None or source_snapshots is None:
+                    raise ProceduralModelError("store and source_snapshots required for unpatched replacement chunk.")
+                snap = source_snapshots[str(b["base_snapshot"])]
+                raw = store.read_range(snap.manifests[recipe.tensor_name], offset, length)
         else:
             raise ProceduralModelError(f"Unsupported recipe kind {recipe.kind!r}.")
 
@@ -703,11 +1155,15 @@ __all__ = [
     "ProceduralModelError",
     "TensorRecipe",
     "compile_fsm_to_neural",
+    "compile_multivariate_hinge_relu",
     "compile_piecewise_affine_relu",
     "evaluate_compiled_capsule",
+    "evaluate_multivariate_capsule",
     "insert_identity_depth",
     "permute_hidden_units",
+    "rescale_block_dyadic",
     "verify_compiled_capsule",
+    "verify_multivariate_capsule",
     "verify_widening_certificate",
     "widen_block_dyadic",
 ]

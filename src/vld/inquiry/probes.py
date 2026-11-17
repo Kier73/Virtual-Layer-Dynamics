@@ -404,7 +404,7 @@ def plan_probes_beam(
                 if gain <= 0:
                     continue
                 # Advance representative state using highest-weight scenario for tractable beam lookahead
-                lead_scenario = max(p.scenarios, key=lambda s: (s.weight, s.outcome.target))
+                lead_scenario = max(p.scenarios, key=lambda s: (s.weight, s.outcome.target, s.outcome.output))
                 nxt_sys = apply_counterfactual_probe(rep_sys, p, lead_scenario.outcome)
                 next_beam.append((neg_gain - gain, spent + p.cost, (*seq, p), nxt_sys, used | frozenset({cell})))
                 expanded_any = True

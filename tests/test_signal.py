@@ -13,8 +13,10 @@ from vld.signal import (
     AmbiguousBranchTrap,
     AmbiguousObservationError,
     AmbiguousTransitionError,
+    ConditionalExpr,
     ExactRationalBackend,
     GroundTransitionSystem,
+    IdentityGuard,
     InputExpr,
     Instruction,
     ModularRingBackend,
@@ -273,3 +275,73 @@ def test_multi_digit_base8_transition_compiler_and_partial_refusals() -> None:
         partial.step("q0", "ambig")
     with pytest.raises(UnknownTransitionError):
         partial.step("q1", "go")
+
+
+def test_whole_program_atomic_trap_footprint_write_guards_and_rational_metrics() -> None:
+    # 1. Multi-output TaskCompiler orders all guards before STORE/EMIT so trap leaves zero partial mutation
+    b8 = Signal8Backend()
+    interp = VirtualGroundInterpreter(backend=b8)
+    task = TaskSpec(
+        "atomic-multi-output",
+        ("x", "y"),
+        (
+            OutputSpec("first", InputExpr("x")),
+            OutputSpec(
+                "second",
+                ConditionalExpr(IdentityGuard(InputExpr("y"), 0.10), InputExpr("x"), InputExpr("y")),
+            ),
+        ),
+    )
+    compiled = TaskCompiler().compile(task)
+    fp_report = analyze_program_footprints(
+        compiled,
+        declared_memory_cells=("x", "y"),
+        declared_writable_cells=("output.first", "output.second"),
+        forbid_side_effects_before_trap=True,
+    )
+    assert fp_report.side_effect_before_trap_pcs == ()
+
+    machine = interp.instantiate(
+        compiled,
+        {"x": b8.encode_symbol(3, 1), "y": b8.encode_symbol(0, 1, phase_error_bound=0.25)},
+    )
+    with pytest.raises(AmbiguousBranchTrap):
+        machine.run()
+    assert set(machine.memory.keys()) == {"x", "y"}
+    assert machine.outputs == []
+    assert machine.trace == []
+
+    # 2. Hand-written program with STORE before reachable trap is rejected when forbid_side_effects_before_trap=True
+    impure_prog = Program(
+        "impure-before-trap",
+        (
+            Instruction("LOAD", {"dst": "r0", "address": "x"}),
+            Instruction("STORE", {"src": "r0", "address": "leaked"}),
+            Instruction("BRANCH_IDENTITY", {"src": "r0", "target": 3, "tolerance_rad": 0.10}),
+            Instruction("HALT"),
+        ),
+    )
+    with pytest.raises(StaticFootprintError, match="before a reachable indeterminate guard trap"):
+        analyze_program_footprints(impure_prog, forbid_side_effects_before_trap=True)
+
+    with pytest.raises(StaticFootprintError, match="writes undeclared memory cell"):
+        analyze_program_footprints(impure_prog, declared_writable_cells=("allowed",))
+
+    # 3. Even on impure hand-written IR, machine.run(atomic_on_trap=True) rolls back whole run on trap!
+    m_impure = interp.instantiate(impure_prog, {"x": b8.encode_symbol(0, 1, phase_error_bound=0.25)})
+    with pytest.raises(AmbiguousBranchTrap):
+        m_impure.run()
+    assert "leaked" not in m_impure.memory
+
+    # 4. ExactRationalBackend preserves true unbounded distance & positive GuardDecision.margin
+    rat = ExactRationalBackend()
+    dec = rat.compare_equal(rat.encode_rational(100, error_bound=50), rat.encode_rational(0), 1.0)
+    assert dec.distance == 100.0
+    assert dec.lower_bound == 50.0
+    assert dec.margin > 0.0
+
+    # Boolean observer / field smuggling in from_dict must be rejected
+    with pytest.raises(SignalDomainError):
+        b8.value_from_dict({"real": 1.0, "imag": 0.0, "observer": True, "phase_error_bound": 0.0})
+    with pytest.raises(SignalDomainError):
+        rat.value_from_dict({"val_num": 1, "val_den": 1, "observer": True})

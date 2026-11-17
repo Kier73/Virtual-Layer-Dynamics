@@ -156,11 +156,18 @@ class SignalPhasorValue:
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> SignalPhasorValue:
+        if "kind" in data and data["kind"] != "signal_phasor_z8":
+            raise SignalDomainError(f"Expected kind='signal_phasor_z8', got {data['kind']!r}.")
         try:
+            obs_raw = data["observer"]
+            real_raw, imag_raw = data["real"], data["imag"]
+            err_raw = data.get("phase_error_bound", 0.0)
+            if any(isinstance(v, bool) for v in (obs_raw, real_raw, imag_raw, err_raw)):
+                raise SignalDomainError("Boolean values are not valid SignalPhasorValue fields.")
             return cls(
-                phasor=complex(float(data["real"]), float(data["imag"])),
-                observer=int(data["observer"]),
-                phase_error_bound=float(data.get("phase_error_bound", 0.0)),
+                phasor=complex(float(real_raw), float(imag_raw)),
+                observer=int(obs_raw),
+                phase_error_bound=float(err_raw),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise SignalDomainError(f"Invalid serialized SignalPhasorValue: {exc}") from exc
@@ -375,6 +382,8 @@ class ModularResidueValue:
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> ModularResidueValue:
+        if "kind" in data and data["kind"] != "modular_residue":
+            raise SignalDomainError(f"Expected kind='modular_residue', got {data['kind']!r}.")
         try:
             return cls(
                 residue=data["residue"],
@@ -589,11 +598,18 @@ class RationalSignalValue:
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> RationalSignalValue:
+        if "kind" in data and data["kind"] != "rational_signal":
+            raise SignalDomainError(f"Expected kind='rational_signal', got {data['kind']!r}.")
         try:
+            vn, vd = data["val_num"], data["val_den"]
+            obs_raw = data["observer"]
+            en, ed = data.get("error_num", 0), data.get("error_den", 1)
+            if any(isinstance(v, bool) or not isinstance(v, int) for v in (vn, vd, obs_raw, en, ed)):
+                raise SignalDomainError("RationalSignalValue dictionary fields must be exact integers.")
             return cls(
-                scaled_value=Fraction(int(data["val_num"]), int(data["val_den"])),
-                observer=int(data["observer"]),
-                error_bound=Fraction(int(data.get("error_num", 0)), int(data.get("error_den", 1))),
+                scaled_value=Fraction(vn, vd),
+                observer=obs_raw,
+                error_bound=Fraction(en, ed),
             )
         except (KeyError, TypeError, ValueError, ZeroDivisionError) as exc:
             raise SignalDomainError(f"Invalid serialized RationalSignalValue: {exc}") from exc
@@ -690,9 +706,9 @@ class ExactRationalBackend:
         if isinstance(tolerance, bool) or not isinstance(tolerance, (int, float)):
             raise SignalDomainError("tolerance must be numeric.")
         tol_float = float(tolerance)
-        if not math.isfinite(tol_float) or not (0.0 <= tol_float <= math.pi):
-            raise SignalDomainError("tolerance must lie in [0, pi].")
-        tol_frac = Fraction(tol_float)
+        if not math.isfinite(tol_float) or tol_float < 0.0:
+            raise SignalDomainError("tolerance must be finite and non-negative.")
+        tol_frac = Fraction(tolerance) if isinstance(tolerance, int) else Fraction(tol_float)
         a, b = self._align(left, right)
         dist_frac = abs(a.scaled_value - b.scaled_value) / a.observer
         unc_frac = a.error_bound + b.error_bound
@@ -706,11 +722,11 @@ class ExactRationalBackend:
             disp = TruthDisposition.INDETERMINATE
         return GuardDecision(
             disposition=disp,
-            distance=min(math.pi, float(dist_frac)),
-            uncertainty=min(math.pi, float(unc_frac)),
+            distance=float(dist_frac),
+            uncertainty=float(unc_frac),
             tolerance=tol_float,
-            lower_bound=min(math.pi, float(lower_frac)),
-            upper_bound=min(math.pi, float(upper_frac)),
+            lower_bound=float(lower_frac),
+            upper_bound=float(upper_frac),
         )
 
     def compare_identity(self, value: RationalSignalValue, tolerance: float) -> GuardDecision:

@@ -299,20 +299,23 @@ class PagedObjectStore:
         _validate_page_size(self.backing.page_size)
         self.page_size = self.backing.page_size
         self.max_object_bytes = _strict_int(max_object_bytes, "max_object_bytes", minimum=1)
+        self._lock = threading.RLock()
         self._manifests: dict[str, PagedByteManifest] = {}
 
     def register_manifest(self, manifest: PagedByteManifest | Mapping[str, Any]) -> PagedByteManifest:
         m = manifest if isinstance(manifest, PagedByteManifest) else PagedByteManifest.from_dict(manifest)
         if m.page_size != self.page_size:
             raise PagedStoreError(f"Manifest page_size {m.page_size} != store page_size {self.page_size}.")
-        self._manifests[m.manifest_digest] = m
+        with self._lock:
+            self._manifests[m.manifest_digest] = m
         return m
 
     def get_manifest(self, manifest_digest: str) -> PagedByteManifest:
         digest = _strict_hex64(manifest_digest, "manifest_digest")
-        if digest not in self._manifests:
-            raise PagedStoreError(f"Manifest {digest} is not registered in this store.")
-        return self._manifests[digest]
+        with self._lock:
+            if digest not in self._manifests:
+                raise PagedStoreError(f"Manifest {digest} is not registered in this store.")
+            return self._manifests[digest]
 
     def put_bytes(
         self,
@@ -371,7 +374,8 @@ class PagedObjectStore:
             content_digest=hasher.hexdigest(),
             chunks=tuple(chunks),
         )
-        self._manifests[manifest.manifest_digest] = manifest
+        with self._lock:
+            self._manifests[manifest.manifest_digest] = manifest
         return manifest
 
     def read_range(

@@ -477,13 +477,21 @@ class SignalStateMachine(Generic[V]):
             self._restore_local_state(before)
             raise
 
-    def run(self, *, max_steps: int = 10_000) -> ExecutionResult[V]:
+    def run(self, *, max_steps: int = 10_000, atomic_on_trap: bool = True) -> ExecutionResult[V]:
         if isinstance(max_steps, bool) or not isinstance(max_steps, int) or max_steps < 1:
             raise ValueError("max_steps must be a positive integer.")
+        run_checkpoint = self._capture_local_state()
+        undo_depth = len(self._undo_stack)
         steps = 0
-        while not self.halted and steps < max_steps:
-            self.step()
-            steps += 1
+        try:
+            while not self.halted and steps < max_steps:
+                self.step()
+                steps += 1
+        except AmbiguousBranchTrap:
+            if atomic_on_trap:
+                self._restore_local_state(run_checkpoint)
+                del self._undo_stack[undo_depth:]
+            raise
         if not self.halted:
             raise StepLimitExceededError(f"Execution exceeded max_steps={max_steps} at pc={self.pc}.")
         return self.result()

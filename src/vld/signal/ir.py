@@ -237,6 +237,7 @@ class ProgramFootprintReport:
     emissions: frozenset[str]
     may_trap_pcs: tuple[int, ...]
     definite_registers_at_halt: frozenset[str]
+    side_effect_before_trap_pcs: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -310,7 +311,9 @@ def analyze_program_footprints(
     program: Program,
     *,
     declared_memory_cells: Iterable[str] | None = None,
+    declared_writable_cells: Iterable[str] | None = None,
     forbid_unreachable: bool = False,
+    forbid_side_effects_before_trap: bool = False,
 ) -> ProgramFootprintReport:
     """Statically verify control-flow safety, definite register initialization, and memory footprints."""
     n = len(program.instructions)
@@ -407,6 +410,9 @@ def analyze_program_footprints(
     may_trap_pcs: list[int] = []
     halt_regs: list[frozenset[str]] = []
 
+    allowed_writes: frozenset[str] | None = (
+        frozenset(declared_writable_cells) if declared_writable_cells is not None else None
+    )
     for pc in sorted(reachable):
         fp = program.instructions[pc].footprint
         missing_regs = fp.reg_reads - reg_in[pc]
@@ -420,6 +426,12 @@ def analyze_program_footprints(
                 raise StaticFootprintError(
                     f"Instruction {program.instructions[pc].opcode} at pc={pc} reads undeclared memory cell(s): {sorted(missing_mem)}"
                 )
+        if allowed_writes is not None:
+            unauthorized_writes = fp.mem_writes - allowed_writes
+            if unauthorized_writes:
+                raise StaticFootprintError(
+                    f"Instruction {program.instructions[pc].opcode} at pc={pc} writes undeclared memory cell(s): {sorted(unauthorized_writes)}"
+                )
         mem_reads_agg.update(fp.mem_reads)
         mem_writes_agg.update(fp.mem_writes)
         emissions_agg.update(fp.emissions)
@@ -427,6 +439,26 @@ def analyze_program_footprints(
             may_trap_pcs.append(pc)
         if program.instructions[pc].opcode == "HALT":
             halt_regs.append(reg_in[pc])
+
+    # Identify side-effecting PCs (`STORE` / `EMIT`) that can reach a subsequent indeterminate trap PC
+    # (`u ->+ t` with u in S, t in T, violating non-transactional side-effect isolation).
+    pre_trap: set[int] = set()
+    bwork = [p for t_pc in may_trap_pcs for p in preds[t_pc]]
+    while bwork:
+        cur = bwork.pop()
+        if cur in pre_trap:
+            continue
+        pre_trap.add(cur)
+        bwork.extend(preds[cur])
+    impure_before_trap = tuple(
+        pc
+        for pc in sorted(pre_trap)
+        if (program.instructions[pc].footprint.mem_writes or program.instructions[pc].footprint.emissions)
+    )
+    if forbid_side_effects_before_trap and impure_before_trap:
+        raise StaticFootprintError(
+            f"Program {program.name!r} performs memory write or emission at pc={impure_before_trap} before a reachable indeterminate guard trap."
+        )
 
     definite_halt = all_regs.intersection(*halt_regs) if halt_regs else frozenset()
     return ProgramFootprintReport(
@@ -437,6 +469,7 @@ def analyze_program_footprints(
         emissions=frozenset(emissions_agg),
         may_trap_pcs=tuple(may_trap_pcs),
         definite_registers_at_halt=definite_halt,
+        side_effect_before_trap_pcs=impure_before_trap,
     )
 
 

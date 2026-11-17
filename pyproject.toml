@@ -73,7 +73,7 @@ where = ["src"]
 include = ["vld*"]
 
 [tool.setuptools.package-data]
-vld = ["py.typed"]
+vld = ["py.typed", "accel/*.rs"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

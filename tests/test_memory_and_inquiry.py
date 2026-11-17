@@ -234,3 +234,62 @@ def test_active_perception_planners_and_surprise_hypothesis_revision() -> None:
     assert summary["executed_probes"][0]["surprise"] is True
     assert len(inquiry.ledger.revisions) == 2
     assert len(inquiry.ledger.events) >= 4
+
+
+def test_wrapping_modular_poly_fgraph_priority_and_forged_receipt_rejection() -> None:
+    # 1. Wrapping quadratic & cubic polynomials over Z/MZ (Newton Mahler basis)
+    mod_quad = [(t * t + 3 * t + 5) % 97 for t in range(14)]
+    law_quad = certify_sequence_law(mod_quad, declared_modulus=97)
+    assert law_quad.family == "poly" and law_quad.order == 2
+    assert law_quad.evaluate(123_456) == (123_456 * 123_456 + 3 * 123_456 + 5) % 97
+
+    mod_cubic = [(2 * (t**3) + t + 7) % 64 for t in range(12)]
+    law_cubic = certify_sequence_law(mod_cubic, declared_modulus=64)
+    assert law_cubic.family == "poly" and law_cubic.order == 3
+    assert law_cubic.evaluate(9_999) == (2 * (9_999**3) + 9_999 + 7) % 64
+
+    # 2. Bounded low-period `fgraph` wins over high-degree unbounded polynomial coincidence
+    # 5-cycle (0 -> 1 -> 7 -> 8 -> 4 -> 0) of length 10 has vanishing 8th differences (deg=7 poly on 10 pts),
+    # while fgraph complexity mu + lam = 5 <= 7!
+    cycle5 = [0, 1, 7, 8, 4, 0, 1, 7, 8, 4]
+    law_cycle = certify_sequence_law(cycle5, allow_unbounded_poly=True, max_poly_degree=7)
+    assert law_cycle.family == "fgraph"
+    assert law_cycle.evaluate(1003) == 8
+
+    # 3. Forged StructuralReadReceipt (tampered values, context_digest, or journal_event_digest) MUST fail!
+    from vld.memory.registry import StructuralReadReceipt
+
+    reg = StructuralMemoryRegistry()
+    reg.certify_and_admit("mem.strict", [1, 4, 7, 2, 5], domain="Z/8Z", declared_modulus=8)
+    vals, genuine = reg.read("mem.strict", 0)
+    assert reg.verify_read_receipt(genuine) == (True, "valid")
+
+    forged_vals = StructuralReadReceipt(
+        memory_id=genuine.memory_id,
+        revision=genuine.revision,
+        spec_digest=genuine.spec_digest,
+        certificate_digest=genuine.certificate_digest,
+        context_digest=genuine.context_digest,
+        coordinate_start=genuine.coordinate_start,
+        length=genuine.length,
+        values=(999_999,),
+        expanded_intermediate_states=0,
+        journal_event_digest=genuine.journal_event_digest,
+    )
+    ok_fv, reason_fv = reg.verify_read_receipt(forged_vals)
+    assert not ok_fv and "mismatch" in reason_fv
+
+    forged_journal = StructuralReadReceipt(
+        memory_id=genuine.memory_id,
+        revision=genuine.revision,
+        spec_digest=genuine.spec_digest,
+        certificate_digest=genuine.certificate_digest,
+        context_digest=genuine.context_digest,
+        coordinate_start=genuine.coordinate_start,
+        length=genuine.length,
+        values=genuine.values,
+        expanded_intermediate_states=0,
+        journal_event_digest="f" * 64,
+    )
+    ok_fj, reason_fj = reg.verify_read_receipt(forged_journal)
+    assert not ok_fj and reason_fj == "missing_journal_event"

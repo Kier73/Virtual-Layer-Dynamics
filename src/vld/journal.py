@@ -132,6 +132,7 @@ class HashChainedJournal:
         self._max_bytes = max_bytes
         self._lock_timeout_s = lock_timeout_s
         self._thread_lock = threading.RLock()
+        self._guard_depth = 0
         self._events: list[JournalReceipt] = []
         self._by_request_id: dict[str, JournalReceipt] = {}
         self._prefix_hasher = hashlib.sha256()
@@ -161,8 +162,12 @@ class HashChainedJournal:
     def _exclusive_guard(self) -> Iterator[None]:
         """Acquire intra-process reentrant lock plus cross-process OS lock on `<path>.lock`."""
         with self._thread_lock:
-            if self._path is None:
-                yield
+            if self._path is None or self._guard_depth > 0:
+                self._guard_depth += 1
+                try:
+                    yield
+                finally:
+                    self._guard_depth -= 1
                 return
 
             self._path.parent.mkdir(parents=True, exist_ok=True)
@@ -199,7 +204,11 @@ class HashChainedJournal:
                                 raise TimeoutError(f"Timed out acquiring journal lock {lock_path}") from exc
                             time.sleep(delay)
                             delay = min(0.01, delay * 1.5)
-                yield
+                self._guard_depth += 1
+                try:
+                    yield
+                finally:
+                    self._guard_depth -= 1
             finally:
                 if acquired:
                     try:
@@ -394,6 +403,13 @@ class HashChainedJournal:
             norm_result = parse_strict_json(canonical_json(raw_result))
             if not isinstance(norm_result, dict):
                 raise ValueError("result must serialize to a JSON object.")
+
+            if request_id in self._by_request_id:
+                raise IdempotencyConflictError(
+                    f"Reentrant operation already committed request_id {request_id!r}."
+                )
+            if len(self._events) >= self._max_events:
+                raise JournalIntegrityError(f"Journal capacity ({self._max_events} events) exhausted.")
 
             seq = len(self._events)
             prev = self.head_digest

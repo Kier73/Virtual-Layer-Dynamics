@@ -18,7 +18,10 @@ Changing the shape of computation:
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import math
+import statistics
+import struct
 import time
 from typing import Any, Sequence
 
@@ -26,6 +29,47 @@ from vld.accel.kernels import has_numpy
 from vld.accel.native import get_native_accelerator
 from vld.canonical import domain_digest
 from vld.ground import NavigationCostVector
+
+
+def _spectral_norm_f64(mat: tuple[tuple[float, ...], ...]) -> float:
+    r"""Compute exact $\ell_2$ operator norm $\|A\|_2 = \sqrt{\lambda_{\max}(A^\top A)}$ via symmetric Jacobi rotations."""
+    d = len(mat)
+    g = [
+        [math.fsum(float(mat[k][i]) * float(mat[k][j]) for k in range(d)) for j in range(d)]
+        for i in range(d)
+    ]
+    max_sweeps = max(16, 6 * d * d)
+    for _ in range(max_sweeps):
+        p, q = 0, 1
+        best = 0.0
+        for i in range(d):
+            for j in range(i + 1, d):
+                val = abs(g[i][j])
+                if val > best:
+                    best = val
+                    p, q = i, j
+        if best <= 1e-14:
+            break
+        diff = g[q][q] - g[p][p]
+        if abs(diff) <= 1e-30:
+            t = 1.0
+        else:
+            tau = diff / (2.0 * g[p][q])
+            t = math.copysign(1.0 / (abs(tau) + math.hypot(1.0, tau)), tau)
+        c = 1.0 / math.hypot(1.0, t)
+        s = t * c
+        g_pp, g_qq, g_pq = g[p][p], g[q][q], g[p][q]
+        g[p][p] = c * c * g_pp - 2.0 * s * c * g_pq + s * s * g_qq
+        g[q][q] = s * s * g_pp + 2.0 * s * c * g_pq + c * c * g_qq
+        g[p][q] = 0.0
+        g[q][p] = 0.0
+        for r in range(d):
+            if r != p and r != q:
+                grp, grq = g[r][p], g[r][q]
+                g[r][p] = g[p][r] = c * grp - s * grq
+                g[r][q] = g[q][r] = s * grp + c * grq
+    max_eig = max((g[i][i] for i in range(d)), default=0.0)
+    return math.sqrt(max(0.0, max_eig))
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,15 +93,19 @@ class StructuralLinearOperator:
             raise ValueError("rows and cols must be positive integers.")
         if self.orbit_stride < 0:
             raise ValueError("orbit_stride must be non-negative.")
-        for scalar in (self.alpha, self.beta, self.gamma, self.delta):
+        for scalar in (*((self.alpha, self.beta, self.gamma, self.delta)), *self.periodic_orbit):
             if not math.isfinite(float(scalar)):
-                raise ValueError("Bilinear law coefficients must be finite.")
+                raise ValueError("Bilinear and periodic law coefficients must be finite.")
         if self.low_rank_u or self.low_rank_v:
             if len(self.low_rank_u) != self.rows or len(self.low_rank_v) != self.cols:
                 raise ValueError("low_rank_u/v outer dimensions must match (rows, cols).")
             rank = len(self.low_rank_u[0])
             if any(len(r) != rank for r in self.low_rank_u) or any(len(c) != rank for c in self.low_rank_v):
                 raise ValueError("Inconsistent low-rank inner dimension R.")
+            if any(not math.isfinite(float(v)) for row in self.low_rank_u for v in row) or any(
+                not math.isfinite(float(v)) for row in self.low_rank_v for v in row
+            ):
+                raise ValueError("Low-rank factor entries must be finite.")
         seen: set[tuple[int, int]] = set()
         for r_idx, c_idx, val in self.sparse_entries:
             if not (0 <= r_idx < self.rows and 0 <= c_idx < self.cols):
@@ -102,6 +150,11 @@ class StructuralLinearOperator:
 
     @property
     def fingerprint(self) -> str:
+        u_flat = [float(v) for row in self.low_rank_u for v in row]
+        v_flat = [float(v) for row in self.low_rank_v for v in row]
+        u_sha = hashlib.sha256(struct.pack(f"<{len(u_flat)}d", *u_flat)).hexdigest()
+        v_sha = hashlib.sha256(struct.pack(f"<{len(v_flat)}d", *v_flat)).hexdigest()
+        sorted_sparse = [[r_i, c_i, float(dv)] for r_i, c_i, dv in sorted(self.sparse_entries)]
         return domain_digest(
             "vld.structural-linear-op.v1",
             {
@@ -110,16 +163,20 @@ class StructuralLinearOperator:
                 "cols": self.cols,
                 "delta": self.delta,
                 "gamma": self.gamma,
+                "low_rank_u_sha256": u_sha,
+                "low_rank_v_sha256": v_sha,
                 "orbit_stride": self.orbit_stride,
                 "periodic_orbit": list(self.periodic_orbit),
                 "rank": self.rank,
                 "rows": self.rows,
-                "sparse_count": len(self.sparse_entries),
+                "sparse_entries": sorted_sparse,
             },
         )
 
     def entry(self, i: int, j: int) -> float:
         """Evaluate single matrix entry $W_{i,j}$ on demand in $O(R)$ without dense storage."""
+        if not (0 <= i < self.rows and 0 <= j < self.cols):
+            raise ValueError(f"Coordinate {(i, j)} outside ({self.rows}, {self.cols}).")
         val = self.alpha + self.beta * i + self.gamma * j + self.delta * (i * j)
         if self.periodic_orbit:
             p = len(self.periodic_orbit)
@@ -156,6 +213,49 @@ class StructuralLinearOperator:
         """Evaluate $y = W x$ via Virtual Layer sufficient statistics without materializing $W$."""
         if len(x) != self.cols:
             raise ValueError(f"Input vector length {len(x)} != operator cols {self.cols}.")
+        if has_numpy():
+            import numpy as np
+
+            xa = np.asarray(x, dtype=np.float64)
+            if not bool(np.isfinite(xa).all()):
+                raise ValueError("Input vector contains non-finite values.")
+            native = get_native_accelerator() if allow_native else None
+            if native is not None and native.available:
+                out_arr = np.asarray(
+                    native.bilinear_periodic_matvec_f64(
+                        rows=self.rows,
+                        cols=self.cols,
+                        alpha=self.alpha,
+                        beta=self.beta,
+                        gamma=self.gamma,
+                        delta=self.delta,
+                        orbit=self.periodic_orbit,
+                        stride=self.orbit_stride,
+                        x=xa.tolist(),
+                    ),
+                    dtype=np.float64,
+                )
+            else:
+                p = len(self.periodic_orbit)
+                s0 = float(np.sum(xa))
+                jj = np.arange(self.cols, dtype=np.float64)
+                s1 = float(np.dot(jj, xa))
+                ii = np.arange(self.rows, dtype=np.float64)
+                out_arr = (self.alpha + self.beta * ii) * s0 + (self.gamma + self.delta * ii) * s1
+                if p > 0:
+                    folded = np.bincount(np.arange(self.cols) % p, weights=xa, minlength=p)
+                    shifts = (self.orbit_stride * np.arange(self.rows, dtype=np.int64)) % p
+                    orb_arr = np.asarray(self.periodic_orbit, dtype=np.float64)
+                    idx = (np.arange(p, dtype=np.int64)[None, :] - shifts[:, None]) % p
+                    out_arr = out_arr + (orb_arr[idx] @ folded)
+            if self.rank > 0:
+                u_arr = np.asarray(self.low_rank_u, dtype=np.float64)
+                v_arr = np.asarray(self.low_rank_v, dtype=np.float64)
+                out_arr = out_arr + (u_arr @ (v_arr.T @ xa))
+            for r_idx, c_idx, dv in self.sparse_entries:
+                out_arr[r_idx] += dv * xa[c_idx]
+            return [float(v) for v in out_arr.tolist()]
+
         xf = [float(v) for v in x]
         if any(not math.isfinite(v) for v in xf):
             raise ValueError("Input vector contains non-finite values.")
@@ -217,14 +317,18 @@ class LinearRecurrenceGround:
         d = len(self.transition_matrix)
         if d == 0 or len(self.bias) != d or any(len(row) != d for row in self.transition_matrix):
             raise ValueError("transition_matrix must be non-empty square (d x d) matching bias (d,).")
-        # Frobenius / row-sum stability check: refuse unbounded exponential blowup on floating-point pockets
-        max_row_l1 = max(sum(abs(float(v)) for v in row) for row in self.transition_matrix)
-        frob_sq = sum(float(v) * float(v) for row in self.transition_matrix for v in row)
-        if not math.isfinite(max_row_l1) or not math.isfinite(frob_sq):
+        if any(not math.isfinite(float(v)) for row in self.transition_matrix for v in row) or any(
+            not math.isfinite(float(b)) for b in self.bias
+        ):
             raise ValueError("Recurrence parameters must be finite.")
-        if max_row_l1 > 1.0 + 1e-9 and frob_sq > d + 1e-9:
+        # Sound induced operator-norm non-expansiveness gate: min(||A||_inf, ||A||_1, ||A||_2) <= 1 + 1e-9
+        norm_inf = max(math.fsum(abs(float(v)) for v in row) for row in self.transition_matrix)
+        norm_1 = max(math.fsum(abs(float(self.transition_matrix[i][j])) for i in range(d)) for j in range(d))
+        norm_2 = _spectral_norm_f64(self.transition_matrix)
+        if min(norm_inf, norm_1, norm_2) > 1.0 + 1e-9:
             raise ValueError(
-                "LinearRecurrenceGround refuses unstable floating-point matrix exponentiation (||A||_inf > 1 and ||A||_F^2 > d)."
+                "LinearRecurrenceGround refuses unstable floating-point matrix exponentiation "
+                f"(||A||_inf={norm_inf:.6g}, ||A||_1={norm_1:.6g}, ||A||_2={norm_2:.6g} all exceed 1)."
             )
 
     @property
@@ -233,8 +337,8 @@ class LinearRecurrenceGround:
 
     def step_sequential(self, h0: Sequence[float], steps: int) -> list[float]:
         r"""Traditional $\Theta(T d^2)$ step-by-step evaluation."""
-        if len(h0) != self.dim or steps < 0:
-            raise ValueError("Invalid h0 dimension or negative steps.")
+        if len(h0) != self.dim or steps < 0 or any(not math.isfinite(float(v)) for v in h0):
+            raise ValueError("Invalid/non-finite h0 or negative steps.")
         h = [float(v) for v in h0]
         a = self.transition_matrix
         b = self.bias
@@ -244,8 +348,8 @@ class LinearRecurrenceGround:
 
     def navigate_horizon(self, h0: Sequence[float], steps: int) -> tuple[list[float], int]:
         r"""Evaluate $h_T$ in $O(d^3 \log_2 T)$ homogeneous block-matrix multiplications."""
-        if len(h0) != self.dim or steps < 0:
-            raise ValueError("Invalid h0 dimension or negative steps.")
+        if len(h0) != self.dim or steps < 0 or any(not math.isfinite(float(v)) for v in h0):
+            raise ValueError("Invalid/non-finite h0 or negative steps.")
         m = self.dim + 1
 
         def mat_mul(p: list[list[float]], q: list[list[float]]) -> list[list[float]]:
@@ -300,34 +404,44 @@ def benchmark_virtual_vs_traditional(
     )
     x = [math.cos(0.05 * j) for j in range(cols)]
 
-    # 1. Virtual Layer contraction timing
-    t0 = time.perf_counter()
-    y_vld = op.contract(x)
-    vld_matvec_ms = (time.perf_counter() - t0) * 1000.0
+    def _eval_trad() -> list[float]:
+        if has_numpy():
+            import numpy as np
 
-    # 2. Traditional dense materialization + matvec (using numpy when available for strongest baseline!)
-    t1 = time.perf_counter()
-    if has_numpy():
-        import numpy as np
-
-        ii = np.arange(rows, dtype=np.float64)[:, None]
-        jj = np.arange(cols, dtype=np.float64)[None, :]
-        orb_arr = np.asarray(orbit, dtype=np.float64)
-        w_dense = (
-            op.alpha
-            + op.beta * ii
-            + op.gamma * jj
-            + op.delta * (ii * jj)
-            + orb_arr[(np.arange(cols)[None, :] - op.orbit_stride * np.arange(rows)[:, None]) % len(orbit)]
-            + (np.asarray(u, dtype=np.float64) @ np.asarray(v, dtype=np.float64).T)
-        )
-        for r_idx, c_idx, dv in op.sparse_entries:
-            w_dense[r_idx, c_idx] += dv
-        y_trad = (w_dense @ np.asarray(x, dtype=np.float64)).tolist()
-    else:
+            ii = np.arange(rows, dtype=np.float64)[:, None]
+            jj = np.arange(cols, dtype=np.float64)[None, :]
+            orb_arr = np.asarray(orbit, dtype=np.float64)
+            w_dense = (
+                op.alpha
+                + op.beta * ii
+                + op.gamma * jj
+                + op.delta * (ii * jj)
+                + orb_arr[(np.arange(cols)[None, :] - op.orbit_stride * np.arange(rows)[:, None]) % len(orbit)]
+                + (np.asarray(u, dtype=np.float64) @ np.asarray(v, dtype=np.float64).T)
+            )
+            for r_idx, c_idx, dv in op.sparse_entries:
+                w_dense[r_idx, c_idx] += dv
+            return (w_dense @ np.asarray(x, dtype=np.float64)).tolist()
         dense = op.materialize_dense()
-        y_trad = [math.fsum(r_val * x_val for r_val, x_val in zip(row, x)) for row in dense]
-    trad_matvec_ms = (time.perf_counter() - t1) * 1000.0
+        return [math.fsum(r_val * x_val for r_val, x_val in zip(row, x)) for row in dense]
+
+    # Warm up compiled DLL / allocator once before honest median-of-3 wall-clock measurement
+    _ = op.contract(x)
+    vld_samples_ms: list[float] = []
+    y_vld: list[float] = []
+    for _ in range(3):
+        t0 = time.perf_counter()
+        y_vld = op.contract(x)
+        vld_samples_ms.append((time.perf_counter() - t0) * 1000.0)
+    vld_matvec_ms = statistics.median(vld_samples_ms)
+
+    trad_samples_ms: list[float] = []
+    y_trad: list[float] = []
+    for _ in range(3):
+        t1 = time.perf_counter()
+        y_trad = _eval_trad()
+        trad_samples_ms.append((time.perf_counter() - t1) * 1000.0)
+    trad_matvec_ms = statistics.median(trad_samples_ms)
 
     matvec_max_err = max(abs(a - b) for a, b in zip(y_vld, y_trad))
     assert matvec_max_err < 1e-8, f"Contraction error too large: {matvec_max_err}"
@@ -339,7 +453,7 @@ def benchmark_virtual_vs_traditional(
         verification_ops=float(rows),
     )
     cost_trad_matvec = NavigationCostVector(
-        latency_ms=max(trad_matvec_ms, vld_matvec_ms + 1e-6) if op.structural_flops < op.dense_flops else trad_matvec_ms,
+        latency_ms=trad_matvec_ms,
         compute_ops=float(op.dense_flops),
         bytes_moved=float(op.dense_bytes_f64 + cols * 8 + rows * 8),
         verification_ops=float(rows),

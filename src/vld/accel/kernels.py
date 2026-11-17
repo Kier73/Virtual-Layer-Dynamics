@@ -58,7 +58,10 @@ def encode_bf16_le(values: Sequence[float]) -> bytes:
     u16s: list[int] = []
     for bits in u32s:
         rounding_bias = 0x7FFF + ((bits >> 16) & 1)
-        u16s.append(((bits + rounding_bias) >> 16) & 0xFFFF)
+        top16 = ((bits + rounding_bias) >> 16) & 0xFFFF
+        if (top16 & 0x7F80) == 0x7F80:
+            raise ValueError("Finite float value overflows bfloat16 finite dynamic range.")
+        u16s.append(top16)
     return struct.pack(f"<{n}H", *u16s)
 
 

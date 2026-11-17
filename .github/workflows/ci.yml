@@ -38,6 +38,9 @@ jobs:
       - name: Run unit and invariant test suite
         run: python -m pytest -v
 
+      - name: Verify pure-stdlib execution without Rust CDLL
+        run: python -c "import shutil, sys, pytest; shutil.which = lambda _: None; raise SystemExit(pytest.main(['-q']))"
+
       - name: Run CLI mathematical self-verification and Pareto benchmark
         run: |
           python -m vld verify
