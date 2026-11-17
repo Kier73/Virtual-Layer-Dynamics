@@ -25,6 +25,10 @@ def test_kleene_k3_truth_tables() -> None:
     assert (F | I) is I
     assert (I & I) is I
     assert (I | I) is I
+    with pytest.raises(TypeError):
+        _ = T & True  # type: ignore[operator]
+    with pytest.raises(TypeError):
+        _ = F | "false"  # type: ignore[operator]
 
 
 def test_interval_guard_boundaries_and_validation() -> None:
@@ -119,3 +123,38 @@ def test_analyze_finite_ground_input_validation() -> None:
         analyze_finite_ground(("s0",), (), {}, {"s0": "o"})
     with pytest.raises(ValueError, match="Observer projection missing"):
         analyze_finite_ground(("s0",), ("a",), {}, {})
+    with pytest.raises(ValueError, match="real number"):
+        evaluate_interval_guard(True, 0.0, 0.1)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="at least one reachable target"):
+        analyze_finite_ground(("s0",), ("a",), {}, {"s0": "o"}, external_couplings=(("s0", "a"),))
+
+
+def test_myhill_nerode_forward_invariance_under_backward_contraction_and_relational_preimage() -> None:
+    # Regression 1: backward preimage asymmetry (contracting vs preserving) MUST NOT split
+    # forward-indistinguishable states under Moore / Myhill-Nerode equivalence ~_P.
+    # Both u0 (colliding with u0_twin at u1) and v0 (injective into v1) emit "0", "0", "1", "1", ... forever!
+    states = ("u0", "u0_twin", "u1", "v0", "v1", "sink")
+    actions = ("step",)
+    transitions = {
+        ("u0", "step"): ("u1",),
+        ("u0_twin", "step"): ("u1",),
+        ("u1", "step"): ("sink",),
+        ("v0", "step"): ("v1",),
+        ("v1", "step"): ("sink",),
+        ("sink", "step"): ("sink",),
+    }
+    observer = {"u0": "0", "u0_twin": "0", "u1": "0", "v0": "0", "v1": "0", "sink": "1"}
+    report = analyze_finite_ground(states, actions, transitions, observer)
+    assert report.cell_classes[("u0", "step")] is TransitionClass.PREDICTABLE_CONTRACTING
+    assert report.cell_classes[("v0", "step")] is TransitionClass.PREDICTABLE_PRESERVING
+    # Exact 3 forward equivalence classes: distance-2 to sink {u0, u0_twin, v0}, distance-1 {u1, v1}, and {sink}
+    assert report.quotient_classes == (("sink",), ("u0", "u0_twin", "v0"), ("u1", "v1"))
+
+    # Regression 2: full relational preimage counts collisions from ambiguous/external cells too.
+    mixed = analyze_finite_ground(
+        states=("s0", "s1"),
+        actions=("a",),
+        transitions={("s0", "a"): ("s0",), ("s1", "a"): ("s0", "s1")},
+        observer={"s0": "0", "s1": "1"},
+    )
+    assert mixed.cell_classes[("s0", "a")] is TransitionClass.PREDICTABLE_CONTRACTING

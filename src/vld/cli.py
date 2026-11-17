@@ -8,6 +8,7 @@ import math
 import sys
 from typing import Any, Sequence
 
+from vld import __version__ as PACKAGE_VERSION
 from vld.canonical import canonical_bytes, canonical_json, domain_digest, parse_strict_json
 from vld.ground import (
     AffineOrbitLaw,
@@ -30,8 +31,6 @@ from vld.triad import (
     evaluate_interval_guard,
     require_determinate_branch,
 )
-
-PACKAGE_VERSION = "0.1.0"
 
 
 def run_self_verification() -> dict[str, Any]:
@@ -106,10 +105,19 @@ def run_self_verification() -> dict[str, Any]:
     except UnderdeterminedGroundError:
         pass
 
+    zero_dof_wrap = [7, 42, 19]
+    prop_zero_dof = propose_modular_progression(zero_dof_wrap)
+    assert prop_zero_dof.status is EpistemicStatus.HYPOTHESIS and prop_zero_dof.law is None
+    try:
+        certify_modular_progression(zero_dof_wrap)
+        raise AssertionError("Zero-dof 3-sample trace must not certify modulus")
+    except UnderdeterminedGroundError:
+        pass
+
     wrapped = [90, 95, 3, 8, 13]
     certified_law = certify_modular_progression(wrapped)
     assert certified_law.modulus == 97 and certified_law.increment == 5
-    checks["affine_navigation_and_identifiability"] = 6
+    checks["affine_navigation_and_identifiability"] = 8
 
     # 5. Finite Ground capacity, Myhill-Nerode quotient, and erasure bits
     states = ("s0", "s1", "s2", "s3")
@@ -132,7 +140,16 @@ def run_self_verification() -> dict[str, Any]:
     assert math.isclose(report.action_summaries["collapse"].erasure_bits, 1.0)
     assert report.cell_classes[("s0", "permute")] is TransitionClass.PREDICTABLE_PRESERVING
     assert report.cell_classes[("s0", "collapse")] is TransitionClass.PREDICTABLE_CONTRACTING
-    checks["finite_ground_triad_and_quotient"] = 5
+
+    # Forward Myhill-Nerode invariance under asymmetric backward preimages
+    asym = analyze_finite_ground(
+        ("s0", "s1", "s2"),
+        ("a",),
+        {("s0", "a"): ("s2",), ("s1", "a"): ("s2",), ("s2", "a"): ("s0",)},
+        {"s0": "obs", "s1": "obs", "s2": "obs"},
+    )
+    assert asym.quotient_class_count == 1
+    checks["finite_ground_triad_and_quotient"] = 6
 
     # 6. Pareto shortcut inequality & HashChainedJournal idempotency
     physical = NavigationCostVector(latency_ms=120.0, compute_ops=1_000_000.0, bytes_moved=65536.0, verification_ops=10.0)
@@ -230,7 +247,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "navigate":
         law = AffineOrbitLaw(multiplier=1664525, increment=1013904223, modulus=2**32)
-        receipt = law.navigate(args.seed, args.coordinate)
+        try:
+            receipt = law.navigate(args.seed, args.coordinate)
+        except ValueError as exc:
+            parser.error(str(exc))
         print(
             json.dumps(
                 {

@@ -63,8 +63,8 @@ For each state-action pair $(s, a) \in \Sigma_{\mathcal{G}} \times A_{\mathcal{G
 
 | Class | Defining Condition | Information Dynamics & Operational Role |
 |---|---|---|
-| `PREDICTABLE_PRESERVING` | $|T(s, a)| = 1$ and $|\delta_a^{-1}(\delta_a(s))| = 1$ | Bijective / invertible step; zero collision erasure ($H_{\text{erasure}} = 0$). Supports group/orbit shortcuts and exact undo. |
-| `PREDICTABLE_CONTRACTING` | $|T(s, a)| = 1$ and $|\delta_a^{-1}(\delta_a(s))| > 1$ | Deterministic many-to-one map; removes historical state bits: $H_{\text{erasure}}(a) = \sum_{s'} \frac{|\delta_a^{-1}(s')|}{|\Sigma|} \log_2 |\delta_a^{-1}(s')| > 0$. Justifies sufficient-state collapse and smaller checkpoints. |
+| `PREDICTABLE_PRESERVING` | $|T(s, a)| = 1$ (un-coupled) and $|\Delta_a^{-1}(s')| = 1$ | Locally invertible step; zero collision erasure ($H_{\text{erasure}} = 0$ when total). Supports group/orbit shortcuts and exact undo. |
+| `PREDICTABLE_CONTRACTING` | $|T(s, a)| = 1$ (un-coupled) and $|\Delta_a^{-1}(s')| > 1$ | Deterministic many-to-one map; removes historical state bits: $H_{\text{erasure}}(a) = \sum_{s'} \frac{|\delta_a^{-1}(s')|}{|\Sigma|} \log_2 |\delta_a^{-1}(s')| > 0$. Justifies sufficient-state collapse and smaller checkpoints. |
 | `INFORMATION_PRODUCING` | $(s, a) \in \mathcal{K}_{\text{ext}}$, $I(S'; \text{Env} \mid s, a) > 0$ | Active sensor, user, or network encounter introducing external entropy; requires observation receipts and active inquiry policies. |
 | `AMBIGUOUS` | $|T(s, a)| > 1$, $(s, a) \notin \mathcal{K}_{\text{ext}}$ | Competing uncalibrated hypotheses; lowering to deterministic code is refused. |
 | `UNKNOWN` | $|T(s, a)| = 0$ | Unwitnessed cell; triggers refusal or exploratory probing rather than extrapolation. |
@@ -118,8 +118,8 @@ Fitting a formula to finite observations does **not** automatically identify a G
 $$\forall m > \max_{0 \le t < k} x_t,\quad x_{t+1} \equiv x_t + \delta \pmod m$$
 
 Because infinitely many moduli (plus unbounded $\mathbb{Z}$) generate identical prefixes, `propose_modular_progression` classifies unwrapped traces as `EpistemicStatus.HYPOTHESIS` and `certify_modular_progression` refuses certification unless either:
-1. A modular wrap jump $x_{t^* + 1} - x_{t^*} = \delta - m < 0$ is directly witnessed in the trace (uniquely pinning $m = \delta - (x_{t^* + 1} - x_{t^*})$), or
-2. The domain modulus $m$ is explicitly declared by an upstream Ground contract.
+1. Both a positive unwrapped step $\delta > 0$ and a modular wrap jump $x_{t^* + 1} - x_{t^*} = \delta - m < 0$ are directly witnessed across $N \ge 4$ samples (providing $df = (N - 1) - 2 = N - 3 \ge 1$ predictive degree of freedom beyond fitting $(\delta, m)$, preventing 3-sample overfitting), or
+2. The domain modulus $m$ is explicitly declared by an upstream Ground contract ($df = (N - 1) - 1 = N - 2 \ge 1$ for $N \ge 3$).
 
 ---
 
@@ -128,7 +128,7 @@ Because infinitely many moduli (plus unbounded $\mathbb{Z}$) generate identical 
 ### Path Composition
 A logical **host** is any identifiable locus $h = (I_h, C_h, S_h, T_h, K_h, L_h)$ possessing a declared observation or transition relation $T_h$ and local capability policy $K_h$. Over an admissible path $\pi = (h_0, h_1, \dots, h_m)$ with matching boundary contracts, the composite operation is:
 
-$$F_\pi = T_{h_m} \circ T_{h_{h-1}} \circ \dots \circ T_{h_0}$$
+$$F_\pi = T_{h_m} \circ T_{h_{m-1}} \circ \dots \circ T_{h_0}$$
 
 Authority remains strictly receiver-local: routing reachability never grants execution permission, and transport acknowledgement never implies semantic state commit.
 

@@ -58,3 +58,28 @@ def test_parse_strict_json_rejects_duplicates_and_nan_constants() -> None:
         parse_strict_json('{"a": Infinity}')
     with pytest.raises(CanonicalizationError, match="Invalid JSON"):
         parse_strict_json("{unclosed")
+
+
+def test_surrogates_and_custom_str_key_collisions_rejected() -> None:
+    # Lone UTF-16 surrogates must be rejected consistently across canonical_json, canonical_bytes, and parse_strict_json
+    for fn in (canonical_json, canonical_bytes):
+        with pytest.raises(CanonicalizationError, match="surrogate"):
+            fn("\ud800")
+        with pytest.raises(CanonicalizationError, match="surrogate"):
+            fn({"\ud800": 1})
+    with pytest.raises(CanonicalizationError, match="surrogate"):
+        domain_digest("bad\ud800domain", {"k": 1})
+    with pytest.raises(CanonicalizationError, match="surrogate"):
+        parse_strict_json('"\\ud800"')
+
+    # str subclasses with custom hash/eq must not emit duplicate keys in canonical_json
+    class DistinctIdStr(str):
+        def __hash__(self) -> int:
+            return id(self)
+
+        def __eq__(self, other: object) -> bool:
+            return self is other
+
+    colliding = {DistinctIdStr("k"): 1, "k": 2}
+    with pytest.raises(CanonicalizationError, match="Duplicate canonical object key"):
+        canonical_json(colliding)

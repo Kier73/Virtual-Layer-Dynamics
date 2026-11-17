@@ -31,6 +31,11 @@ def test_cli_info_verify_and_navigate(capsys: pytest.CaptureFixture[str]) -> Non
     assert nav_out["coordinate"] == 1000000000000
     assert 0 <= nav_out["value"] < 2**32
 
+    with pytest.raises(SystemExit) as exc_info:
+        main(["navigate", "--seed", "-1", "--coordinate", "10"])
+    assert exc_info.value.code == 2
+    capsys.readouterr()
+
 
 def test_zero_syntax_warnings_in_all_python_sources() -> None:
     py_files = list((REPO_ROOT / "src").rglob("*.py")) + list((REPO_ROOT / "tests").rglob("*.py"))

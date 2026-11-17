@@ -12,10 +12,11 @@ and an observer projection $P: \Sigma \to Y$:
      - $L \le \tau < U \implies \text{INDETERMINATE}$ (atomic trap; never guess a branch).
 
 2. **Predictability & Information Triad over $(\Sigma, A, \Delta, P)$:**
-   - `PREDICTABLE_PRESERVING`: $|\Delta(s, a)| = 1$ and action map $\delta_a$ is injective on $\Sigma$
-     ($H_{\text{erasure}}(a) = 0$ bits; invertible / group-like orbit).
-   - `PREDICTABLE_CONTRACTING`: $|\Delta(s, a)| = 1$ and $|\delta_a^{-1}(\delta_a(s))| > 1$
-     (deterministic many-to-one step that removes historical distinctions, enabling compact
+   - `PREDICTABLE_PRESERVING`: $|\Delta(s, a)| = 1$ (un-coupled) and $|\Delta_a^{-1}(s')| = 1$
+     for $s' \in \Delta(s, a)$ (locally invertible step; when true across $\Sigma$, $\delta_a$ is
+     bijective with $H_{\text{erasure}}(a) = 0$ bits).
+   - `PREDICTABLE_CONTRACTING`: $|\Delta(s, a)| = 1$ (un-coupled) and $|\Delta_a^{-1}(s')| > 1$
+     (deterministic many-to-one step that merges predecessor trajectories at $s'$, enabling compact
      sufficient-state checkpoints; step collision erasure under uniform prior is
      $H_{\text{erasure}}(a) = \sum_{s' \in \operatorname{im}(\delta_a)} \frac{|\delta_a^{-1}(s')|}{|\Sigma|} \log_2 |\delta_a^{-1}(s')|$ bits).
    - `INFORMATION_PRODUCING`: environment/sensor-coupled transition declared in `external_couplings`
@@ -50,14 +51,18 @@ class TruthDisposition(str, Enum):
             return TruthDisposition.TRUE
         return TruthDisposition.INDETERMINATE
 
-    def __and__(self, other: TruthDisposition) -> TruthDisposition:
+    def __and__(self, other: object) -> TruthDisposition:
+        if not isinstance(other, TruthDisposition):
+            return NotImplemented
         if self is TruthDisposition.FALSE or other is TruthDisposition.FALSE:
             return TruthDisposition.FALSE
         if self is TruthDisposition.TRUE and other is TruthDisposition.TRUE:
             return TruthDisposition.TRUE
         return TruthDisposition.INDETERMINATE
 
-    def __or__(self, other: TruthDisposition) -> TruthDisposition:
+    def __or__(self, other: object) -> TruthDisposition:
+        if not isinstance(other, TruthDisposition):
+            return NotImplemented
         if self is TruthDisposition.TRUE or other is TruthDisposition.TRUE:
             return TruthDisposition.TRUE
         if self is TruthDisposition.FALSE and other is TruthDisposition.FALSE:
@@ -92,6 +97,9 @@ class TransitionClass(str, Enum):
 
 def evaluate_interval_guard(distance: float, error_bound: float, tolerance: float) -> TruthDisposition:
     r"""Evaluate conservative interval equality guard $d \pm e \le \tau$ on $[0, \pi]$."""
+    for name, val in (("distance", distance), ("error_bound", error_bound), ("tolerance", tolerance)):
+        if isinstance(val, bool) or not isinstance(val, (int, float)):
+            raise ValueError(f"{name} must be a real number, got {type(val).__name__}.")
     if not (math.isfinite(distance) and math.isfinite(error_bound) and math.isfinite(tolerance)):
         raise ValueError("Guard parameters must be finite.")
     if distance < 0.0 or error_bound < 0.0 or tolerance < 0.0:
@@ -216,6 +224,10 @@ def analyze_finite_ground(
         for a in action_tuple:
             normalized.setdefault((s, a), ())
 
+    for s, a in sorted(coupled_set):
+        if len(normalized[(s, a)]) == 0:
+            raise ValueError(f"External coupling {(s, a)!r} must declare at least one reachable target state.")
+
     # 1. Reachable state capacity via BFS from initial_states (defaults to all states if unspecified).
     seeds = tuple(sorted(set(initial_states))) if initial_states is not None else state_tuple
     if not seeds:
@@ -240,7 +252,8 @@ def analyze_finite_ground(
     n_states = len(state_tuple)
 
     for a in action_tuple:
-        preimages: dict[str, list[str]] = {}
+        det_preimages: dict[str, list[str]] = {}
+        full_preimages: dict[str, set[str]] = {}
         unknown_cnt = 0
         ambiguous_cnt = 0
         producing_cnt = 0
@@ -248,7 +261,10 @@ def analyze_finite_ground(
 
         for s in state_tuple:
             targets = normalized[(s, a)]
-            if (s, a) in coupled_set and len(targets) >= 1:
+            for t in targets:
+                full_preimages.setdefault(t, set()).add(s)
+
+            if (s, a) in coupled_set:
                 cell_classes[(s, a)] = TransitionClass.INFORMATION_PRODUCING
                 producing_cnt += 1
             elif len(targets) == 0:
@@ -259,13 +275,13 @@ def analyze_finite_ground(
                 ambiguous_cnt += 1
             else:
                 det_count += 1
-                preimages.setdefault(targets[0], []).append(s)
+                det_preimages.setdefault(targets[0], []).append(s)
 
-        # Refine deterministic cells into preserving (|preimage| == 1) vs contracting (|preimage| > 1).
-        for target, sources in preimages.items():
+        # Refine deterministic cells into preserving (|full_preimage| == 1) vs contracting (|full_preimage| > 1).
+        for target, sources in det_preimages.items():
             cls = (
                 TransitionClass.PREDICTABLE_PRESERVING
-                if len(sources) == 1
+                if len(full_preimages[target]) == 1
                 else TransitionClass.PREDICTABLE_CONTRACTING
             )
             for src in sources:
@@ -276,7 +292,7 @@ def analyze_finite_ground(
         if is_total_det:
             # H(S | delta_a(S)) under uniform prior over Sigma:
             # sum_{s'} (|preimage(s')| / |Sigma|) * log2(|preimage(s')|)
-            for sources in preimages.values():
+            for sources in det_preimages.values():
                 k = len(sources)
                 if k > 1:
                     erasure_bits += (k / n_states) * math.log2(k)
@@ -284,15 +300,17 @@ def analyze_finite_ground(
         action_summaries[a] = ActionInformationSummary(
             action=a,
             is_total_deterministic=is_total_det,
-            image_cardinality=len(preimages),
+            image_cardinality=len(det_preimages),
             erasure_bits=erasure_bits,
             unknown_cells=unknown_cnt,
             ambiguous_cells=ambiguous_cnt,
             information_producing_cells=producing_cnt,
         )
 
-    # 3. Moore / Myhill-Nerode partition refinement for predictive equivalence ~_P.
+    # 3. Moore / Myhill-Nerode partition refinement for forward predictive equivalence ~_P.
     # Initial partition groups states solely by immediate observation P(s).
+    # Forward signatures depend ONLY on forward causal mode and target quotient block sets
+    # (never on backward preimage multiplicity: preserving vs contracting share mode "deterministic").
     obs_groups: dict[str, int] = {}
     block_of: dict[str, int] = {}
     for s in state_tuple:
@@ -308,9 +326,14 @@ def analyze_finite_ground(
             action_sigs: list[object] = [block_of[s]]
             for a in action_tuple:
                 cls = cell_classes[(s, a)]
+                forward_mode = (
+                    "deterministic"
+                    if cls in (TransitionClass.PREDICTABLE_PRESERVING, TransitionClass.PREDICTABLE_CONTRACTING)
+                    else cls.value
+                )
                 targets = normalized[(s, a)]
-                target_blocks = tuple(sorted(block_of[t] for t in targets))
-                action_sigs.append((cls.value, target_blocks))
+                target_blocks = tuple(sorted(set(block_of[t] for t in targets)))
+                action_sigs.append((forward_mode, target_blocks))
             sig = tuple(action_sigs)
             if sig not in sig_to_block:
                 sig_to_block[sig] = len(sig_to_block)

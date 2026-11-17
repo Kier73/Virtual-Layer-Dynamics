@@ -57,14 +57,30 @@ class VirtualGroundSpec:
     evidence_scope: str = "declared-specification"
 
     def __post_init__(self) -> None:
-        if not self.ground_id.strip():
-            raise ValueError("ground_id must be non-empty.")
-        if not self.version.strip():
-            raise ValueError("version must be non-empty.")
-        if not self.language.strip() or not self.state_domain.strip():
-            raise ValueError("language and state_domain must be non-empty.")
+        for field_name, scalar in (
+            ("ground_id", self.ground_id),
+            ("version", self.version),
+            ("language", self.language),
+            ("state_domain", self.state_domain),
+            ("evidence_scope", self.evidence_scope),
+        ):
+            if not isinstance(scalar, str) or not scalar.strip():
+                raise ValueError(f"{field_name} must be a non-empty str.")
+
+        for seq_name in ("transitions", "invariants", "observers", "cost_dimensions"):
+            seq_val = getattr(self, seq_name)
+            if isinstance(seq_val, (str, bytes)) or not hasattr(seq_val, "__iter__"):
+                raise ValueError(f"{seq_name} must be a sequence of non-empty strings, not {type(seq_val).__name__}.")
+            items = tuple(seq_val)
+            for item in items:
+                if not isinstance(item, str) or not item.strip():
+                    raise ValueError(f"{seq_name} entries must be non-empty strings, got {item!r}.")
+            object.__setattr__(self, seq_name, items)
+
         if not self.observers:
             raise ValueError("Ground must declare at least one observer projection.")
+        if not self.cost_dimensions or len(set(self.cost_dimensions)) != len(self.cost_dimensions):
+            raise ValueError("cost_dimensions must be non-empty and duplicate-free.")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -113,8 +129,11 @@ class ByteLens:
     expected_length: int | None = None
 
     def __post_init__(self) -> None:
-        if self.expected_length is not None and self.expected_length < 0:
-            raise ValueError("expected_length cannot be negative.")
+        if not isinstance(self.kind, LensKind):
+            raise ValueError(f"kind must be a LensKind, got {self.kind!r}.")
+        if self.expected_length is not None:
+            if not isinstance(self.expected_length, int) or isinstance(self.expected_length, bool) or self.expected_length < 0:
+                raise ValueError("expected_length must be a non-negative int.")
 
     def lift(self, raw: bytes) -> LiftedByteProjection:
         """Lift raw bytes into the declared domain and verify exact round-trip invertibility."""
@@ -169,6 +188,8 @@ class ByteLens:
 
     def lower(self, value: Any, *, byte_length: int | None = None) -> bytes:
         r"""Apply inverse map $\Lambda^{-1}: \Sigma \to (\mathbb{Z}/256\mathbb{Z})^N$."""
+        if byte_length is not None and (not isinstance(byte_length, int) or isinstance(byte_length, bool) or byte_length < 0):
+            raise LensProjectionError("byte_length must be a non-negative int.")
         target_len = self.expected_length if self.expected_length is not None else byte_length
         if self.kind is LensKind.RAW_Z256:
             if not isinstance(value, (tuple, list)):
@@ -234,6 +255,9 @@ class AffineOrbitLaw:
 
     @classmethod
     def from_parameters(cls, multiplier: int, increment: int, modulus: int) -> AffineOrbitLaw:
+        for name, val in (("multiplier", multiplier), ("increment", increment), ("modulus", modulus)):
+            if not isinstance(val, int) or isinstance(val, bool):
+                raise ValueError(f"{name} must be an exact int.")
         if modulus < 2:
             raise ValueError("modulus must be >= 2.")
         return cls(multiplier % modulus, increment % modulus, modulus)
@@ -334,13 +358,14 @@ def propose_modular_progression(
 ) -> ProgressionTraceProposal:
     r"""Propose or certify $x_{t+1} = (x_t + \Delta) \bmod m$ from finite observations.
 
-    Identifiability rule (prevents unwrapped-progression mis-certification):
-      - If `declared_modulus` is omitted, a modular wrap ($x_t + \Delta \ge m \implies x_{t+1} = x_t + \Delta - m$)
-        MUST be directly witnessed in `samples`, alongside at least one positive unwrapped step $\Delta > 0$,
-        to uniquely identify both $\Delta$ and $m$.
-      - An unwrapped arithmetic progression has infinitely many compatible moduli $m > \max_t x_t$
-        (as well as unbounded $\mathbb{Z}$), so it is classified as `EpistemicStatus.HYPOTHESIS` (`law=None`),
-        never silently promoted to a certified modular Ground.
+    Identifiability & degrees-of-freedom rules:
+      - If `declared_modulus` is omitted, BOTH a modular wrap ($x_t + \Delta \ge m \implies x_{t+1} = x_t + \Delta - m$)
+        and a positive unwrapped step $\Delta > 0$ MUST be witnessed in `samples`, AND at least 4 samples
+        ($N - 1 \ge 3$ transitions for 2 unknown parameters $(\Delta, m)$, giving $df = N - 3 \ge 1$
+        predictive check) are required to reach `EpistemicStatus.CERTIFIED`.
+      - A 3-sample wrap candidate ($df = 0$) or an unwrapped arithmetic progression (infinitely many
+        compatible moduli $m > \max_t x_t$, plus $\mathbb{Z}$) is classified as `EpistemicStatus.HYPOTHESIS`
+        (`law=None`), never silently promoted to a certified modular Ground.
     """
     if len(samples) < 3:
         raise ValueError("At least 3 samples are required to assess progression structure.")
@@ -349,8 +374,8 @@ def propose_modular_progression(
             raise ValueError(f"Sample at index {idx} must be a non-negative int, got {val!r}.")
 
     if declared_modulus is not None:
-        if declared_modulus < 2:
-            raise ValueError("declared_modulus must be >= 2.")
+        if not isinstance(declared_modulus, int) or isinstance(declared_modulus, bool) or declared_modulus < 2:
+            raise ValueError("declared_modulus must be an exact int >= 2.")
         if any(v >= declared_modulus for v in samples):
             return ProgressionTraceProposal(
                 status=EpistemicStatus.AMBIGUOUS,
@@ -392,7 +417,7 @@ def propose_modular_progression(
             inferred_modulus=None,
             wrap_witnessed=False,
             law=None,
-            reason="Unwrapped monotonic progression: modulus is unidentifiable without wrap witness or declared domain.",
+            reason="Unwrapped progression: modulus is unidentifiable without wrap witness or declared domain.",
         )
 
     if len(distinct_diffs) == 2 and distinct_diffs[0] < 0 < distinct_diffs[1]:
@@ -400,6 +425,15 @@ def propose_modular_progression(
         modulus = pos_step - neg_jump
         if modulus >= 2 and all(0 <= v < modulus for v in samples):
             if all((samples[i + 1] - samples[i]) % modulus == pos_step for i in range(len(samples) - 1)):
+                if len(samples) < 4:
+                    return ProgressionTraceProposal(
+                        status=EpistemicStatus.HYPOTHESIS,
+                        step_delta=pos_step,
+                        inferred_modulus=modulus,
+                        wrap_witnessed=True,
+                        law=None,
+                        reason="Wrap candidate has zero residual degrees of freedom (3 samples fit 2 parameters); at least 4 samples required for certification.",
+                    )
                 law = AffineOrbitLaw(multiplier=1, increment=pos_step, modulus=modulus)
                 return ProgressionTraceProposal(
                     status=EpistemicStatus.CERTIFIED,
@@ -407,7 +441,7 @@ def propose_modular_progression(
                     inferred_modulus=modulus,
                     wrap_witnessed=True,
                     law=law,
-                    reason="Unique step and modulus identified via witnessed modular wrap.",
+                    reason="Unique step and modulus certified via witnessed modular wrap with positive residual degrees of freedom.",
                 )
 
     return ProgressionTraceProposal(
@@ -450,10 +484,13 @@ class NavigationCostVector:
             ("bytes_moved", self.bytes_moved),
             ("verification_ops", self.verification_ops),
         ):
-            if not math.isfinite(val) or val < 0.0:
-                raise ValueError(f"{name} must be finite and >= 0, got {val!r}.")
+            if isinstance(val, bool) or not isinstance(val, (int, float)) or not math.isfinite(val) or val < 0.0:
+                raise ValueError(f"{name} must be a finite real number >= 0, got {val!r}.")
+            object.__setattr__(self, name, float(val))
 
-    def __add__(self, other: NavigationCostVector) -> NavigationCostVector:
+    def __add__(self, other: object) -> NavigationCostVector:
+        if not isinstance(other, NavigationCostVector):
+            return NotImplemented
         return NavigationCostVector(
             latency_ms=self.latency_ms + other.latency_ms,
             compute_ops=self.compute_ops + other.compute_ops,
@@ -462,8 +499,8 @@ class NavigationCostVector:
         )
 
     def scale(self, factor: float) -> NavigationCostVector:
-        if not math.isfinite(factor) or factor < 0.0:
-            raise ValueError("Scale factor must be finite and >= 0.")
+        if isinstance(factor, bool) or not isinstance(factor, (int, float)) or not math.isfinite(factor) or factor < 0.0:
+            raise ValueError("Scale factor must be a finite real number >= 0.")
         return NavigationCostVector(
             latency_ms=self.latency_ms * factor,
             compute_ops=self.compute_ops * factor,
@@ -489,6 +526,11 @@ def expected_shortcut_cost(
     fallback_cost: NavigationCostVector,
 ) -> NavigationCostVector:
     r"""Evaluate $\mathbf{C}_{\text{VLD}} = \mathbf{C}_{\text{lift}} + \mathbf{C}_g + \mathbf{C}_\sigma + p_{\text{exit}} \mathbf{C}_{\text{exec}}$."""
-    if not math.isfinite(exit_probability) or not (0.0 <= exit_probability <= 1.0):
-        raise ValueError("exit_probability must lie in [0.0, 1.0].")
-    return lift_cost + guard_cost + shortcut_cost + fallback_cost.scale(exit_probability)
+    if (
+        isinstance(exit_probability, bool)
+        or not isinstance(exit_probability, (int, float))
+        or not math.isfinite(exit_probability)
+        or not (0.0 <= exit_probability <= 1.0)
+    ):
+        raise ValueError("exit_probability must be a finite real number in [0.0, 1.0].")
+    return lift_cost + guard_cost + shortcut_cost + fallback_cost.scale(float(exit_probability))

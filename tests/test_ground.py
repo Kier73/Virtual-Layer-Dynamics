@@ -45,6 +45,11 @@ def test_virtual_ground_spec_fingerprint_stability_and_validation() -> None:
         VirtualGroundSpec("", "1.0", "lang", "dom", (), (), ("obs",))
     with pytest.raises(ValueError):
         VirtualGroundSpec("id", "1.0", "lang", "dom", (), (), ())
+    # Bare str for sequence fields must be rejected instead of silently splitting characters
+    with pytest.raises(ValueError, match="sequence of non-empty strings"):
+        VirtualGroundSpec("id", "1.0", "lang", "dom", "step", ("inv",), ("obs",))  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="duplicate-free"):
+        VirtualGroundSpec("id", "1.0", "lang", "dom", ("step",), (), ("obs",), cost_dimensions=("lat", "lat"))
 
 
 def test_byte_lens_round_trips_and_edge_cases() -> None:
@@ -138,6 +143,27 @@ def test_modular_progression_identifiability_regression() -> None:
     with pytest.raises(UnderdeterminedGroundError):
         certify_modular_progression([20, 37, 55], declared_modulus=100)
 
+    # Zero-step constant trace & strictly decreasing unwrapped trace remain HYPOTHESIS without declared modulus
+    const_prop = propose_modular_progression([5, 5, 5, 5])
+    assert const_prop.status is EpistemicStatus.HYPOTHESIS and const_prop.step_delta == 0 and const_prop.law is None
+    dec_prop = propose_modular_progression([90, 50, 10])
+    assert dec_prop.status is EpistemicStatus.HYPOTHESIS and dec_prop.step_delta == -40 and dec_prop.law is None
+
+    # 3-sample wrap candidates have df = (3 - 1) - 2 = 0 residual degrees of freedom -> HYPOTHESIS, never CERTIFIED!
+    for three_sample in ([7, 42, 19], [90, 10, 30], [95, 5, 15]):
+        p3 = propose_modular_progression(three_sample)
+        assert p3.status is EpistemicStatus.HYPOTHESIS
+        assert p3.wrap_witnessed is True
+        assert p3.law is None
+        with pytest.raises(UnderdeterminedGroundError):
+            certify_modular_progression(three_sample)
+
+    # Adding a 4th confirming sample (df = 1) certifies genuine modular orbits (including large-step decreasing mod 100)
+    law_inc = certify_modular_progression([90, 10, 30, 50])
+    assert law_inc.modulus == 100 and law_inc.increment == 20
+    law_dec = certify_modular_progression([25, 15, 5, 95, 85])
+    assert law_dec.modulus == 100 and law_dec.increment == 90
+
 
 def test_pareto_cost_vector_dominance() -> None:
     fast_heavy = NavigationCostVector(latency_ms=2.0, compute_ops=500.0, bytes_moved=4096.0, verification_ops=10.0)
@@ -167,3 +193,7 @@ def test_pareto_cost_vector_dominance() -> None:
             exit_probability=1.5,
             fallback_cost=slow_light,
         )
+    with pytest.raises(ValueError, match="finite real number"):
+        NavigationCostVector(True, 0.0, 0.0, 0.0)  # type: ignore[arg-type]
+    with pytest.raises(TypeError):
+        _ = strictly_better + 1.0  # type: ignore[operator]
