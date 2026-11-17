@@ -349,13 +349,78 @@ def _find_strict_polyhedron_interior(
     return (*sub_x, coord)
 
 
+def _split_open_chamber(
+    ineqs: list[tuple[tuple[Fraction, ...], Fraction]],
+    witness: tuple[Fraction, ...],
+    n_vec: tuple[Fraction, ...],
+    beta: Fraction,
+    dim: int,
+) -> list[tuple[list[tuple[tuple[Fraction, ...], Fraction]], tuple[Fraction, ...]]]:
+    r"""Incrementally split open polyhedron $C = \{x : A x + \delta > 0\}$ by hyperplane $\langle n, x \rangle + \beta = 0$.
+
+    Uses two exact convex-geometric accelerations before invoking Fourier-Motzkin:
+      1. **Normal-Ray Witness Crossing:** Walks from $w \in C$ along $\pm n$ to cross $h(x)=0$ in $O(|C|\cdot d)$
+         operations whenever $h$ is visible along the normal ray before hitting $\partial C$.
+      2. **Open-Polyhedron Redundancy Elimination:** Because $C$ is open and $n \neq 0$,
+         $C \cap \{h < 0\} = \emptyset \implies C \subseteq \{h > 0\}$, so redundant non-slicing hyperplanes
+         are never appended to $C$'s constraint list.
+    """
+    neg_n = tuple(-v for v in n_vec)
+    v0 = sum((n_j * w_j for n_j, w_j in zip(n_vec, witness)), start=beta)
+    slacks = [sum((a_j * w_j for a_j, w_j in zip(a_q, witness)), start=d_q) for a_q, d_q in ineqs]
+
+    if v0 == 0:
+        # Witness lies directly on hyperplane strictly inside open chamber C: step analytically to both sides!
+        pos_caps = [r_q / (-s_q) for (a_q, _), r_q in zip(ineqs, slacks) if (s_q := sum(a * b for a, b in zip(a_q, n_vec))) < 0]
+        neg_caps = [r_q / s_q for (a_q, _), r_q in zip(ineqs, slacks) if (s_q := sum(a * b for a, b in zip(a_q, n_vec))) > 0]
+        t_pos = (min(pos_caps) / 2) if pos_caps else Fraction(1)
+        t_neg = (min(neg_caps) / 2) if neg_caps else Fraction(1)
+        w_pos = tuple(w_j + t_pos * n_j for w_j, n_j in zip(witness, n_vec))
+        w_neg = tuple(w_j - t_neg * n_j for w_j, n_j in zip(witness, n_vec))
+        return [
+            ([*ineqs, (n_vec, beta)], w_pos),
+            ([*ineqs, (neg_n, -beta)], w_neg),
+        ]
+
+    if v0 > 0:
+        same_h = (n_vec, beta)
+        opp_h = (neg_n, -beta)
+    else:
+        same_h = (neg_n, -beta)
+        opp_h = (n_vec, beta)
+
+    opp_dir = opp_h[0]
+    norm_sq = sum(v * v for v in opp_dir)
+    t_cross = abs(v0) / norm_sq
+    wall_caps = [
+        r_q / (-s_q)
+        for (a_q, _), r_q in zip(ineqs, slacks)
+        if (s_q := sum(a * b for a, b in zip(a_q, opp_dir))) < 0
+    ]
+    t_max = min(wall_caps) if wall_caps else None
+
+    if t_max is None or t_cross < t_max:
+        t_star = (t_cross + Fraction(1)) if t_max is None else ((t_cross + t_max) / 2)
+        w_opp: tuple[Fraction, ...] | None = tuple(w_j + t_star * d_j for w_j, d_j in zip(witness, opp_dir))
+    else:
+        w_opp = _find_strict_polyhedron_interior([*ineqs, opp_h], dim)
+
+    if w_opp is None:
+        # Hyperplane does not intersect open polyhedron C; same_h > 0 is strictly redundant on C!
+        return [(ineqs, witness)]
+    return [
+        ([*ineqs, same_h], witness),
+        ([*ineqs, opp_h], w_opp),
+    ]
+
+
 def compile_multivariate_hinge_relu(
     *,
     input_dim: int,
     base_linear: Sequence[Sequence[str]],
     base_bias: Sequence[str],
     hinges: Sequence[Mapping[str, Any]] = (),
-    max_hinges: int = 24,
+    max_hinges: int = 64,
 ) -> dict[str, Any]:
     r"""Compile a multivariate polyhedral hinge specification $f: \mathbb{Q}^d \to \mathbb{Q}^m$ into an exact ReLU capsule."""
     if isinstance(input_dim, bool) or not isinstance(input_dim, int) or not (1 <= input_dim <= 8):
@@ -470,8 +535,14 @@ def evaluate_multivariate_capsule(
     ]
 
 
-def verify_multivariate_capsule(capsule: Mapping[str, Any] | str | bytes) -> dict[str, Any]:
+def verify_multivariate_capsule(
+    capsule: Mapping[str, Any] | str | bytes,
+    *,
+    max_chambers: int = 10_000,
+) -> dict[str, Any]:
     r"""Independently verify whole-domain $\mathbb{R}^d$ equivalence across all polyhedral hyperplane chambers."""
+    if isinstance(max_chambers, bool) or not isinstance(max_chambers, int) or max_chambers < 1:
+        raise ProceduralModelError("max_chambers must be a positive integer.")
     try:
         data = parse_strict_json(capsule) if isinstance(capsule, (str, bytes)) else dict(capsule)
     except Exception as exc:
@@ -495,7 +566,7 @@ def verify_multivariate_capsule(capsule: Mapping[str, Any] | str | bytes) -> dic
     hinges_spec = [
         (
             tuple(_parse_canonical_rational(v) for v in h["normal"]),
-            _parse_canonical_rational(h["offset"]),
+            _parse_canonical_rational(v) if isinstance((v := h["offset"]), str) else _parse_canonical_rational(v),
             tuple(_parse_canonical_rational(v) for v in h["weights"]),
         )
         for h in spec["hinges"]
@@ -526,22 +597,21 @@ def verify_multivariate_capsule(capsule: Mapping[str, Any] | str | bytes) -> dic
             seen_hp.add(canon)
             hyperplanes.append(canon)
 
-    # Enumerate every non-empty full-dimensional polyhedral chamber via incremental Fourier-Motzkin pruning
-    chambers: list[tuple[Fraction, ...]] = []
+    # Incrementally split open polyhedral chambers using normal-ray witnesses + redundancy elimination
+    active_chambers: list[tuple[list[tuple[tuple[Fraction, ...], Fraction]], tuple[Fraction, ...]]] = [
+        ([], tuple(Fraction(0) for _ in range(d)))
+    ]
+    for n_vec, beta in hyperplanes:
+        next_chambers: list[tuple[list[tuple[tuple[Fraction, ...], Fraction]], tuple[Fraction, ...]]] = []
+        for ineqs, w_pt in active_chambers:
+            next_chambers.extend(_split_open_chamber(ineqs, w_pt, n_vec, beta, d))
+            if len(next_chambers) > max_chambers:
+                raise ProceduralModelError(
+                    f"Polyhedral chamber count exceeded max_chambers={max_chambers} budget."
+                )
+        active_chambers = next_chambers
 
-    def _enumerate(idx: int, active_ineqs: list[tuple[tuple[Fraction, ...], Fraction]]) -> None:
-        witness = _find_strict_polyhedron_interior(active_ineqs, d)
-        if witness is None:
-            return
-        if idx == len(hyperplanes):
-            chambers.append(witness)
-            return
-        n_vec, beta = hyperplanes[idx]
-        neg_n = tuple(-v for v in n_vec)
-        _enumerate(idx + 1, [*active_ineqs, (n_vec, beta)])
-        _enumerate(idx + 1, [*active_ineqs, (neg_n, -beta)])
-
-    _enumerate(0, [])
+    chambers = [w_pt for _, w_pt in active_chambers]
     if not chambers:
         raise ProceduralModelError("Empty polyhedral domain arrangement.")
 

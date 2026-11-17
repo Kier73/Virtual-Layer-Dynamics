@@ -1,0 +1,71 @@
+r"""Phase 3 — Receiver Authority, Quorum Sessions & Portable Provenance (`vld.authority`)."""
+
+from __future__ import annotations
+
+from vld.authority.quorum import (
+    QuorumAuthorityMember,
+    QuorumCommitCertificate,
+    QuorumEquivocationError,
+    QuorumError,
+    QuorumInsufficientError,
+    QuorumLineageCoordinator,
+    QuorumMembership,
+    QuorumProposal,
+    QuorumVote,
+    RollbackDetectedError,
+    StaleTermError,
+)
+from vld.authority.session import (
+    ComputationalSession,
+    SessionCheckpoint,
+    SessionConflictError,
+    SessionError,
+    StaleEpochError,
+    VirtualProcessor,
+)
+from vld.authority.temporal import (
+    CausalOrder,
+    ClockBridgeReceipt,
+    CrossSchedulerComparisonError,
+    EncounterEnvelope,
+    InterpretationEnvelope,
+    TemporalCoordinate,
+    TemporalError,
+    VectorClock,
+    decode_temporal_f64,
+    decode_temporal_int,
+    encode_temporal_f64,
+    encode_temporal_int,
+)
+
+__all__ = [
+    "CausalOrder",
+    "ClockBridgeReceipt",
+    "ComputationalSession",
+    "CrossSchedulerComparisonError",
+    "EncounterEnvelope",
+    "InterpretationEnvelope",
+    "QuorumAuthorityMember",
+    "QuorumCommitCertificate",
+    "QuorumEquivocationError",
+    "QuorumError",
+    "QuorumInsufficientError",
+    "QuorumLineageCoordinator",
+    "QuorumMembership",
+    "QuorumProposal",
+    "QuorumVote",
+    "RollbackDetectedError",
+    "SessionCheckpoint",
+    "SessionConflictError",
+    "SessionError",
+    "StaleEpochError",
+    "StaleTermError",
+    "TemporalCoordinate",
+    "TemporalError",
+    "VectorClock",
+    "VirtualProcessor",
+    "decode_temporal_f64",
+    "decode_temporal_int",
+    "encode_temporal_f64",
+    "encode_temporal_int",
+]

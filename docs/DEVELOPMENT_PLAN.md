@@ -16,13 +16,13 @@ src/vld/
 ├── signal/             # [Phase 1 - Done] Phasor/ring/rational backends, typed IR, static footprints
 ├── memory/             # [Phase 2 - Done] Structural Memory registry, 5-rung certifier, M1 paged store
 ├── inquiry/            # [Phase 2 - Done] Active perception, greedy/beam/minimax probes, revision ledger
-├── accel/              # [Accel - Done] StructuralLinearOperator, semigroup leaps, NumPy + Rust CDLL
-├── fabric/             # [Vantage - Done] Multi-framing VantageEnvelope, pipe & HTTP 206 Range hosting
+├── authority/          # [Phase 3 - Done] Scheduler-scoped clocks (G13), 2q>N quorum M3 sessions & VP continuity
+├── navigation/         # [Phase 4 - Done] Unbounded lazy NavigableComputationDAG, interval & bisimulation gates
+├── accel/              # [Accel - Done] StructuralLinearOperator, ndarray-resident NumPy + Rust CDLL kernels
+├── fabric/             # [Phase 4 - Done] VantageEnvelope, ReplayWindowGuard, ReliableChannel, mTLS & G11 forwarding
+├── substrates/         # [Phase 5 - Done] CoW + Structural VM pages, ELF64/WASM lifters, O(1) delta tensor & Path Grounds
 ├── models/             # [Phase 6-7 - Done] Safetensors HFR, BPE, Qwen3 dense/MoE, orbit recovery, SNC/PNF
-├── agents/             # [Phase 7 - Done] ProofGround, ReceiverHypervisor CAS/capabilities & ModelAgents
-├── authority/          # [Phase 3 - Next] Distributed multi-node quorum sessions & temporal clocks
-├── navigation/         # [Phase 4 - Next] Hierarchical lazy NavigableComputationDAG & mTLS peer mesh
-└── substrates/         # [Phase 5 - Next] HeadlessOS VM, ELF/WASM lifting & E-GPU delta checkpoints
+└── agents/             # [Phase 7 - Done] ProofGround, ReceiverHypervisor CAS/capabilities & ModelAgents
 ```
 
 Every layer obeys a strict acyclic dependency order:
@@ -39,7 +39,7 @@ Every layer obeys a strict acyclic dependency order:
 
 ---
 
-### Phase 1 — Signal-State Machine, Multi-Domain Backends & Compositional Footprints (`vld.signal`)
+### Phase 1 — Signal-State Machine, Multi-Domain Backends & Compositional Footprints (`vld.signal`) *(Completed)*
 - **Consolidates:** `vgi.values`, `vgi.ground`, `vgi.ir`, `vgi.compiler`, `vgi.machine`, `vgi.transitions` (`G01`–`G03`).
 - **Key Deliverables:**
   1. Extract formal `ComputationalBackend` protocol decoupling machine control flow from domain algebra.
@@ -50,7 +50,7 @@ Every layer obeys a strict acyclic dependency order:
 
 ---
 
-### Phase 2 — Structural Memory, Active Inquiry & Observation-to-Ground Pipeline (`vld.memory`, `vld.inquiry`)
+### Phase 2 — Structural Memory, Active Inquiry & Observation-to-Ground Pipeline (`vld.memory`, `vld.inquiry`) *(Completed)*
 - **Consolidates:** `mailcpu.structural_memory`, `mailcpu.law_certifier`, `mailcpu.composed_ground`, `mailcpu.computational_objects` (M1), `vgi.partial_attention`, `vgi.partial_policy`, `ifs.bridges.hypothesis_revision` (`G04`, `G07`, `G12`, `G25`).
 - **Key Deliverables:**
   1. **M1 Content-Addressed Paged Byte Store:** Fixed-size SHA-256 verified pages, streaming manifests, and bounded range reads without materializing entire multi-gigabyte objects in RAM.
@@ -60,7 +60,7 @@ Every layer obeys a strict acyclic dependency order:
 
 ---
 
-### Phase 3 — Receiver Authority, Quorum Sessions & Portable Provenance (`vld.authority`)
+### Phase 3 — Receiver Authority, Quorum Sessions & Portable Provenance (`vld.authority`) *(Completed)*
 - **Consolidates:** `mailcpu.virtual_layer`, `mailcpu.classifier` (Hypervisor), `mailcpu.computational_session` (M3), `mailcpu.recovery_lineage`, `vp.core`, `ifs.formats.*`, `ifs.bridges.temporal_provenance` (`G13`, `G21`, `G22`).
 - **Key Deliverables:**
   1. **Typed Temporal & Encounter Envelopes:** Vector clocks, scheduler-scoped coordinates (preventing cross-scheduler silent misinterpretation, resolving `G13`), and decoupled observation-vs-interpretation envelopes.
@@ -70,7 +70,7 @@ Every layer obeys a strict acyclic dependency order:
 
 ---
 
-### Phase 4 — Navigable Computation DAGs & Authenticated Distributed Fabric (`vld.navigation`, `vld.fabric`)
+### Phase 4 — Navigable Computation DAGs & Authenticated Distributed Fabric (`vld.navigation`, `vld.fabric`) *(Completed)*
 - **Consolidates:** `mailcpu.computation_dag`, `mailcpu.navigation*`, `mailcpu.reliability`, `mailcpu.mtls_transport`, `mailcpu.computational_fabric*`, `mailcpu.partitioned_dataflow` (`G08`, `G11`, `G14`, `G15`, `G20`).
 - **Key Deliverables:**
   1. **Hierarchical Navigable Computation DAG:** Content-addressed dependency frontiers removing the legacy 256-node flat ceiling via lazy subgraph expansion; static/dynamic readiness, checkpoint/restore, and strong-bisimulation / interval-abstract-interpretation pre-gates.
@@ -79,7 +79,7 @@ Every layer obeys a strict acyclic dependency order:
 
 ---
 
-### Phase 5 — Virtual OS, Hardware/Bytecode Lifting & Substrate/Path-Native Realization (`vld.substrates`)
+### Phase 5 — Virtual OS, Hardware/Bytecode Lifting & Substrate/Path-Native Realization (`vld.substrates`) *(Completed)*
 - **Consolidates:** `mailcpu.interpreter`, `mailcpu.kernel`, `mailcpu.vm` (CoW + structural demand paging), `mailcpu.elf`, `mailcpu.egpu`, `mailcpu.tensor_stream`, `mailcpu.tensor_checkpoint`, `mailcpu.path_ground*`, `mailcpu.internet_ground*`, `experiments.portable_rooms` (`G09`, `G10`, `G23`, `G24`, `G26`–`G29`).
 - **Key Deliverables:**
   1. **Software & OS Lifting:** Deterministic VM kernel, Copy-on-Write + Structural-Memory-backed virtual pages, transactional ELF/WASM lifting into navigable process Grounds (`Locate`, `Restore`, `Continue`, `Transform`).
@@ -89,7 +89,7 @@ Every layer obeys a strict acyclic dependency order:
 
 ---
 
-### Phase 6 — Hosted & Partitioned Large Language Models Inside the Virtual Layer (`vld.models`)
+### Phase 6 — Hosted & Partitioned Large Language Models Inside the Virtual Layer (`vld.models`) *(Completed)*
 - **Consolidates:** `mailcpu.model_weight_ground` (`MWS-001/002`), `mailcpu.hf_model_ground` / `hf_layer_realization` / `model_orbit_handoff` (`HFG-001..003`), `vp.moe` (`VP-002`), `ifs.experiments.external_neural_structure_reading` (`HFR`), `ifs.experiments.tensor_cut_realization` (`TCR`), `ifs.experiments.aks*` (`G16`–`G19`).
 - **Key Deliverables:**
   1. **Source-Pinned Model Artifact & Tokenizer Grounds:** Bounded Safetensors header/range reader (`HFR`), deterministic source-pinned BPE tokenizer Ground with round-trip receipts, and hierarchical lazy `ModelParameterSpace` supporting 0.6B dense through 235B+ sparse MoE architectures without full checkpoint download.
@@ -99,7 +99,7 @@ Every layer obeys a strict acyclic dependency order:
 
 ---
 
-### Phase 7 — Procedural Model Generation, Synthetic Weight Geometry & Agentic Hypervisors (`vld.models.procedural`, `vld.agents`)
+### Phase 7 — Procedural Model Generation, Synthetic Weight Geometry & Agentic Hypervisors (`vld.models.procedural`, `vld.agents`) *(Completed)*
 - **Consolidates:** `ifs.experiments.semantic_neural_compilation` (`SNC-001`), `ifs.experiments.procedural_neural_formation` (`PNF-001..003`), `mailcpu.generative_weight_ground` (`MWS-002`), `mailcpu.weight_space` / `stateful_transition`, `vgi.proof` (`ProofGround`), `ifs.bridges.model_native_operations` (`USM-001..003`) (`G05`, `G06`, `G18`).
 - **Key Deliverables:**
   1. **Constructive Semantic-to-Neural Compilation:** Compile symbolic specifications, finite-state machines, and multivariate piecewise-affine/rational atlases directly into verified neural subnetworks (hinge/polyhedral compilation, finite-transition synthesis) with zero training data and whole-domain activation-cell certificates.

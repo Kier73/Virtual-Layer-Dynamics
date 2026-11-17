@@ -659,3 +659,38 @@ def test_multivariate_polyhedral_compilation_dyadic_rescaling_replacement_and_hy
 
     refusals = [e for e in hyp.journal.events if e.operation == "hypervisor.refusal"]
     assert len(refusals) == 4
+
+
+def test_high_hinge_multivariate_arrangement_scalability_and_chamber_budget() -> None:
+    from vld.models import (
+        compile_multivariate_hinge_relu,
+        evaluate_multivariate_capsule,
+        verify_multivariate_capsule,
+    )
+
+    # 26 hinges in R^2 (> 2^26 = 67M naive sign combinations!) verified whole-domain in < 1.5s via normal-ray + redundancy elimination!
+    hinges_26 = [
+        {"normal": [str((i % 7) + 1), str((i % 5) - 2)], "offset": str(-i), "weights": ["1"]}
+        for i in range(26)
+    ]
+    cap_26 = compile_multivariate_hinge_relu(
+        input_dim=2,
+        base_linear=[["2", "-3"]],
+        base_bias=["1"],
+        hinges=hinges_26,
+    )
+    rep_26 = verify_multivariate_capsule(cap_26)
+    assert rep_26["status"] == "VERIFIED_WHOLE_DOMAIN"
+    assert rep_26["chambers_verified"] > 100
+
+    # Verify exact evaluation at rational query point
+    pt = (Fraction(5, 2), Fraction(-3, 4))
+    expected = Fraction(1) + 2 * pt[0] - 3 * pt[1] + sum(
+        max(Fraction(0), Fraction(int(h["normal"][0])) * pt[0] + Fraction(int(h["normal"][1])) * pt[1] + Fraction(int(h["offset"])))
+        for h in hinges_26
+    )
+    assert evaluate_multivariate_capsule(cap_26, pt) == [expected]
+
+    with pytest.raises(ProceduralModelError, match="max_chambers"):
+        verify_multivariate_capsule(cap_26, max_chambers=5)
+

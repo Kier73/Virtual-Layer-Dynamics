@@ -22,13 +22,15 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import io
 import json
 import re
+import ssl
 import struct
 import threading
 from typing import Any, BinaryIO, Mapping
 from urllib.error import HTTPError, URLError
-from urllib.request import HTTPRedirectHandler, Request, build_opener
+from urllib.request import HTTPRedirectHandler, HTTPSHandler, Request, build_opener
 
 from vld.canonical import CanonicalizationError, canonical_bytes, canonical_json, domain_digest, parse_strict_json
+from vld.fabric.reliability import ReplayRejectedError, ReplayWindowGuard
 from vld.ground import AffineOrbitLaw, VirtualGroundSpec
 from vld.journal import HashChainedJournal, IdempotencyConflictError
 from vld.memory import PagedByteManifest, PagedObjectStore, PagedStoreError, StructuralMemoryError, StructuralMemoryRegistry
@@ -223,6 +225,7 @@ class VLDVantageNode:
         structural_memory: StructuralMemoryRegistry | None = None,
         journal: HashChainedJournal | None = None,
         capability_secret: bytes | None = None,
+        replay_guard: ReplayWindowGuard | None = None,
     ) -> None:
         if not isinstance(node_id, str) or not node_id.strip():
             raise VantageError("node_id must be a non-empty string.")
@@ -235,6 +238,7 @@ class VLDVantageNode:
             structural_memory if structural_memory is not None else StructuralMemoryRegistry(self.journal)
         )
         self._capability_secret = capability_secret
+        self._replay_guard = replay_guard
         self._grounds: dict[str, VirtualGroundSpec] = {}
         self._seq_lock = threading.Lock()
         self._out_seq = 0
@@ -268,6 +272,12 @@ class VLDVantageNode:
             raise VantageError(f"Expected flow_kind='op_request', got {request_env.flow_kind!r}.")
         if self._capability_secret is not None and not request_env.verify_hmac(self._capability_secret):
             raise VantageAuthError("Missing or invalid HMAC capability token for receiver node.")
+        if self._replay_guard is not None:
+            with self._seq_lock:
+                try:
+                    self._replay_guard.check_and_record(request_env.vantage_id, request_env.sequence)
+                except ReplayRejectedError as exc:
+                    raise VantageAuthError(str(exc)) from exc
 
         p = request_env.payload
         req_id = p.get("request_id")
@@ -370,15 +380,26 @@ class VLDHttpVantageServer:
 
     MAX_POST_BYTES = 4 * 1024 * 1024
 
-    def __init__(self, node: VLDVantageNode, host: str = "127.0.0.1", port: int = 0) -> None:
+    def __init__(
+        self,
+        node: VLDVantageNode,
+        host: str = "127.0.0.1",
+        port: int = 0,
+        *,
+        ssl_context: ssl.SSLContext | None = None,
+    ) -> None:
         self.node = node
+        self._ssl_context = ssl_context
         self._httpd = ThreadingHTTPServer((host, port), self._make_handler())
+        if ssl_context is not None:
+            self._httpd.socket = ssl_context.wrap_socket(self._httpd.socket, server_side=True)
         self._thread: threading.Thread | None = None
 
     @property
     def base_url(self) -> str:
         addr, port = self._httpd.server_address[:2]
-        return f"http://{addr}:{port}"
+        scheme = "https" if self._ssl_context is not None else "http"
+        return f"{scheme}://{addr}:{port}"
 
     def start_background(self) -> str:
         if self._thread is None:
@@ -544,12 +565,16 @@ class VLDHttpVantageClient:
         client_id: str = "vld.client",
         capability_secret: bytes | None = None,
         timeout_s: float = 10.0,
+        ssl_context: ssl.SSLContext | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.client_id = client_id
         self._capability_secret = capability_secret
         self.timeout_s = timeout_s
-        self._opener = build_opener(_StrictNoRedirect)
+        handlers: list[Any] = [_StrictNoRedirect]
+        if ssl_context is not None:
+            handlers.append(HTTPSHandler(context=ssl_context))
+        self._opener = build_opener(*handlers)
         self._seq_lock = threading.Lock()
         self._seq = 0
 

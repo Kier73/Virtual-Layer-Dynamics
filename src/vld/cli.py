@@ -17,8 +17,27 @@ from vld.agents import (
     ReceiverHypervisor,
     create_default_exploration_grant,
 )
+from vld.authority import (
+    CausalOrder,
+    CrossSchedulerComparisonError,
+    QuorumAuthorityMember,
+    QuorumEquivocationError,
+    QuorumLineageCoordinator,
+    QuorumMembership,
+    QuorumProposal,
+    RollbackDetectedError,
+    TemporalCoordinate,
+    VectorClock,
+)
 from vld.canonical import canonical_bytes, canonical_json, domain_digest, parse_strict_json
-from vld.fabric import VLDHttpVantageServer, VLDVantageNode
+from vld.fabric import (
+    LossyInMemoryLink,
+    ReliableChannel,
+    ReplayRejectedError,
+    ReplayWindowGuard,
+    VLDHttpVantageServer,
+    VLDVantageNode,
+)
 from vld.ground import (
     AffineOrbitLaw,
     ByteLens,
@@ -40,7 +59,31 @@ from vld.models import (
     verify_compiled_capsule,
     verify_multivariate_capsule,
 )
+from vld.navigation import (
+    ComputationNode,
+    IntervalBound,
+    NavigableComputationDAG,
+    SubgraphThunk,
+    analyze_dag_intervals,
+    check_strong_bisimulation,
+)
 from vld.signal import verify_differential_backends, verify_signal8_ground
+from vld.substrates import (
+    BarrierDivergenceError,
+    PF_R,
+    PF_W,
+    PF_X,
+    SIMTInstruction,
+    SIMTWorkgroupExecutor,
+    VirtualPageSpace,
+    WasmRealizer,
+    assemble_wasm_affine_orbit_module,
+    build_minimal_elf64_image,
+    build_room_intention,
+    execute_room_on_realizer,
+    lift_elf64_image,
+    lift_wasm_module,
+)
 from vld.triad import (
     EpistemicStatus,
     IndeterminateGuardTrap,
@@ -169,7 +212,131 @@ def run_self_verification() -> dict[str, Any]:
     assert wrap_poly.family == "poly" and wrap_poly.evaluate(10_000) == (10_000 * 10_000 + 30_005) % 97
     checks["phase2_m1_and_structural_memory"] = 6
 
-    # 7. Phases 6 & 7: MoE routing, 1D + R^d SNC whole-domain ReLU compilation & Hypervisor-governed Model Agent
+    # 7. Phase 3: Scheduler-scoped vector clocks (G13) & strict-majority (2q > N) quorum fencing
+    tc_a = TemporalCoordinate("sched.verify.a", 1, VectorClock.from_mapping({"p0": 1}))
+    tc_b = tc_a.advance("p0", 2)
+    assert tc_a.compare(tc_b) is CausalOrder.BEFORE
+    try:
+        tc_a.compare(TemporalCoordinate("sched.verify.b", 1, VectorClock.from_mapping({"p0": 1})))
+        raise AssertionError("Expected CrossSchedulerComparisonError")
+    except CrossSchedulerComparisonError:
+        pass
+
+    q_mem = QuorumMembership("verify.lineage", ("m0", "m1", "m2"))
+    q_secs = {m: f"verify-secret-{m}-0123456789".encode("utf-8") for m in q_mem.member_ids}
+    q_nodes = [QuorumAuthorityMember(m, q_secs[m]) for m in q_mem.member_ids]
+    q_coord = QuorumLineageCoordinator(q_mem, q_nodes, q_secs)
+    s1_dg = domain_digest("verify.m1", "s1")
+    s2_dg = domain_digest("verify.m1", "s2")
+    q_coord.propose_and_seal(
+        slot=1,
+        term=1,
+        predecessor_manifest_digest="0" * 64,
+        state_manifest_digest=s1_dg,
+        proposer_id="h0",
+        operation_id="init",
+        active_member_ids=("m0", "m1"),
+    )
+    try:
+        q_nodes[0].vote(
+            QuorumProposal(q_mem.lineage_id, q_mem.membership_digest, 1, 1, "0" * 64, s2_dg, "fork", "fork")
+        )
+        raise AssertionError("Expected QuorumEquivocationError")
+    except QuorumEquivocationError:
+        pass
+    q_coord.propose_and_seal(
+        slot=2,
+        term=2,
+        predecessor_manifest_digest=s1_dg,
+        state_manifest_digest=s2_dg,
+        proposer_id="h1",
+        operation_id="step",
+        active_member_ids=("m1", "m2"),
+    )
+    try:
+        q_coord.verify_fresh_checkpoint(slot=1, state_manifest_digest=s1_dg)
+        raise AssertionError("Expected RollbackDetectedError")
+    except RollbackDetectedError:
+        pass
+    checks["phase3_temporal_and_quorum_fencing"] = 6
+
+    # 8. Phase 4: Lazy NavigableComputationDAG, interval & bisimulation gates, ReliableChannel & replay guard
+    v_ctx = domain_digest("verify.dag", "ctx")
+    v_dag = NavigableComputationDAG("verify.dag")
+    v_dag.add_node(ComputationNode("in_x", 1, "const", "/r", v_ctx, (), {"value": "2"}))
+    v_dag.add_subgraph_thunk(
+        SubgraphThunk(
+            "thunk.1",
+            ("in_x",),
+            domain_digest("verify.thunk", "t1"),
+            lambda _c: [ComputationNode("aff_y", 1, "affine", "/r", v_ctx, ("in_x",), {"bias": "1", "scale": "3"})],
+        )
+    )
+    v_dag.commit_result("in_x", 2)
+    assert len(v_dag.ready_frontier()) == 1
+    ig_rep = analyze_dag_intervals(
+        v_dag,
+        input_bounds={"in_x": IntervalBound(Fraction(1), Fraction(3))},
+        safety_contracts={"aff_y": IntervalBound(Fraction(4), Fraction(10))},
+    )
+    assert ig_rep.overall_disposition is TruthDisposition.TRUE
+    bisim = check_strong_bisimulation(
+        actions=("a",),
+        left_states=("s0", "s1"),
+        left_transitions={("s0", "a"): ("s1",), ("s1", "a"): ("s0",)},
+        left_observations={"s0": 0, "s1": 0},
+        left_initial="s0",
+        right_states=("q0",),
+        right_transitions={("q0", "a"): ("q0",)},
+        right_observations={"q0": 0},
+        right_initial="q0",
+    )
+    assert bisim.equivalent is True
+
+    rw = ReplayWindowGuard(16)
+    rw.check_and_record("peer0", 5)
+    try:
+        rw.check_and_record("peer0", 5)
+        raise AssertionError("Expected ReplayRejectedError")
+    except ReplayRejectedError:
+        pass
+    link = LossyInMemoryLink()
+    ch_s = ReliableChannel(channel_id="v.ch", local_peer="a", remote_peer="b", send_fn=link.send)
+    ch_r = ReliableChannel(channel_id="v.ch", local_peer="b", remote_peer="a", send_fn=link.send)
+    ch_s.send_operation("op.1", {"k": 7})
+    deliv = ch_r.receive_frame(link.pop_for("b"))  # type: ignore[arg-type]
+    assert len(deliv) == 1 and deliv[0][1] == "op.1"
+    checks["phase4_navigation_gates_and_fabric_reliability"] = 6
+
+    # 9. Phase 5: CoW VirtualPageSpace, ELF64 & WASM lifting, SIMT barrier guard & Portable ROOM parity
+    vps = VirtualPageSpace(page_size=64)
+    vps.map_region(0, 64, flags=PF_R | PF_W, initial_bytes=b"ORIG")
+    vps_cow = vps.fork_cow()
+    vps_cow.write_bytes(0, b"FORK")
+    assert vps.read_bytes(0, 4) == b"ORIG" and vps_cow.read_bytes(0, 4) == b"FORK"
+
+    elf_img = build_minimal_elf64_image([(0x401000, PF_R | PF_X, b"\x90\xc3", 16)])
+    elf_g, _ = lift_elf64_image(elf_img)
+    assert elf_g.entry_point == 0x401000
+
+    wasm_mod = lift_wasm_module(assemble_wasm_affine_orbit_module())
+    room_intent = build_room_intention(coordinate=1_000_000_007)
+    alg_val = execute_room_on_realizer(room_intent, "algebraic-orbit")
+    vm_val = execute_room_on_realizer(room_intent, "vm-kernel")
+    (wasm_val,) = WasmRealizer(wasm_mod).invoke("affine_jump", (17, 29, 65521, 5, 1_000_000_007))
+    assert alg_val == vm_val == wasm_val
+
+    try:
+        SIMTWorkgroupExecutor(workgroup_size=2).execute_kernel(
+            (SIMTInstruction("JZ_EVEN_LANE", ("r0", 2)), SIMTInstruction("BARRIER", ("b0",)), SIMTInstruction("HALT", ())),
+            [0.0, 0.0],
+        )
+        raise AssertionError("Expected BarrierDivergenceError")
+    except BarrierDivergenceError:
+        pass
+    checks["phase5_substrates_cow_elf_wasm_simt_and_rooms"] = 6
+
+    # 10. Phases 6 & 7: MoE routing, 1D + R^d SNC whole-domain ReLU compilation & Hypervisor-governed Model Agent
     moe_spec = TransformerArchitectureSpec.from_published_profile("qwen3-235b-a22b")
     moe_route = route_moe_topk(
         moe_spec,
@@ -311,8 +478,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "vld.signal (Signal8, ModularRing & ExactRational backends, static footprints, base-8 compiler)",
                 "vld.memory (M1 PagedObjectStore, 5-rung Law Certifier, 2-adic inverse locators, counterexample demotion)",
                 "vld.inquiry (greedy, beam & exact minimax active perception planners, HypothesisRevisionLedger)",
-                "vld.accel (StructuralLinearOperator contraction, LinearRecurrenceGround, NumPy + Rust CDLL kernels)",
-                "vld.fabric (VantageEnvelope multi-framing codec, StreamPipeVantage, HTTP Range Vantage Server/Client)",
+                "vld.authority (scheduler-scoped vector clocks G13, decoupled provenance G21, 2q>N quorum M3 sessions & VirtualProcessor)",
+                "vld.navigation (unbounded lazy NavigableComputationDAG, K_3 dynamic guards, interval & strong-bisimulation pre-gates)",
+                "vld.accel (StructuralLinearOperator contraction, LinearRecurrenceGround, ndarray-resident NumPy + Rust CDLL kernels)",
+                "vld.fabric (VantageEnvelope, ReplayWindowGuard, crash-resumable ReliableChannel, X.509 v3 mTLS mesh & G11 forwarding)",
+                "vld.substrates (CoW + Structural-Memory VM pages, ELF64/WASM lifting, SIMT barriers, O(1) delta tensor log, Path Grounds & ROOM)",
                 "vld.models (Safetensors HFR, BPE Tokenizer Ground, Qwen3 dense/MoE realizers, SNC/PNF procedural models)",
                 "vld.agents (ProofGround hypergraph, ReceiverHypervisor CAS/capabilities, InLayerModelAgent)",
             ],

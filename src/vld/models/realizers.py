@@ -7,7 +7,7 @@ import hashlib
 import math
 from typing import Any, Callable, Mapping, Sequence
 
-from vld.accel import NumericEngine, decode_bf16_le, decode_f16_le, decode_f32_le, encode_f32_le
+from vld.accel import NumericEngine, decode_bf16_le, decode_f16_le, decode_f32_le, decode_tensor_ndarray, encode_f32_le
 from vld.canonical import domain_digest
 from vld.memory import PagedObjectStore
 from vld.models.artifacts import ModelArtifactError, ModelWeightSnapshot, TransformerArchitectureSpec
@@ -205,23 +205,148 @@ class TransformerLayerRealizer:
         loaded_log.append(name)
         return decode_shaped_tensor(raw, t_space.dtype, t_space.shape, use_numpy=self.engine.uses_numpy)
 
+    def _load_tensor_nd(self, name: str, loaded_log: list[str]) -> Any:
+        t_space = self.snapshot.space.tensor(name)
+        raw = self.snapshot.read_tensor_bytes(
+            name,
+            store=self.store,
+            remote_range_fetcher=self.remote_range_fetcher,
+        )
+        loaded_log.append(name)
+        try:
+            return decode_tensor_ndarray(raw, t_space.dtype, t_space.shape)
+        except ValueError as exc:
+            raise RealizerError(str(exc)) from exc
+
     def embed_tokens(self, token_ids: Sequence[int]) -> list[list[float]]:
-        loaded: list[str] = []
-        emb_table = self._load_tensor("model.embed_tokens.weight", loaded)
-        out: list[list[float]] = []
         for tid in token_ids:
             if not (0 <= tid < self.arch.vocab_size):
                 raise RealizerError(f"Token ID {tid} outside vocab_size {self.arch.vocab_size}.")
-            out.append(list(emb_table[tid]))
-        return out
+        loaded: list[str] = []
+        if self.engine.uses_numpy and token_ids:
+            emb_nd = self._load_tensor_nd("model.embed_tokens.weight", loaded)
+            return [[float(v) for v in row] for row in emb_nd[list(token_ids)].tolist()]
+        emb_table = self._load_tensor("model.embed_tokens.weight", loaded)
+        return [list(emb_table[tid]) for tid in token_ids]
 
     def final_logits(self, hidden_states: Sequence[Sequence[float]]) -> list[list[float]]:
         loaded: list[str] = []
+        head_name = "model.embed_tokens.weight" if self.arch.tie_word_embeddings else "lm_head.weight"
+        if self.engine.uses_numpy:
+            x_nd = self.engine.asarray_f32(hidden_states)
+            norm_w_nd = self._load_tensor_nd("model.norm.weight", loaded)
+            normed_nd = self.engine.rms_norm_nd(x_nd, norm_w_nd, self.arch.rms_norm_eps)
+            lm_w_nd = self._load_tensor_nd(head_name, loaded)
+            logits_nd = self.engine.linear_x_wt_nd(normed_nd, lm_w_nd)
+            return [[float(v) for v in row] for row in logits_nd.tolist()]
         norm_w = self._load_tensor("model.norm.weight", loaded)
         normed = self.engine.rms_norm_2d(hidden_states, norm_w, self.arch.rms_norm_eps)
-        head_name = "model.embed_tokens.weight" if self.arch.tie_word_embeddings else "lm_head.weight"
         lm_w = self._load_tensor(head_name, loaded)
         return self.engine.linear_x_wt(normed, lm_w)
+
+    def _forward_layer_numpy(
+        self,
+        layer_index: int,
+        hidden_states: Sequence[Sequence[float]],
+        *,
+        past_k: Sequence[Sequence[Sequence[float]]],
+        past_v: Sequence[Sequence[Sequence[float]]],
+    ) -> LayerExecutionOutput:
+        """Contiguous `ndarray`-resident layer realizer avoiding intermediate Python list marshaling."""
+        import numpy as np
+
+        seq_len = len(hidden_states)
+        start_pos = len(past_k)
+        loaded_log: list[str] = []
+        p = f"model.layers.{layer_index}."
+        nq = self.arch.num_attention_heads
+        nkv = self.arch.num_key_value_heads
+        hd = self.arch.head_dim
+        eps = self.arch.rms_norm_eps
+
+        x_nd = self.engine.asarray_f32(hidden_states)  # [seq_len, hidden_size]
+        in_norm_w = self._load_tensor_nd(p + "input_layernorm.weight", loaded_log)
+        normed_x = self.engine.rms_norm_nd(x_nd, in_norm_w, eps)
+
+        q_flat = self.engine.linear_x_wt_nd(normed_x, self._load_tensor_nd(p + "self_attn.q_proj.weight", loaded_log))
+        k_flat = self.engine.linear_x_wt_nd(normed_x, self._load_tensor_nd(p + "self_attn.k_proj.weight", loaded_log))
+        v_flat = self.engine.linear_x_wt_nd(normed_x, self._load_tensor_nd(p + "self_attn.v_proj.weight", loaded_log))
+
+        q_norm_w = self._load_tensor_nd(p + "self_attn.q_norm.weight", loaded_log)
+        k_norm_w = self._load_tensor_nd(p + "self_attn.k_norm.weight", loaded_log)
+
+        q_heads = self.engine.rms_norm_nd(q_flat.reshape(seq_len, nq, hd), q_norm_w, eps)
+        k_heads = self.engine.rms_norm_nd(k_flat.reshape(seq_len, nkv, hd), k_norm_w, eps)
+        v_heads = np.ascontiguousarray(v_flat.reshape(seq_len, nkv, hd), dtype=np.float32)
+
+        q_rot = self.engine.rope_3d_nd(q_heads, start_position=start_pos, rope_theta=self.arch.rope_theta)
+        k_rot = self.engine.rope_3d_nd(k_heads, start_position=start_pos, rope_theta=self.arch.rope_theta)
+
+        if start_pos > 0:
+            past_k_nd = self.engine.asarray_f32(past_k)
+            past_v_nd = self.engine.asarray_f32(past_v)
+            k_full_nd = np.ascontiguousarray(np.concatenate((past_k_nd, k_rot), axis=0), dtype=np.float32)
+            v_full_nd = np.ascontiguousarray(np.concatenate((past_v_nd, v_heads), axis=0), dtype=np.float32)
+        else:
+            k_full_nd = k_rot
+            v_full_nd = v_heads
+
+        attn_concat = self.engine.causal_gqa_nd(q_rot, k_full_nd, v_full_nd, start_position=start_pos)
+        o_proj_w = self._load_tensor_nd(p + "self_attn.o_proj.weight", loaded_log)
+        attn_proj = self.engine.linear_x_wt_nd(attn_concat, o_proj_w)
+        post_attn = np.ascontiguousarray(x_nd + attn_proj, dtype=np.float32)
+
+        post_norm_w = self._load_tensor_nd(p + "post_attention_layernorm.weight", loaded_log)
+        normed_ffn = self.engine.rms_norm_nd(post_attn, post_norm_w, eps)
+
+        moe_receipts: list[MoERoutingReceipt] = []
+        if not self.arch.is_moe:
+            gate = self.engine.linear_x_wt_nd(normed_ffn, self._load_tensor_nd(p + "mlp.gate_proj.weight", loaded_log))
+            up = self.engine.linear_x_wt_nd(normed_ffn, self._load_tensor_nd(p + "mlp.up_proj.weight", loaded_log))
+            act = self.engine.swiglu_nd(gate, up)
+            ffn_out = self.engine.linear_x_wt_nd(act, self._load_tensor_nd(p + "mlp.down_proj.weight", loaded_log))
+        else:
+            router_w = self._load_tensor_nd(p + "mlp.gate.weight", loaded_log)
+            router_logits_nd = self.engine.linear_x_wt_nd(normed_ffn, router_w)
+            router_logits_2d = router_logits_nd.tolist()
+            expert_cache: dict[int, tuple[Any, Any, Any]] = {}
+            ffn_out = np.zeros((seq_len, self.arch.hidden_size), dtype=np.float64)
+            for t_rel in range(seq_len):
+                rec = route_moe_topk(
+                    self.arch,
+                    layer_index=layer_index,
+                    token_position=start_pos + t_rel,
+                    router_logits=router_logits_2d[t_rel],
+                )
+                moe_receipts.append(rec)
+                tok_nd = normed_ffn[t_rel : t_rel + 1]
+                for exp_id, exp_w in zip(rec.selected_experts, rec.normalized_weights):
+                    if exp_id not in expert_cache:
+                        eb = f"{p}mlp.experts.{exp_id}."
+                        expert_cache[exp_id] = (
+                            self._load_tensor_nd(eb + "gate_proj.weight", loaded_log),
+                            self._load_tensor_nd(eb + "up_proj.weight", loaded_log),
+                            self._load_tensor_nd(eb + "down_proj.weight", loaded_log),
+                        )
+                    gw, uw, dw = expert_cache[exp_id]
+                    g_val = self.engine.linear_x_wt_nd(tok_nd, gw)
+                    u_val = self.engine.linear_x_wt_nd(tok_nd, uw)
+                    swi = self.engine.swiglu_nd(g_val, u_val)
+                    e_out = self.engine.linear_x_wt_nd(swi, dw)[0]
+                    ffn_out[t_rel] += float(exp_w) * e_out.astype(np.float64)
+            ffn_out = ffn_out.astype(np.float32)
+
+        final_nd = np.ascontiguousarray(post_attn.astype(np.float64) + ffn_out.astype(np.float64), dtype=np.float64)
+        if not bool(np.isfinite(final_nd).all()):
+            raise RealizerError("Non-finite activation produced during layer realization.")
+
+        return LayerExecutionOutput(
+            hidden_states=[[float(v) for v in row] for row in final_nd.tolist()],
+            k_cache_full=[[[float(v) for v in hv] for hv in tok] for tok in k_full_nd.tolist()],
+            v_cache_full=[[[float(v) for v in hv] for hv in tok] for tok in v_full_nd.tolist()],
+            moe_receipts=tuple(moe_receipts),
+            loaded_tensor_names=tuple(loaded_log),
+        )
 
     def forward_layer(
         self,
@@ -241,6 +366,14 @@ class TransformerLayerRealizer:
         start_pos = len(past_k)
         if start_pos + seq_len > self.arch.max_position_embeddings:
             raise RealizerError("Sequence position exceeds max_position_embeddings.")
+
+        if self.engine.uses_numpy:
+            return self._forward_layer_numpy(
+                layer_index,
+                hidden_states,
+                past_k=past_k,
+                past_v=past_v,
+            )
 
         loaded_log: list[str] = []
         p = f"model.layers.{layer_index}."

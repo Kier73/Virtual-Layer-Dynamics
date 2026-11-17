@@ -1,6 +1,6 @@
 r"""Virtual Layer Dynamics (`vld`) — Consolidated Computational Ground Architecture.
 
-Active consolidated package layers (`v0.2.0`):
+Active consolidated package layers (`v0.3.0` — Phases 0 through 7 Complete):
   - `vld.canonical`: Deterministic JSON & domain-separated SHA-256 addressing
   - `vld.triad`: Kleene $\mathcal{K}_3$ guards, epistemic tags, Myhill-Nerode quotient & erasure bits
   - `vld.ground`: `VirtualGroundSpec`, reversible `ByteLens`, dual-derivation `AffineOrbitLaw` & Pareto costs
@@ -10,13 +10,20 @@ Active consolidated package layers (`v0.2.0`):
   - `vld.memory`: M1 `PagedObjectStore` ($O(L/P)$ range reads), 5-rung `CertifiedLaw` ladder,
     exact 2-adic/$\gcd$ inverse locators, and counterexample-demoting `StructuralMemoryRegistry`
   - `vld.inquiry`: Active perception (`greedy`, `beam`, `minimax` probe planners) & `HypothesisRevisionLedger`
+  - `vld.authority`: Lossless temporal coordinates, scheduler-scoped vector clocks (`G13`), decoupled
+    `EncounterEnvelope` provenance (`G21`), $2q > N$ quorum fencing, M3 CAS sessions & `VirtualProcessor` continuity
+  - `vld.navigation`: Unbounded lazy `NavigableComputationDAG`, Kleene $\mathcal{K}_3$ dynamic guards,
+    interval abstract-interpretation pre-gates, and partition-refinement strong bisimulation
   - `vld.accel`: Sufficient-statistic `StructuralLinearOperator`, `LinearRecurrenceGround`,
-    dual `stdlib`/`numpy` `NumericEngine`, and optional LLVM-compiled Rust CDLL kernels (`vld.accel.native`)
-  - `vld.fabric`: Multi-framing `VantageEnvelope` codec, `StreamPipeVantage`, and RFC 9110 `Range`-enabled
-    `VLDHttpVantageServer` / `VLDHttpVantageClient`
+    contiguous `ndarray`-resident `NumericEngine`, and optional LLVM-compiled Rust CDLL kernels
+  - `vld.fabric`: Multi-framing `VantageEnvelope` codec, `ReplayWindowGuard`, crash-resumable `ReliableChannel`,
+    zero-dependency X.509 v3 mTLS peer mesh, HTTP/HTTPS 206 `Range` vantages, and `G11` terminal-to-terminal forwarding
+  - `vld.substrates`: CoW + Structural-Memory `VirtualPageSpace`, `DeterministicVMKernel`, ELF64 & binary WASM
+    process Ground lifters (`Locate`/`Restore`/`Continue`/`Transform`), SIMT barriers, $O(1)$-delta tensor
+    checkpoints, active Path-Native Grounds with negative controls, and portable computational `ROOM`s
   - `vld.models`: Safetensors Range observer (`HFR`), `ByteLevelBPETokenizerGround`, `Qwen3` dense & sparse MoE
-    realizers, crash-resumable `AutoregressiveModelRunner`, constructive piecewise-affine & FSM neural compilers,
-    Net2Wider morphisms, and `GenerativeWeightGround`
+    realizers, crash-resumable `AutoregressiveModelRunner`, constructive 1D/multivariate ReLU & FSM compilers,
+    Net2Wider/rescaling morphisms, and `GenerativeWeightGround`
   - `vld.agents`: `ProofGround` AND/OR hypergraph, `ReceiverHypervisor`, and `InLayerModelAgent`
 """
 
@@ -65,7 +72,7 @@ from vld.triad import (
     require_determinate_branch,
 )
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = [
     "ActionInformationSummary",

@@ -141,12 +141,29 @@ For a guarded Virtual Layer shortcut $(\sigma, g)$ with pocket-exit probability 
 
 $$\mathbf{C}_{\text{VLD}}(\sigma, g) = \mathbf{C}_{\text{lift}} + \mathbf{C}_g + \mathbf{C}_\sigma + p_{\text{exit}} \cdot \mathbf{C}_{\text{fallback}}$$
 
-### Hash-Chained Journal & Quorum Safety
+### Hash-Chained Journal, Scheduler-Scoped Vector Clocks & Quorum Safety
 Durable processor/session receipts form a domain-separated hash chain anchored at $h_{-1} = 0^{64}$:
 
 $$h_i = H_{\text{vld.journal-event.v1}}(e_i \setminus \{\text{event\_digest}\}), \qquad e_i.\text{prev\_digest} = h_{i-1}$$
 
-Across distributed recovery authorities of fixed membership $N$, conflicting lineage roots in the same `(term, generation)` slot are prevented by strict majority quorums $2q > N \implies \forall Q_1, Q_2,\; |Q_1 \cap Q_2| \ge 1$.
+Every causal coordinate $\tau = (\text{scheduler\_id}, \text{epoch}, V)$ (`vld.authority.TemporalCoordinate`) scopes vector clock $V: \mathcal{P} \to \mathbb{N}_0$ to its scheduler domain; comparing coordinates across $\text{scheduler\_id}_1 \neq \text{scheduler\_id}_2$ without an explicit `ClockBridgeReceipt` raises `CrossSchedulerComparisonError` (`G13`), while raw `EncounterEnvelope` observations remain hash-decoupled from downstream `InterpretationEnvelope` claims (`G21`).
+
+Across distributed recovery authorities $\mathcal{M}$ of fixed membership $N = |\mathcal{M}|$, conflicting lineage roots in the same `(slot, term)` are prevented by strict majority quorums $q_{\min} = \lfloor N/2 \rfloor + 1$:
+
+$$2q_{\min} > N \implies \forall Q_1, Q_2 \subseteq \mathcal{M},\; |Q_1| \ge q_{\min} \land |Q_2| \ge q_{\min} \implies |Q_1 \cap Q_2| \ge 1$$
+
+Combined with atomic pre-quorum write-ahead staging and term fencing $t' = t_{\text{hw}} + 1$, `VirtualProcessor` preserves **exact-once** state evolution across `os._exit` process destruction and host replacement (`G22`).
+
+### Pre-Execution Gates, Substrate Lifting & Path-Native Negative Controls
+1. **Interval Abstract Interpretation & Strong Bisimulation (`vld.navigation`):**
+   - Galois-sound exact rational intervals $[l_v, u_v] \subseteq \mathbb{Q}$ propagate across DAG operators before execution, classifying safety contracts $[L_v, U_v]$ in $\mathcal{K}_3$.
+   - Partition refinement over $\Sigma_1 \sqcup \Sigma_2$ computes coarsest strong bisimulation $\sim_{\text{bisim}}$ and extracts a minimal distinguishing action trace via BFS whenever $s_1 \not\sim_{\text{bisim}} s_2$.
+2. **Direct Terminal-to-Terminal Dataflow (`vld.fabric.forwarding`, `G11`):**
+   For DAG edge $u \to v$ across workers $H_1 \to H_2$, bulk M1 pages stream directly $H_1 \to H_2$ over mutually authenticated X.509 v3 TLS (with exact-offset range resumption on link drop) while commit authority (`WorkerExecutionAssignment` + `HashChainedJournal`) remains strictly at Origin Coordinator $C$.
+3. **Copy-on-Write, $O(1)$ Delta Tensor Checkpoints & Active Path Formation (`vld.substrates`):**
+   - `VirtualPageSpace` unifies $O(1)$-fork Copy-on-Write pages with zero-allocation `StructuralMemoryRegistry` demand pages and transactional ELF64 / WebAssembly 1.0 binary lifters (`Locate`, `Restore`, `Continue`, `Transform`).
+   - `DeltaTensorCheckpointLog` appends single-tile records in $O(B_M B_N)$ bytes independent of total tiles $K_{\text{tiles}}$, eliminating $O(K_{\text{tiles}}^2)$ prefix-copy overhead.
+   - `ActiveHostFormationPipeline` (`observe -> qualify -> construct -> admit -> navigate -> verify`) enforces **mandatory negative controls** ($\Delta N_{\text{origin}} = 0$ for in-path HTTP conditional/Range caches; non-identity transform + witness MAC for transit hops) so stateless pass-through endpoint proxies and noisy channels are deterministically refused.
 
 ---
 
@@ -161,7 +178,7 @@ Virtual Layer Dynamics treats neural networks and Large Language Models as struc
 3. **Constructive & Procedural Weight Synthesis:**
    - *Piecewise-Affine & Multivariate Polyhedral Hinge Compilation:* Continuous 1D piecewise-affine laws and multivariate polyhedral hinge specifications $f: \mathbb{Q}^d \to \mathbb{Q}^m$ compile constructively (zero gradient descent) into exact rational ReLU networks:
      $$f(x) = c + \sum_{i=1}^d A_{:,i}\big(\operatorname{ReLU}(x_i) - \operatorname{ReLU}(-x_i)\big) + \sum_{k=1}^K \gamma_k \operatorname{ReLU}(\langle n_k, x \rangle + \beta_k),$$
-     with standalone whole-domain verification across all non-empty polyhedral chambers $\mathcal{C}_\sigma = \{x \in \mathbb{Q}^d : \forall r,\; \sigma_r(\langle w_r, x \rangle + b_r) > 0\}$ via exact Fourier-Motzkin strict-feasibility witnesses.
+     with standalone whole-domain verification across all non-empty open polyhedral chambers $\mathcal{C}_\sigma = \{x \in \mathbb{Q}^d : \forall r,\; \sigma_r(\langle w_r, x \rangle + b_r) > 0\}$. Using open-polyhedron redundancy elimination ($\mathcal{C} \cap \{h < 0\} = \emptyset \implies \mathcal{C} \subseteq \{h > 0\}$) and $O(|\mathcal{C}|d)$ analytical normal-ray crossing witnesses prior to Fourier-Motzkin fallback, chamber verification scales in $O(|\text{actual chambers}|)$ rather than $O(2^H)$.
    - *Function-Preserving Morphisms (Dyadic Net2Wider, Depth Identity & Rescaling Symmetry):* Duplicating hidden unit $j$ with halved outgoing row $V_{j,:} \mapsto \frac{1}{2} V_{j,:}$, inserting $\operatorname{ReLU}(x) - \operatorname{ReLU}(-x) = x$, and rescaling ReLU units by $(2^{e_j} W_{:,j},\; 2^{-e_j} V_{j,:})$ preserve exact IEEE 754 binary32 semantics (refusing subnormal underflow) while expanding representational geometry.
    - *Generative Weight Recipes:* Tensors may be reconstructed on demand from certified Structural Memory laws, sparse bit deltas, or verified coordinate bijections, all checked against exact per-chunk SHA-256 commitments.
 4. **Models as Capability-Bounded Agents & Advisory Hypervisors:** Models operating inside the Virtual Layer emit typed proposals (`propose_ground`, `select_probe`, `route_frontier`), while deterministic receiver Hypervisors, law certifiers, and independent verifiers enforce capability bounds, mathematical equivalence, and state commits.

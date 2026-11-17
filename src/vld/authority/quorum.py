@@ -1,0 +1,593 @@
+r"""Phase 3 — Strict-Majority ($2q > N$) Quorum Fencing & High-Water Lineage (`vld.authority.quorum`).
+
+Governing equations:
+1. **Strict Majority Quorum Intersection:**
+   Over fixed authority membership $\mathcal{M}$ of size $N = |\mathcal{M}| \ge 1$, the minimum quorum size is
+     $$q_{\min} = \left\lfloor \frac{N}{2} \right\rfloor + 1 \implies 2 q_{\min} > N \implies \forall Q_1, Q_2 \subseteq \mathcal{M},\; |Q_1| \ge q_{\min} \land |Q_2| \ge q_{\min} \implies Q_1 \cap Q_2 \neq \emptyset.$$
+2. **Per-Member Monotonic Term & Single-Vote Invariant:**
+   Each authority member $a \in \mathcal{M}$ persists `(highest_term[lineage], votes[(lineage, slot, term)])`
+   inside an atomic `HashChainedJournal`. Member $a$ refuses any proposal with `term < highest_term[lineage]`
+   (`StaleTermError`) and refuses any conflicting proposal in an already-voted `(lineage, slot, term)`
+   (`QuorumEquivocationError`), preventing split-brain or cloned-credential forks.
+3. **Rollback Detection:**
+   Any valid historical checkpoint at slot $s < s_{\text{high-water}}$ is deterministically rejected by
+   `verify_fresh_checkpoint` (`RollbackDetectedError`).
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+import hashlib
+import hmac
+from pathlib import Path
+import re
+from typing import Any, Mapping, Sequence
+
+from vld.canonical import canonical_bytes, domain_digest
+from vld.journal import GENESIS_PREV_DIGEST, HashChainedJournal
+
+_SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
+
+
+class QuorumError(ValueError):
+    """Base error for quorum membership, proposal validation, or lineage framing."""
+
+
+class StaleTermError(QuorumError):
+    """Raised when a proposal carries a fencing term/epoch below the promised high-water term."""
+
+
+class QuorumEquivocationError(QuorumError):
+    """Raised when a proposer or cloned credential attempts conflicting proposals in the same `(slot, term)`."""
+
+
+class QuorumInsufficientError(QuorumError):
+    """Raised when valid authority votes fail to reach strict majority $2q > N$."""
+
+
+class RollbackDetectedError(QuorumError):
+    """Raised when a presented checkpoint/manifest lags behind or diverges from the quorum high-water mark."""
+
+
+@dataclass(frozen=True, slots=True)
+class QuorumMembership:
+    r"""Fixed authority membership $\mathcal{M}$ with strict-majority threshold $q_{\min} = \lfloor N/2 \rfloor + 1$."""
+
+    lineage_id: str
+    member_ids: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.lineage_id, str) or not self.lineage_id.strip():
+            raise QuorumError("lineage_id must be a non-empty string.")
+        if isinstance(self.member_ids, (str, bytes)):
+            raise QuorumError("member_ids must be a sequence of member identifier strings.")
+        cleaned = tuple(sorted(self.member_ids))
+        if not cleaned or any(not isinstance(m, str) or not m.strip() for m in cleaned):
+            raise QuorumError("QuorumMembership requires at least one non-empty member_id.")
+        if len(set(cleaned)) != len(cleaned):
+            raise QuorumError("QuorumMembership member_ids must be unique.")
+        object.__setattr__(self, "member_ids", cleaned)
+
+    @property
+    def size(self) -> int:
+        return len(self.member_ids)
+
+    @property
+    def quorum_size(self) -> int:
+        return (len(self.member_ids) // 2) + 1
+
+    @property
+    def membership_digest(self) -> str:
+        return domain_digest(
+            "vld.quorum-membership.v1",
+            {"lineage_id": self.lineage_id, "member_ids": list(self.member_ids)},
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "lineage_id": self.lineage_id,
+            "member_ids": list(self.member_ids),
+            "membership_digest": self.membership_digest,
+            "quorum_size": self.quorum_size,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class QuorumProposal:
+    """Candidate lineage slot anchor binding predecessor state digest to successor M1 state manifest."""
+
+    lineage_id: str
+    membership_digest: str
+    slot: int
+    term: int
+    predecessor_manifest_digest: str
+    state_manifest_digest: str
+    proposer_id: str
+    operation_id: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.lineage_id, str) or not self.lineage_id.strip():
+            raise QuorumError("lineage_id must be non-empty.")
+        for name in ("membership_digest", "predecessor_manifest_digest", "state_manifest_digest"):
+            val = getattr(self, name)
+            if not isinstance(val, str) or _SHA256_RE.fullmatch(val) is None:
+                raise QuorumError(f"{name} must be a 64-char lowercase SHA-256 hex digest.")
+        if isinstance(self.slot, bool) or not isinstance(self.slot, int) or self.slot <= 0:
+            raise QuorumError("slot must be a positive integer (>= 1).")
+        if isinstance(self.term, bool) or not isinstance(self.term, int) or self.term <= 0:
+            raise QuorumError("term must be a positive integer (>= 1).")
+        if not isinstance(self.proposer_id, str) or not self.proposer_id.strip():
+            raise QuorumError("proposer_id must be non-empty.")
+        if not isinstance(self.operation_id, str) or not self.operation_id.strip():
+            raise QuorumError("operation_id must be non-empty.")
+
+    def body_dict(self) -> dict[str, Any]:
+        return {
+            "lineage_id": self.lineage_id,
+            "membership_digest": self.membership_digest,
+            "operation_id": self.operation_id,
+            "predecessor_manifest_digest": self.predecessor_manifest_digest,
+            "proposer_id": self.proposer_id,
+            "schema": "vld.quorum-proposal.v1",
+            "slot": self.slot,
+            "state_manifest_digest": self.state_manifest_digest,
+            "term": self.term,
+        }
+
+    @property
+    def proposal_digest(self) -> str:
+        return domain_digest("vld.quorum-proposal.v1", self.body_dict())
+
+    def to_dict(self) -> dict[str, Any]:
+        return {**self.body_dict(), "proposal_digest": self.proposal_digest}
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> QuorumProposal:
+        req = {
+            "lineage_id",
+            "membership_digest",
+            "operation_id",
+            "predecessor_manifest_digest",
+            "proposal_digest",
+            "proposer_id",
+            "schema",
+            "slot",
+            "state_manifest_digest",
+            "term",
+        }
+        if not isinstance(data, Mapping) or set(data.keys()) != req or data["schema"] != "vld.quorum-proposal.v1":
+            raise QuorumError("Invalid QuorumProposal schema.")
+        prop = cls(
+            lineage_id=data["lineage_id"],
+            membership_digest=data["membership_digest"],
+            slot=data["slot"],
+            term=data["term"],
+            predecessor_manifest_digest=data["predecessor_manifest_digest"],
+            state_manifest_digest=data["state_manifest_digest"],
+            proposer_id=data["proposer_id"],
+            operation_id=data["operation_id"],
+        )
+        if prop.proposal_digest != data["proposal_digest"]:
+            raise QuorumError("QuorumProposal digest mismatch.")
+        return prop
+
+
+@dataclass(frozen=True, slots=True)
+class QuorumVote:
+    """Cryptographically authenticated member vote over one `QuorumProposal`."""
+
+    proposal_digest: str
+    lineage_id: str
+    slot: int
+    term: int
+    voter_id: str
+    signature_hmac: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.proposal_digest, str) or _SHA256_RE.fullmatch(self.proposal_digest) is None:
+            raise QuorumError("proposal_digest must be a 64-char SHA-256 hex digest.")
+        if not isinstance(self.signature_hmac, str) or _SHA256_RE.fullmatch(self.signature_hmac) is None:
+            raise QuorumError("signature_hmac must be a 64-char HMAC-SHA256 hex digest.")
+        if not isinstance(self.voter_id, str) or not self.voter_id.strip():
+            raise QuorumError("voter_id must be non-empty.")
+
+    @staticmethod
+    def signing_bytes(proposal_digest: str, lineage_id: str, slot: int, term: int, voter_id: str) -> bytes:
+        return canonical_bytes(
+            {
+                "domain": "vld.quorum-vote.v1",
+                "lineage_id": lineage_id,
+                "proposal_digest": proposal_digest,
+                "slot": slot,
+                "term": term,
+                "voter_id": voter_id,
+            }
+        )
+
+    def verify_signature(self, secret: bytes) -> bool:
+        expected = hmac.new(
+            secret,
+            self.signing_bytes(self.proposal_digest, self.lineage_id, self.slot, self.term, self.voter_id),
+            hashlib.sha256,
+        ).hexdigest()
+        return hmac.compare_digest(self.signature_hmac, expected)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "lineage_id": self.lineage_id,
+            "proposal_digest": self.proposal_digest,
+            "signature_hmac": self.signature_hmac,
+            "slot": self.slot,
+            "term": self.term,
+            "voter_id": self.voter_id,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> QuorumVote:
+        req = {"lineage_id", "proposal_digest", "signature_hmac", "slot", "term", "voter_id"}
+        if not isinstance(data, Mapping) or set(data.keys()) != req:
+            raise QuorumError("Invalid QuorumVote fields.")
+        return cls(
+            proposal_digest=data["proposal_digest"],
+            lineage_id=data["lineage_id"],
+            slot=data["slot"],
+            term=data["term"],
+            voter_id=data["voter_id"],
+            signature_hmac=data["signature_hmac"],
+        )
+
+
+class QuorumAuthorityMember:
+    """Durable quorum voter enforcing monotonic term promises and single-proposal-per-(slot, term) voting."""
+
+    def __init__(
+        self,
+        member_id: str,
+        secret: bytes,
+        *,
+        journal_path: str | Path | None = None,
+    ) -> None:
+        if not isinstance(member_id, str) or not member_id.strip():
+            raise QuorumError("member_id must be non-empty.")
+        if not isinstance(secret, bytes) or len(secret) < 16:
+            raise QuorumError("Authority member secret must be bytes of length >= 16.")
+        self.member_id = member_id
+        self._secret = secret
+        self.journal = HashChainedJournal(journal_path)
+        self._highest_term: dict[str, int] = {}
+        self._votes: dict[tuple[str, int, int], str] = {}
+        self._replay_journal()
+
+    def _replay_journal(self) -> None:
+        self.journal.verify()
+        for rec in self.journal.events:
+            p = rec.payload
+            if rec.operation == "quorum.promise_term":
+                lin = str(p["lineage_id"])
+                self._highest_term[lin] = max(self._highest_term.get(lin, 0), int(p["term"]))
+            elif rec.operation == "quorum.cast_vote":
+                lin = str(p["lineage_id"])
+                slot = int(p["slot"])
+                term = int(p["term"])
+                pdigest = str(p["proposal_digest"])
+                self._highest_term[lin] = max(self._highest_term.get(lin, 0), term)
+                self._votes[(lin, slot, term)] = pdigest
+
+    def highest_term(self, lineage_id: str) -> int:
+        self._replay_journal()
+        return self._highest_term.get(lineage_id, 0)
+
+    def promise_term(self, lineage_id: str, new_term: int) -> int:
+        """Fence off older epochs by advancing `highest_term[lineage_id]` monotonically."""
+        if isinstance(new_term, bool) or not isinstance(new_term, int) or new_term <= 0:
+            raise QuorumError("new_term must be a positive integer.")
+        cur = self.highest_term(lineage_id)
+        if new_term < cur:
+            raise StaleTermError(f"Member {self.member_id!r} refuses stale term {new_term} < promised {cur}.")
+        if new_term > cur:
+            self.journal.record(
+                request_id=f"promise:{lineage_id}:{new_term}",
+                ground_fingerprint=domain_digest("vld.quorum-lineage-id.v1", lineage_id),
+                operation="quorum.promise_term",
+                payload={"lineage_id": lineage_id, "term": new_term},
+                result_fn=lambda: {"promised_term": new_term},
+            )
+            self._highest_term[lineage_id] = new_term
+        return new_term
+
+    def vote(self, proposal: QuorumProposal) -> QuorumVote:
+        """Validate term & equivocation invariants, persist vote to journal, and return signed `QuorumVote`."""
+        cur_term = self.highest_term(proposal.lineage_id)
+        if proposal.term < cur_term:
+            raise StaleTermError(
+                f"Member {self.member_id!r} refuses proposal in stale term {proposal.term} < {cur_term}."
+            )
+        key = (proposal.lineage_id, proposal.slot, proposal.term)
+        prior = self._votes.get(key)
+        if prior is not None and prior != proposal.proposal_digest:
+            raise QuorumEquivocationError(
+                f"Member {self.member_id!r} detected equivocation at {key}: already voted for {prior}, "
+                f"refusing conflicting {proposal.proposal_digest}."
+            )
+
+        if prior is None:
+            self.journal.record(
+                request_id=f"vote:{proposal.lineage_id}:{proposal.slot}:{proposal.term}",
+                ground_fingerprint=proposal.membership_digest,
+                operation="quorum.cast_vote",
+                payload={
+                    "lineage_id": proposal.lineage_id,
+                    "proposal_digest": proposal.proposal_digest,
+                    "slot": proposal.slot,
+                    "term": proposal.term,
+                },
+                result_fn=lambda: {"voted": proposal.proposal_digest},
+            )
+            self._highest_term[proposal.lineage_id] = max(cur_term, proposal.term)
+            self._votes[key] = proposal.proposal_digest
+
+        sig = hmac.new(
+            self._secret,
+            QuorumVote.signing_bytes(
+                proposal.proposal_digest,
+                proposal.lineage_id,
+                proposal.slot,
+                proposal.term,
+                self.member_id,
+            ),
+            hashlib.sha256,
+        ).hexdigest()
+        return QuorumVote(
+            proposal_digest=proposal.proposal_digest,
+            lineage_id=proposal.lineage_id,
+            slot=proposal.slot,
+            term=proposal.term,
+            voter_id=self.member_id,
+            signature_hmac=sig,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class QuorumCommitCertificate:
+    """Strict-majority ($2q > N$) sealed proof for one lineage slot transition."""
+
+    proposal: QuorumProposal
+    membership: QuorumMembership
+    votes: tuple[QuorumVote, ...]
+    certificate_digest: str = ""
+
+    def __post_init__(self) -> None:
+        if self.proposal.lineage_id != self.membership.lineage_id:
+            raise QuorumError("Proposal lineage_id disagrees with QuorumMembership.")
+        if self.proposal.membership_digest != self.membership.membership_digest:
+            raise QuorumError("Proposal membership_digest disagrees with QuorumMembership.")
+        sorted_votes = tuple(sorted(self.votes, key=lambda v: v.voter_id))
+        voter_ids = [v.voter_id for v in sorted_votes]
+        if len(set(voter_ids)) != len(voter_ids):
+            raise QuorumError("Duplicate voter_id in QuorumCommitCertificate.")
+        allowed = set(self.membership.member_ids)
+        for v in sorted_votes:
+            if v.voter_id not in allowed:
+                raise QuorumError(f"Outsider voter {v.voter_id!r} not in QuorumMembership.")
+            if (
+                v.proposal_digest != self.proposal.proposal_digest
+                or v.lineage_id != self.proposal.lineage_id
+                or v.slot != self.proposal.slot
+                or v.term != self.proposal.term
+            ):
+                raise QuorumError("Vote coordinates disagree with QuorumProposal.")
+        if len(sorted_votes) < self.membership.quorum_size:
+            raise QuorumInsufficientError(
+                f"Insufficient votes ({len(sorted_votes)} < quorum_size {self.membership.quorum_size} for N={self.membership.size})."
+            )
+        object.__setattr__(self, "votes", sorted_votes)
+        computed = domain_digest("vld.quorum-certificate.v1", self._body())
+        if self.certificate_digest and self.certificate_digest != computed:
+            raise QuorumError("QuorumCommitCertificate digest mismatch.")
+        object.__setattr__(self, "certificate_digest", computed)
+
+    def _body(self) -> dict[str, Any]:
+        return {
+            "membership": self.membership.to_dict(),
+            "proposal": self.proposal.to_dict(),
+            "schema": "vld.quorum-certificate.v1",
+            "votes": [v.to_dict() for v in self.votes],
+        }
+
+    def verify_signatures(self, member_secrets: Mapping[str, bytes]) -> bool:
+        valid = 0
+        for v in self.votes:
+            sec = member_secrets.get(v.voter_id)
+            if sec is not None and v.verify_signature(sec):
+                valid += 1
+        return valid >= self.membership.quorum_size
+
+    def to_dict(self) -> dict[str, Any]:
+        return {**self._body(), "certificate_digest": self.certificate_digest}
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> QuorumCommitCertificate:
+        req = {"certificate_digest", "membership", "proposal", "schema", "votes"}
+        if not isinstance(data, Mapping) or set(data.keys()) != req or data["schema"] != "vld.quorum-certificate.v1":
+            raise QuorumError("Invalid QuorumCommitCertificate payload.")
+        m_raw = data["membership"]
+        membership = QuorumMembership(lineage_id=m_raw["lineage_id"], member_ids=tuple(m_raw["member_ids"]))
+        proposal = QuorumProposal.from_dict(data["proposal"])
+        votes = tuple(QuorumVote.from_dict(v) for v in data["votes"])
+        return cls(
+            proposal=proposal,
+            membership=membership,
+            votes=votes,
+            certificate_digest=data["certificate_digest"],
+        )
+
+
+class QuorumLineageCoordinator:
+    """Coordinates $2q > N$ slot commits and maintains the durable high-water lineage chain."""
+
+    def __init__(
+        self,
+        membership: QuorumMembership,
+        members: Sequence[QuorumAuthorityMember],
+        member_secrets: Mapping[str, bytes],
+        *,
+        ledger_path: str | Path | None = None,
+    ) -> None:
+        self.membership = membership
+        self._members = {m.member_id: m for m in members}
+        self._secrets = dict(member_secrets)
+        self.ledger = HashChainedJournal(ledger_path)
+        self._sealed_by_slot: dict[int, QuorumCommitCertificate] = {}
+        self._sync_from_ledger()
+
+    def _sync_from_ledger(self) -> None:
+        self.ledger.verify()
+        for rec in self.ledger.events:
+            if rec.operation == "quorum.seal_slot":
+                cert = QuorumCommitCertificate.from_dict(rec.result["certificate"])
+                if not cert.verify_signatures(self._secrets):
+                    raise QuorumError("Persisted quorum certificate failed signature verification.")
+                self._sealed_by_slot[cert.proposal.slot] = cert
+
+    @property
+    def high_water_slot(self) -> int:
+        self._sync_from_ledger()
+        return max(self._sealed_by_slot.keys(), default=0)
+
+    @property
+    def high_water_certificate(self) -> QuorumCommitCertificate | None:
+        hw = self.high_water_slot
+        return self._sealed_by_slot.get(hw) if hw > 0 else None
+
+    def certificate_at(self, slot: int) -> QuorumCommitCertificate | None:
+        self._sync_from_ledger()
+        return self._sealed_by_slot.get(slot)
+
+    def fence_term(self, new_term: int, *, active_member_ids: Sequence[str] | None = None) -> int:
+        """Broadcast term promise across reachable members and require strict majority $2q > N$."""
+        targets = tuple(self._members.keys()) if active_member_ids is None else tuple(active_member_ids)
+        promised = 0
+        last_err: Exception | None = None
+        for mid in targets:
+            member = self._members.get(mid)
+            if member is None:
+                continue
+            try:
+                member.promise_term(self.membership.lineage_id, new_term)
+                promised += 1
+            except QuorumError as exc:
+                last_err = exc
+                if isinstance(exc, StaleTermError):
+                    raise
+        if promised < self.membership.quorum_size:
+            raise QuorumInsufficientError(
+                f"Failed to fence term {new_term}: only {promised}/{self.membership.size} members promised "
+                f"(need {self.membership.quorum_size}). Last error: {last_err}"
+            )
+        return new_term
+
+    def propose_and_seal(
+        self,
+        *,
+        slot: int,
+        term: int,
+        predecessor_manifest_digest: str,
+        state_manifest_digest: str,
+        proposer_id: str,
+        operation_id: str,
+        active_member_ids: Sequence[str] | None = None,
+    ) -> QuorumCommitCertificate:
+        """Collect $2q > N$ votes for `slot`, enforce predecessor continuity, and seal `QuorumCommitCertificate`."""
+        self._sync_from_ledger()
+        existing = self._sealed_by_slot.get(slot)
+        proposal = QuorumProposal(
+            lineage_id=self.membership.lineage_id,
+            membership_digest=self.membership.membership_digest,
+            slot=slot,
+            term=term,
+            predecessor_manifest_digest=predecessor_manifest_digest,
+            state_manifest_digest=state_manifest_digest,
+            proposer_id=proposer_id,
+            operation_id=operation_id,
+        )
+        if existing is not None:
+            if (
+                existing.proposal.state_manifest_digest == state_manifest_digest
+                and existing.proposal.operation_id == operation_id
+                and existing.proposal.predecessor_manifest_digest == predecessor_manifest_digest
+            ):
+                return existing
+            raise QuorumEquivocationError(
+                f"Slot {slot} already quorum-sealed with manifest {existing.proposal.state_manifest_digest}."
+            )
+
+        hw = self.high_water_slot
+        if slot != hw + 1:
+            raise QuorumError(f"Lineage slot must advance contiguously: expected {hw + 1}, got {slot}.")
+        expected_pred = (
+            GENESIS_PREV_DIGEST
+            if hw == 0
+            else self._sealed_by_slot[hw].proposal.state_manifest_digest
+        )
+        if predecessor_manifest_digest != expected_pred:
+            raise RollbackDetectedError(
+                f"Predecessor manifest digest {predecessor_manifest_digest} != high-water {expected_pred}."
+            )
+
+        targets = tuple(self._members.keys()) if active_member_ids is None else tuple(active_member_ids)
+        votes: list[QuorumVote] = []
+        for mid in targets:
+            member = self._members.get(mid)
+            if member is None:
+                continue
+            v = member.vote(proposal)
+            sec = self._secrets.get(mid)
+            if sec is None or not v.verify_signature(sec):
+                raise QuorumError(f"Invalid signature returned by member {mid!r}.")
+            votes.append(v)
+
+        cert = QuorumCommitCertificate(proposal=proposal, membership=self.membership, votes=tuple(votes))
+        if not cert.verify_signatures(self._secrets):
+            raise QuorumError("Sealed QuorumCommitCertificate failed independent signature verification.")
+
+        self.ledger.record(
+            request_id=f"seal:{self.membership.lineage_id}:{slot}",
+            ground_fingerprint=self.membership.membership_digest,
+            operation="quorum.seal_slot",
+            payload={"proposal_digest": proposal.proposal_digest, "slot": slot, "term": term},
+            result_fn=lambda: {"certificate": cert.to_dict()},
+        )
+        self._sealed_by_slot[slot] = cert
+        return cert
+
+    def verify_fresh_checkpoint(self, *, slot: int, state_manifest_digest: str) -> QuorumCommitCertificate:
+        """Verify that `(slot, state_manifest_digest)` matches the latest quorum high-water mark (defeating rollback)."""
+        hw_cert = self.high_water_certificate
+        if hw_cert is None:
+            raise RollbackDetectedError("No quorum lineage has been initialized yet.")
+        if slot < hw_cert.proposal.slot:
+            raise RollbackDetectedError(
+                f"Rollback detected: checkpoint at slot {slot} is stale behind high-water slot {hw_cert.proposal.slot}."
+            )
+        if slot > hw_cert.proposal.slot:
+            raise RollbackDetectedError(
+                f"Unanchored future checkpoint at slot {slot} > high-water slot {hw_cert.proposal.slot}."
+            )
+        if state_manifest_digest != hw_cert.proposal.state_manifest_digest:
+            raise RollbackDetectedError("Checkpoint state_manifest_digest disagrees with quorum high-water mark.")
+        return hw_cert
+
+
+__all__ = [
+    "QuorumAuthorityMember",
+    "QuorumCommitCertificate",
+    "QuorumEquivocationError",
+    "QuorumError",
+    "QuorumInsufficientError",
+    "QuorumLineageCoordinator",
+    "QuorumMembership",
+    "QuorumProposal",
+    "QuorumVote",
+    "RollbackDetectedError",
+    "StaleTermError",
+]

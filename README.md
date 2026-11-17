@@ -45,7 +45,7 @@ For an $n$-step trajectory or $M \times N$ operator evaluation, Virtual Layer Dy
 
 ---
 
-## Consolidated Repository Layout (`v0.2.0`)
+## Consolidated Repository Layout (`v0.3.0` — Phases 0 through 7 Complete)
 
 ```text
 Virtual-Layer-Dynamics/
@@ -63,12 +63,15 @@ Virtual-Layer-Dynamics/
 │   ├── signal/                     # Signal8, ModularRing & ExactRational backends, footprints, base-8 compiler
 │   ├── memory/                     # M1 PagedObjectStore, 5-rung Law Certifier, 2-adic inverses, demotion
 │   ├── inquiry/                    # Greedy, beam & exact minimax probe planners + HypothesisRevisionLedger
-│   ├── accel/                      # StructuralLinearOperator, LinearRecurrenceGround, NumPy + Rust CDLL
-│   ├── fabric/                     # Multi-framing VantageEnvelope codec, StreamPipe & HTTP Range Vantage
+│   ├── authority/                  # Scheduler-scoped clocks (G13), 2q>N quorum M3 sessions & VirtualProcessor
+│   ├── navigation/                 # Unbounded lazy NavigableComputationDAG, interval & bisimulation pre-gates
+│   ├── accel/                      # StructuralLinearOperator, LinearRecurrenceGround, ndarray NumPy + Rust CDLL
+│   ├── fabric/                     # VantageEnvelope, ReplayWindowGuard, ReliableChannel, mTLS & G11 forwarding
+│   ├── substrates/                 # CoW + Structural VM pages, ELF64/WASM lifters, O(1) delta log, Path Grounds & ROOM
 │   ├── models/                     # Safetensors HFR, BPE Tokenizer, Qwen3 dense/MoE, orbit recovery, SNC/PNF
 │   ├── agents/                     # ProofGround AND/OR hypergraph, ReceiverHypervisor & InLayerModelAgent
 │   └── cli.py                      # `vld` CLI (`info`, `verify`, `navigate`, `benchmark`, `serve`)
-└── tests/                          # 50+ invariant, differential, crash-recovery & hygiene tests
+└── tests/                          # 70+ invariant, differential, mTLS, crash-recovery & hygiene tests
 ```
 
 ---

@@ -1,7 +1,38 @@
-r"""Internet & Information-Flow Vantage Infrastructure (`vld.fabric`)."""
+r"""Internet, Mutual-TLS, Reliable Channel & Terminal-Forwarding Fabric (`vld.fabric`)."""
 
 from __future__ import annotations
 
+from vld.fabric.forwarding import (
+    ForwardingCoordinator,
+    ForwardingError,
+    ForwardingWorkerNode,
+    M1ForwardingTicket,
+    UnauthorizedCommitError,
+    WorkerCompletionReceipt,
+    WorkerExecutionAssignment,
+)
+from vld.fabric.mtls import (
+    DEFAULT_STREAM_CHUNK_BYTES,
+    MAX_CONTROL_FRAME_BYTES,
+    MTLSPeerClient,
+    MTLSPeerServer,
+    MutualTLSError,
+    PeerIdentityBundle,
+    create_mtls_client_context,
+    create_mtls_server_context,
+    generate_ephemeral_mtls_pki,
+)
+from vld.fabric.reliability import (
+    LossyInMemoryLink,
+    ReliabilityPolicy,
+    ReliableChannel,
+    ReliableChannelConflictError,
+    ReliableChannelError,
+    ReliableChannelWouldBlock,
+    ReplayRejectedError,
+    ReplayWindowGuard,
+    WireFrame,
+)
 from vld.fabric.vantage import (
     InformationFlowCodec,
     StreamPipeVantage,
@@ -15,8 +46,27 @@ from vld.fabric.vantage import (
 )
 
 __all__ = [
+    "DEFAULT_STREAM_CHUNK_BYTES",
+    "ForwardingCoordinator",
+    "ForwardingError",
+    "ForwardingWorkerNode",
     "InformationFlowCodec",
+    "LossyInMemoryLink",
+    "M1ForwardingTicket",
+    "MAX_CONTROL_FRAME_BYTES",
+    "MTLSPeerClient",
+    "MTLSPeerServer",
+    "MutualTLSError",
+    "PeerIdentityBundle",
+    "ReliabilityPolicy",
+    "ReliableChannel",
+    "ReliableChannelConflictError",
+    "ReliableChannelError",
+    "ReliableChannelWouldBlock",
+    "ReplayRejectedError",
+    "ReplayWindowGuard",
     "StreamPipeVantage",
+    "UnauthorizedCommitError",
     "VLDHttpVantageClient",
     "VLDHttpVantageServer",
     "VLDVantageNode",
@@ -24,4 +74,10 @@ __all__ = [
     "VantageEnvelope",
     "VantageError",
     "WireEncoding",
+    "WireFrame",
+    "WorkerCompletionReceipt",
+    "WorkerExecutionAssignment",
+    "create_mtls_client_context",
+    "create_mtls_server_context",
+    "generate_ephemeral_mtls_pki",
 ]

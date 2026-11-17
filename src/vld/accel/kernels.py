@@ -103,6 +103,30 @@ def decode_f16_le(raw: bytes, *, use_numpy: bool | None = None) -> list[float]:
     return vals
 
 
+def decode_tensor_ndarray(raw: bytes, dtype: str, shape: tuple[int, ...]) -> Any:
+    """Decode raw BF16/F16/F32 bytes directly into a contiguous C-order float32 `numpy.ndarray`."""
+    if _np is None:
+        raise RuntimeError("decode_tensor_ndarray requires numpy.")
+    expected = math.prod(shape)
+    if dtype == "BF16":
+        if len(raw) != expected * 2:
+            raise ValueError(f"Expected {expected * 2} BF16 bytes for shape {shape}, got {len(raw)}.")
+        arr = (_np.frombuffer(raw, dtype="<u2").astype("<u4") << 16).view("<f4")
+    elif dtype == "F16":
+        if len(raw) != expected * 2:
+            raise ValueError(f"Expected {expected * 2} F16 bytes for shape {shape}, got {len(raw)}.")
+        arr = _np.frombuffer(raw, dtype="<f2").astype("<f4")
+    elif dtype == "F32":
+        if len(raw) != expected * 4:
+            raise ValueError(f"Expected {expected * 4} F32 bytes for shape {shape}, got {len(raw)}.")
+        arr = _np.frombuffer(raw, dtype="<f4").copy()
+    else:
+        raise ValueError(f"Unsupported numerical tensor dtype {dtype!r}.")
+    if not bool(_np.isfinite(arr).all()):
+        raise ValueError(f"Decoded {dtype} tensor contains non-finite values.")
+    return _np.ascontiguousarray(arr.reshape(shape), dtype=_np.float32)
+
+
 class NumericEngine:
     """Selectable numeric execution engine (`auto`, `numpy`, or `stdlib`)."""
 
@@ -113,6 +137,79 @@ class NumericEngine:
             raise RuntimeError("NumericEngine(mode='numpy') requested, but numpy is not installed.")
         self.mode = mode
         self.uses_numpy = (_np is not None) and (mode in ("auto", "numpy"))
+
+    def asarray_f32(self, values: Any) -> Any:
+        """Convert nested float sequences or array-likes into a contiguous float32 `ndarray`."""
+        if _np is None:
+            raise RuntimeError("asarray_f32 requires numpy.")
+        return _np.ascontiguousarray(values, dtype=_np.float32)
+
+    def linear_x_wt_nd(self, x_nd: Any, weight_out_in_nd: Any) -> Any:
+        r"""Contiguous `ndarray`-resident $Y = X W^\top$ without Python list marshaling."""
+        assert _np is not None
+        return _np.ascontiguousarray(x_nd @ weight_out_in_nd.T, dtype=_np.float32)
+
+    def rms_norm_nd(self, x_nd: Any, weight_nd: Any, eps: float) -> Any:
+        r"""Contiguous `ndarray`-resident row/last-axis RMSNorm across arbitrary leading rank."""
+        assert _np is not None
+        inv_rms = _np.reciprocal(_np.sqrt(_np.mean(x_nd * x_nd, axis=-1, keepdims=True) + _np.float32(eps)))
+        return _np.ascontiguousarray((x_nd * inv_rms) * weight_nd, dtype=_np.float32)
+
+    def rope_3d_nd(self, heads_3d_nd: Any, *, start_position: int, rope_theta: float) -> Any:
+        r"""Vectorized `ndarray`-resident Rotary Position Embedding over `[seq_len, n_heads, head_dim]`."""
+        assert _np is not None
+        seq_len, _, head_dim = heads_3d_nd.shape
+        if seq_len == 0:
+            return heads_3d_nd.copy()
+        half = head_dim // 2
+        inv_freq = rope_theta ** (-2.0 * _np.arange(half, dtype=_np.float64) / float(head_dim))
+        positions = (_np.arange(seq_len, dtype=_np.float64) + float(start_position))[:, None]
+        angles = positions * inv_freq[None, :]  # [seq_len, half]
+        cos_a = _np.cos(angles)[:, None, :].astype(_np.float32)
+        sin_a = _np.sin(angles)[:, None, :].astype(_np.float32)
+        first = heads_3d_nd[:, :, :half]
+        second = heads_3d_nd[:, :, half:]
+        rot_first = first * cos_a - second * sin_a
+        rot_second = second * cos_a + first * sin_a
+        return _np.ascontiguousarray(_np.concatenate((rot_first, rot_second), axis=-1), dtype=_np.float32)
+
+    def causal_gqa_nd(
+        self,
+        q_rot_nd: Any,
+        k_full_nd: Any,
+        v_full_nd: Any,
+        *,
+        start_position: int,
+    ) -> Any:
+        r"""Contiguous `ndarray`-resident Causal Grouped-Query Attention returning `[seq_len, n_heads * head_dim]`."""
+        assert _np is not None
+        seq_len, nq, hd = q_rot_nd.shape
+        total_seq, nkv, _ = k_full_nd.shape
+        group_size = nq // nkv
+        # Expand KV heads to match Q heads via zero-copy repeat view where possible: [total_seq, nq, hd]
+        k_exp = _np.repeat(k_full_nd, group_size, axis=1).astype(_np.float64)
+        v_exp = _np.repeat(v_full_nd, group_size, axis=1).astype(_np.float64)
+        q64 = q_rot_nd.astype(_np.float64)
+        inv_sqrt_d = 1.0 / math.sqrt(float(hd))
+
+        # Scores: [nq, seq_len, total_seq]
+        scores = _np.einsum("tqd,sqd->qts", q64, k_exp) * inv_sqrt_d
+        q_pos = (_np.arange(seq_len) + start_position)[:, None]
+        k_pos = _np.arange(total_seq)[None, :]
+        causal_mask = k_pos <= q_pos  # [seq_len, total_seq]
+        masked_scores = _np.where(causal_mask[None, :, :], scores, -_np.inf)
+        shifted = _np.exp(masked_scores - _np.max(masked_scores, axis=-1, keepdims=True))
+        probs = shifted / _np.sum(shifted, axis=-1, keepdims=True)  # [nq, seq_len, total_seq]
+        ctx = _np.einsum("qts,sqd->tqd", probs, v_exp)  # [seq_len, nq, hd]
+        return _np.ascontiguousarray(ctx.reshape(seq_len, nq * hd), dtype=_np.float32)
+
+    def swiglu_nd(self, gate_nd: Any, up_nd: Any) -> Any:
+        r"""Contiguous `ndarray`-resident $\operatorname{SiLU}(\text{gate}) \odot \text{up}$."""
+        assert _np is not None
+        g64 = gate_nd.astype(_np.float64)
+        sig = _np.where(g64 >= 0.0, 1.0 / (1.0 + _np.exp(-g64)), _np.exp(g64) / (1.0 + _np.exp(g64)))
+        ya = (g64 * sig).astype(_np.float32) * up_nd
+        return _np.ascontiguousarray(ya, dtype=_np.float32)
 
     def linear_x_wt(self, x: Sequence[Sequence[float]], weight_out_in: Sequence[Sequence[float]]) -> list[list[float]]:
         r"""Compute $Y = X W^\top$ where $X \in \mathbb{R}^{S \times D_{\text{in}}}$ and $W \in \mathbb{R}^{D_{\text{out}} \times D_{\text{in}}}$."""
