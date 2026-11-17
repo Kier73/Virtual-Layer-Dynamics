@@ -1,0 +1,121 @@
+"""Unit and mathematical invariant tests for vld.triad."""
+
+from __future__ import annotations
+
+import math
+import pytest
+
+from vld.triad import (
+    IncompleteGroundError,
+    IndeterminateGuardTrap,
+    TransitionClass,
+    TruthDisposition,
+    analyze_finite_ground,
+    evaluate_interval_guard,
+    require_determinate_branch,
+)
+
+
+def test_kleene_k3_truth_tables() -> None:
+    T, F, I = TruthDisposition.TRUE, TruthDisposition.FALSE, TruthDisposition.INDETERMINATE
+    assert (~T, ~F, ~I) == (F, T, I)
+    assert (F & I) is F
+    assert (T & I) is I
+    assert (T | I) is T
+    assert (F | I) is I
+    assert (I & I) is I
+    assert (I | I) is I
+
+
+def test_interval_guard_boundaries_and_validation() -> None:
+    # Exact boundary U == tau is TRUE
+    assert evaluate_interval_guard(0.15, 0.05, 0.20) is TruthDisposition.TRUE
+    # L == tau means [tau, U] touches tau -> INDETERMINATE (strict > required for FALSE)
+    assert evaluate_interval_guard(0.25, 0.05, 0.20) is TruthDisposition.INDETERMINATE
+    # Strictly outside: L = 0.21 > 0.20 -> FALSE
+    assert evaluate_interval_guard(0.26, 0.05, 0.20) is TruthDisposition.FALSE
+
+    assert require_determinate_branch(TruthDisposition.TRUE) is True
+    assert require_determinate_branch(TruthDisposition.FALSE) is False
+    with pytest.raises(IndeterminateGuardTrap):
+        require_determinate_branch(TruthDisposition.INDETERMINATE, context="unit-test")
+
+    with pytest.raises(ValueError):
+        evaluate_interval_guard(-0.1, 0.0, 0.1)
+    with pytest.raises(ValueError):
+        evaluate_interval_guard(4.0, 0.0, 0.1)
+    with pytest.raises(ValueError):
+        evaluate_interval_guard(0.1, math.nan, 0.1)
+
+
+def test_asymmetric_contraction_erasure_and_multi_step_quotient() -> None:
+    # 4 states: s0, s1, s2 map to s0 under 'contract'; s3 maps to s3.
+    # Under 'shift': s0->s1->s2->s3->s0 (bijection).
+    # Immediate observer only sees s3 vs {s0, s1, s2}, so multi-step refinement must split s0, s1, s2!
+    states = ("s0", "s1", "s2", "s3")
+    actions = ("shift", "contract")
+    transitions = {
+        ("s0", "shift"): ("s1",),
+        ("s1", "shift"): ("s2",),
+        ("s2", "shift"): ("s3",),
+        ("s3", "shift"): ("s0",),
+        ("s0", "contract"): ("s0",),
+        ("s1", "contract"): ("s0",),
+        ("s2", "contract"): ("s0",),
+        ("s3", "contract"): ("s3",),
+    }
+    observer = {"s0": "low", "s1": "low", "s2": "low", "s3": "high"}
+    report = analyze_finite_ground(states, actions, transitions, observer, initial_states=("s0",))
+
+    assert report.reachable_count == 4
+    # Because shift^3(s0)=s3, shift^2(s1)=s3, shift^1(s2)=s3, all 4 states are distinguishable!
+    assert report.quotient_class_count == 4
+    assert math.isclose(report.compression_ratio, 1.0)
+
+    # Shift is bijective -> 0 bits erased
+    assert math.isclose(report.action_summaries["shift"].erasure_bits, 0.0)
+    # Contract has preimages of size 3 (for s0) and size 1 (for s3): (3/4)*log2(3) + (1/4)*log2(1)
+    expected_erasure = 0.75 * math.log2(3.0)
+    assert math.isclose(report.action_summaries["contract"].erasure_bits, expected_erasure, rel_tol=1e-12)
+    assert report.cell_classes[("s0", "contract")] is TransitionClass.PREDICTABLE_CONTRACTING
+    assert report.cell_classes[("s3", "contract")] is TransitionClass.PREDICTABLE_PRESERVING
+
+
+def test_unreachable_states_unknown_ambiguous_and_external_couplings() -> None:
+    states = ("a", "b", "island")
+    actions = ("step", "sense")
+    transitions = {
+        ("a", "step"): ("b",),
+        ("b", "step"): ("a", "b"),  # ambiguous!
+        # ("island", "step") omitted -> UNKNOWN!
+        ("a", "sense"): ("a", "b"),
+        ("b", "sense"): ("b",),
+        ("island", "sense"): ("island",),
+    }
+    observer = {"a": "0", "b": "1", "island": "0"}
+    report = analyze_finite_ground(
+        states,
+        actions,
+        transitions,
+        observer,
+        initial_states=("a",),
+        external_couplings=(("a", "sense"),),
+    )
+
+    assert report.reachable_count == 2
+    assert report.cell_classes[("b", "step")] is TransitionClass.AMBIGUOUS
+    assert report.cell_classes[("island", "step")] is TransitionClass.UNKNOWN
+    assert report.cell_classes[("a", "sense")] is TransitionClass.INFORMATION_PRODUCING
+    assert not report.is_executable_deterministic
+
+    with pytest.raises(IncompleteGroundError):
+        report.require_executable_deterministic()
+
+
+def test_analyze_finite_ground_input_validation() -> None:
+    with pytest.raises(ValueError, match="at least one state"):
+        analyze_finite_ground((), ("a",), {}, {})
+    with pytest.raises(ValueError, match="at least one action"):
+        analyze_finite_ground(("s0",), (), {}, {"s0": "o"})
+    with pytest.raises(ValueError, match="Observer projection missing"):
+        analyze_finite_ground(("s0",), ("a",), {}, {})

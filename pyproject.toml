@@ -1,0 +1,80 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "virtual-layer-dynamics"
+version = "0.1.0"
+description = "Consolidated computational state-space architecture for lifting bytes, hosts, communication paths, and neural systems into navigable, verified Virtual Grounds."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [
+  { name = "Kier73", email = "Kier73research@gmail.com" },
+]
+keywords = [
+  "virtual-layer-dynamics",
+  "computational-ground",
+  "state-space-navigation",
+  "structural-memory",
+  "virtual-processor",
+  "signal-execution",
+  "information-theory",
+  "procedural-neural-models",
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Science/Research",
+  "Intended Audience :: Developers",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  "Topic :: System :: Distributed Computing",
+  "Topic :: System :: Emulators",
+  "Typing :: Typed",
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+  "build>=1.0",
+]
+numerics = [
+  "numpy>=1.26",
+]
+crypto = [
+  "cryptography>=43.0,<47.0",
+]
+models = [
+  "numpy>=1.26",
+  "safetensors>=0.4",
+  "tokenizers>=0.20",
+]
+
+[project.urls]
+Homepage = "https://github.com/Kier73/Virtual-Layer-Dynamics"
+Repository = "https://github.com/Kier73/Virtual-Layer-Dynamics"
+Issues = "https://github.com/Kier73/Virtual-Layer-Dynamics/issues"
+
+[project.scripts]
+vld = "vld.cli:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["vld*"]
+
+[tool.setuptools.package-data]
+vld = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = ["-ra", "--strict-markers", "-W", "error::SyntaxWarning"]
