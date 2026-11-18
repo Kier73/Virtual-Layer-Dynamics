@@ -25,11 +25,13 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from fractions import Fraction
 import hashlib
-import json
 import math
+import os
 from pathlib import Path
+import threading
 import time
 from typing import Any, Callable, Mapping, Sequence
+import urllib.error
 import urllib.request
 
 from vld.agents.hypervisor import (
@@ -54,6 +56,7 @@ from vld.continuous import (
     build_compact_deepseek_v41_fixture,
     build_compact_glm53_fixture,
 )
+from vld.fabric.mtls import MTLSPeerClient, MutualTLSError
 from vld.ground import NavigationCostVector, VirtualGroundSpec
 from vld.journal import GENESIS_PREV_DIGEST, HashChainedJournal
 from vld.memory import DiskPageBacking, InMemoryPageBacking, PagedObjectStore
@@ -261,6 +264,7 @@ class InLayerMetaArbitratorModel:
                 task_id=f"{task.task_id}.c{cycle_index}.w{s_idx}",
                 arbitration_depth=self.arbitration_depth,
                 cost=Fraction(1),
+                idempotent=True,
             )
             authorizations.append(auth)
             out_rep = f"model_out_{worker.model_family}_{s_idx}"
@@ -311,6 +315,7 @@ class InLayerMetaArbitratorModel:
             active_quorum_members=active_quorum_members,
             journal=journal,
             require_independent_verifier=True,
+            reverify_recovered_stages=True,
         )
         init_input = {
             "arbitrator_id": self.agent_id,
@@ -643,13 +648,20 @@ def build_external_http_endpoint_worker(
                 }
             )
         req = urllib.request.Request(endpoint_url, data=body, headers=headers, method="POST")
-        with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
-            raw = resp.read()
-        doc = json.loads(raw.decode("utf-8"))
-        text = str(
-            doc.get("response")
-            or doc.get("choices", [{}])[0].get("message", {}).get("content", "")
-        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+                raw = resp.read()
+        except (urllib.error.URLError, OSError) as exc:
+            raise ArbitrationError(f"External HTTP model endpoint {endpoint_url!r} failed: {exc}") from exc
+        doc = parse_strict_json(raw)
+        if not isinstance(doc, Mapping):
+            raise ArbitrationError("External HTTP model endpoint returned non-object JSON.")
+        choices = doc.get("choices")
+        first_choice = choices[0] if isinstance(choices, list) and len(choices) > 0 and isinstance(choices[0], Mapping) else {}
+        msg_obj = first_choice.get("message") if isinstance(first_choice.get("message"), Mapping) else {}
+        text = str(doc.get("response") or msg_obj.get("content") or "")
+        if not text:
+            raise ArbitrationError(f"External HTTP model endpoint {endpoint_url!r} returned empty completion.")
         return (
             {
                 "model_name": model_name,
@@ -673,6 +685,84 @@ def build_external_http_endpoint_worker(
         capabilities=frozenset(capabilities),
         sparsity_gain=Fraction(1, 2),
         normalized_byte_cost=Fraction(1, 4),
+        health=Fraction(1),
+        ground_spec=spec,
+        run_fn=_run,
+        verify_fn=_ver,
+    )
+
+
+def build_mtls_fabric_worker(
+    worker_id: str,
+    *,
+    mtls_client: MTLSPeerClient,
+    target_store: PagedObjectStore,
+    model_family: str = "mtls_fabric_model",
+    capabilities: Sequence[str] = ("mtls_fabric", "frontier_reasoning"),
+    independent_verifier_fn: Callable[[ExplorationTaskSpec, Mapping[str, Any]], tuple[bool, str]] | None = None,
+) -> ArbitratedModelWorker:
+    """Connect a remote X.509 v3 mutually-authenticated TLS VLD peer (`MTLSPeerServer`) as an arbitrated worker."""
+    spec = VirtualGroundSpec(
+        worker_id,
+        "1.0",
+        model_family,
+        "mtls_control+m1_range_stream",
+        ("invoke_control", "fetch_m1_object_resumable"),
+        ("m1_sha256_manifest",),
+        ("remote_result",),
+    )
+
+    def _run(task: ExplorationTaskSpec, _st: Mapping[str, Any]) -> tuple[dict[str, Any], NavigationCostVector]:
+        try:
+            ctrl_resp = mtls_client.invoke_control(
+                {
+                    "op": "execute_arbitrated_model",
+                    "prompt_text": task.prompt_text,
+                    "prompt_tokens": list(task.prompt_tokens),
+                    "task_id": task.task_id,
+                }
+            )
+            manifest_dg = str(ctrl_resp["result_manifest_digest"])
+            manifest, reconnects = mtls_client.fetch_m1_object_resumable(manifest_dg, target_store)
+            result_doc = parse_strict_json(target_store.read_bytes(manifest))
+            if not isinstance(result_doc, Mapping):
+                raise ArbitrationError("Remote mTLS worker M1 payload must be a JSON object.")
+        except (MutualTLSError, KeyError, ValueError) as exc:
+            raise ArbitrationError(f"mTLS fabric worker {worker_id!r} failed: {exc}") from exc
+        return (
+            {
+                "m1_manifest_digest": manifest.manifest_digest,
+                "m1_size_bytes": manifest.size_bytes,
+                "peer_dns": mtls_client.expected_server_dns,
+                "reconnects": reconnects,
+                "remote_result": dict(result_doc),
+            },
+            NavigationCostVector(1.5, float(max(1, manifest.size_bytes)), float(manifest.size_bytes), 4.0),
+        )
+
+    def _ver(task: ExplorationTaskSpec, _inp: Mapping[str, Any], w_out: Mapping[str, Any]) -> tuple[bool, str]:
+        m_dg = str(w_out.get("m1_manifest_digest", ""))
+        rem = w_out.get("remote_result")
+        if not m_dg or not isinstance(rem, Mapping):
+            return False, "missing_mtls_m1_result"
+        try:
+            m = target_store.get_manifest(m_dg)
+            if parse_strict_json(target_store.read_bytes(m)) != dict(rem):
+                return False, "mtls_m1_payload_mismatch"
+        except Exception:
+            return False, "mtls_m1_manifest_unverified"
+        if independent_verifier_fn is not None:
+            return independent_verifier_fn(task, rem)
+        return True, f"mtls_m1_verified:{mtls_client.expected_server_dns}"
+
+    return ArbitratedModelWorker(
+        worker_id=worker_id,
+        model_family=model_family,
+        source_kind="mtls_vld_fabric",
+        source_uri=f"mtls://{mtls_client.expected_server_dns}:{mtls_client.port}",
+        capabilities=frozenset(capabilities),
+        sparsity_gain=Fraction(3, 4),
+        normalized_byte_cost=Fraction(1, 8),
         health=Fraction(1),
         ground_spec=spec,
         run_fn=_run,
@@ -742,12 +832,24 @@ class IdeaEntry:
         }
 
 
+def _atomic_write_bytes(target: Path, payload: bytes) -> None:
+    """Atomically write `payload` to `target` via fsync'd temp file + `os.replace` (zero torn-cursor window)."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_name(f".{target.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    with open(tmp, "wb") as handle:
+        handle.write(payload)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, target)
+
+
 class IdeaLedger:
     """Append-only, hash-chained ledger of unasked-for ideas, conjectures, negative controls & designs."""
 
     def __init__(self, path: Path | str | None = None) -> None:
         self._path = Path(path) if path is not None else None
         self._entries: list[IdeaEntry] = []
+        self._by_id: dict[str, IdeaEntry] = {}
         if self._path is not None and self._path.is_file():
             prev = GENESIS_PREV_DIGEST
             for line in self._path.read_text(encoding="utf-8").splitlines():
@@ -758,6 +860,7 @@ class IdeaLedger:
                 if entry.prev_digest != prev:
                     raise ArbitrationError("Broken hash chain in persisted IdeaLedger.")
                 self._entries.append(entry)
+                self._by_id.setdefault(entry.idea_id, entry)
                 prev = entry.entry_digest
 
     @property
@@ -778,7 +881,10 @@ class IdeaLedger:
         rationale_and_next_step: str,
         origin_agent: str,
         timestamp_utc: str | None = None,
+        deduplicate_by_id: bool = True,
     ) -> IdeaEntry:
+        if deduplicate_by_id and idea_id in self._by_id:
+            return self._by_id[idea_id]
         ts = timestamp_utc or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         entry = IdeaEntry(
             idea_id=idea_id,
@@ -791,10 +897,13 @@ class IdeaLedger:
             prev_digest=self.head_digest,
         )
         self._entries.append(entry)
+        self._by_id[idea_id] = entry
         if self._path is not None:
             self._path.parent.mkdir(parents=True, exist_ok=True)
             with self._path.open("a", encoding="utf-8", newline="\n") as fh:
                 fh.write(canonical_json(entry.to_dict()) + "\n")
+                fh.flush()
+                os.fsync(fh.fileno())
         return entry
 
     def to_markdown(self) -> str:
@@ -836,9 +945,10 @@ class ContinuousArbitrationService:
 
         self.store = PagedObjectStore(DiskPageBacking(self.state_dir / "m1_pages", page_size=4096))
         self.journal = HashChainedJournal(self.state_dir / "arbitration_journal.jsonl")
+        self.hypervisor_journal = HashChainedJournal(self.state_dir / "hypervisor_journal.jsonl")
         self.idea_ledger = IdeaLedger(self.state_dir / "idea_ledger.jsonl")
 
-        self.hypervisor = ReceiverHypervisor("vld.arbitration.hypervisor")
+        self.hypervisor = ReceiverHypervisor("vld.arbitration.hypervisor", journal=self.hypervisor_journal)
         self.hypervisor.register_agent(create_meta_arbitrator_grant(arbitrator_id, probe_budget=4096, max_arbitration_depth=2))
 
         if workers is None:
@@ -877,6 +987,7 @@ class ContinuousArbitrationService:
         *,
         num_cycles: int = 1,
         interval_sec: float = 0.0,
+        _fault_before_cursor_write: Callable[[int], None] | None = None,
     ) -> tuple[ArbitrationTaskReport, ...]:
         if not tasks or num_cycles <= 0:
             raise ArbitrationError("tasks and num_cycles must be non-empty / positive.")
@@ -906,19 +1017,25 @@ class ContinuousArbitrationService:
             )
             reports.append(rep)
 
-            cursor_doc = {
-                "completed_cycles": cyc + 1,
-                "last_continuity_digest": rep.pipeline_result.final_continuity_digest,
-                "last_encounter_digest": rep.encounter_envelope_digest,
-                "last_selected_workers": list(rep.selected_workers),
-                "last_task_id": task.task_id,
-            }
-            self._cursor_file.write_bytes(canonical_bytes(cursor_doc))
+            # Record idempotent cycle observation in IdeaLedger BEFORE cursor write (crash-safe deduplication by idea_id!)
+            self.idea_ledger.record_idea(
+                idea_id=f"CYCLE-OBS-{cyc:04d}-{task.task_id}",
+                epistemic_status="Verified",
+                title=f"Cycle {cyc}: {task.title}",
+                equation_or_invariant=f"continuity_digest == {rep.pipeline_result.final_continuity_digest[:16]}...",
+                rationale_and_next_step=(
+                    f"Selected workers {list(rep.selected_workers)} under capsule {rep.arbitrator_capsule_digest[:12]}...; "
+                    f"recovered={rep.pipeline_result.stages_recovered_from_quorum}, executed={rep.pipeline_result.stages_executed_this_invocation}."
+                ),
+                origin_agent=rep.arbitrator_id,
+                timestamp_utc="2026-11-18T00:00:00Z",
+                deduplicate_by_id=True,
+            )
 
             if self.ifs_output_dir is not None:
-                self.ifs_output_dir.mkdir(parents=True, exist_ok=True)
                 artifact_path = self.ifs_output_dir / f"cycle_{cyc:04d}_{task.task_id}.json"
-                artifact_path.write_bytes(
+                _atomic_write_bytes(
+                    artifact_path,
                     canonical_bytes(
                         {
                             "arbitrator_capsule_digest": rep.arbitrator_capsule_digest,
@@ -933,8 +1050,21 @@ class ContinuousArbitrationService:
                             "selected_workers": list(rep.selected_workers),
                             "task_id": task.task_id,
                         }
-                    )
+                    ),
                 )
+
+            if _fault_before_cursor_write is not None:
+                _fault_before_cursor_write(cyc)
+
+            cursor_doc = {
+                "completed_cycles": cyc + 1,
+                "idea_ledger_head_digest": self.idea_ledger.head_digest,
+                "last_continuity_digest": rep.pipeline_result.final_continuity_digest,
+                "last_encounter_digest": rep.encounter_envelope_digest,
+                "last_selected_workers": list(rep.selected_workers),
+                "last_task_id": task.task_id,
+            }
+            _atomic_write_bytes(self._cursor_file, canonical_bytes(cursor_doc))
 
             if interval_sec > 0.0 and offset + 1 < num_cycles:
                 time.sleep(interval_sec)
@@ -955,6 +1085,7 @@ __all__ = [
     "build_deepseek_v41_worker",
     "build_external_http_endpoint_worker",
     "build_glm_53_worker",
+    "build_mtls_fabric_worker",
     "build_nested_sub_arbitrator_worker",
     "build_transformer_ground_worker",
     "create_meta_arbitrator_grant",

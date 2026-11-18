@@ -418,7 +418,13 @@ class TransformerLayerRealizer:
             k_full_nd = k_rot
             v_full_nd = v_heads
 
-        attn_concat = self.engine.causal_gqa_nd(q_rot, k_full_nd, v_full_nd, start_position=start_pos)
+        attn_concat = self.engine.causal_gqa_nd(
+            q_rot,
+            k_full_nd,
+            v_full_nd,
+            start_position=start_pos,
+            sliding_window=self.arch.sliding_window_for_layer(layer_index),
+        )
         o_proj_w = self._load_tensor_nd(p + "self_attn.o_proj.weight", loaded_log)
         attn_proj = self.engine.linear_x_wt_nd(attn_concat, o_proj_w)
         if self.arch.has_sandwich_norms:
@@ -592,23 +598,25 @@ class TransformerLayerRealizer:
             *v_heads,
         ]
 
-        # 2. Causal Grouped-Query Attention (GQA)
+        # 2. Causal Grouped-Query Attention (GQA) with optional sliding window
         group_size = nq // nkv
         inv_sqrt_d = 1.0 / math.sqrt(hd)
+        sw = self.arch.sliding_window_for_layer(layer_index)
         attn_concat: list[list[float]] = []
         for t_rel in range(seq_len):
             causal_len = start_pos + t_rel + 1
+            win_start = max(0, causal_len - sw) if sw is not None else 0
             tok_out_flat: list[float] = []
             for qh in range(nq):
                 kvh = qh // group_size
                 q_vec = q_rot[t_rel][qh]
                 scores = [
                     math.fsum(q_vec[d_i] * k_full[s_idx][kvh][d_i] for d_i in range(hd)) * inv_sqrt_d
-                    for s_idx in range(causal_len)
+                    for s_idx in range(win_start, causal_len)
                 ]
                 probs = self.engine.softmax_1d(scores)
                 ctx = [
-                    math.fsum(probs[s_idx] * v_full[s_idx][kvh][d_i] for s_idx in range(causal_len))
+                    math.fsum(probs[p_i] * v_full[win_start + p_i][kvh][d_i] for p_i in range(len(probs)))
                     for d_i in range(hd)
                 ]
                 tok_out_flat.extend(ctx)
@@ -805,20 +813,22 @@ class IndependentReferenceOracle:
 
             after_attn: list[list[float]] = []
             grp = nq // nkv
+            sw = arch.sliding_window_for_layer(l_idx)
             for t in range(seq_len):
+                win_start = max(0, (t + 1) - sw) if sw is not None else 0
                 cat: list[float] = []
                 for h_i in range(nq):
                     kv_i = h_i // grp
                     qv = q_seq[t][h_i]
                     sc = [
                         sum(qv[d] * k_seq[s][kv_i][d] for d in range(hd)) / math.sqrt(hd)
-                        for s in range(t + 1)
+                        for s in range(win_start, t + 1)
                     ]
                     m_sc = max(sc)
                     ex = [math.exp(val - m_sc) for val in sc]
                     sm = sum(ex)
                     pr = [val / sm for val in ex]
-                    cat.extend([sum(pr[s] * v_seq[s][kv_i][d] for s in range(t + 1)) for d in range(hd)])
+                    cat.extend([sum(pr[p_i] * v_seq[win_start + p_i][kv_i][d] for p_i in range(len(pr))) for d in range(hd)])
                 proj = cls._matvec(wo, cat)
                 if w_post_sa is not None:
                     proj = cls._rms(proj, w_post_sa, eps)

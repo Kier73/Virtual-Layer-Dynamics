@@ -88,7 +88,28 @@ class ReceiverHypervisor:
         self._state: dict[str, Any] = parse_strict_json(canonical_json(dict(initial_state or {"epoch": 0})))
         self._epoch: int = 0
         self._admitted_capsules: dict[str, dict[str, Any]] = {}
-        self._audit_seq = 0
+        self._arbitration_receipts: dict[tuple[str, str, str, int], dict[str, Any]] = {}
+        evs = self.journal.events
+        self._audit_seq = len(evs)
+        for ev in evs:
+            p = ev.payload
+            if ev.operation == "hypervisor.authorize_probe":
+                aid = str(p["agent_id"])
+                self._spent_budget[aid] = self._spent_budget.get(aid, Fraction(0)) + Fraction(p["cost"])
+            elif ev.operation == "hypervisor.authorize_model_arbitration":
+                aid = str(p["arbitrator_id"])
+                tw = str(p["target_worker_id"])
+                tid = str(p["task_id"])
+                dep = int(p["arbitration_depth"])
+                self._spent_budget[aid] = self._spent_budget.get(aid, Fraction(0)) + Fraction(p["cost"])
+                self._arbitration_receipts[(aid, tw, tid, dep)] = {
+                    "arbitration_depth": dep,
+                    "arbitrator_id": aid,
+                    "journal_digest": ev.event_digest,
+                    "remaining_budget": str(ev.result.get("remaining_budget", "0")),
+                    "target_worker_id": tw,
+                    "task_id": tid,
+                }
 
     def _next_audit_id(self, tag: str) -> str:
         self._audit_seq += 1
@@ -297,6 +318,7 @@ class ReceiverHypervisor:
         task_id: str,
         arbitration_depth: int = 1,
         cost: int | Fraction = Fraction(1),
+        idempotent: bool = False,
     ) -> dict[str, Any]:
         """Authorize an in-layer model (`arbitrator_id`) to schedule & arbitrate `target_worker_id` on `task_id`."""
         grant = self._require_capability(arbitrator_id, AgentCapability.ARBITRATE_MODEL)
@@ -319,6 +341,9 @@ class ReceiverHypervisor:
             raise HypervisorRefusalError(
                 f"Arbitration depth {arbitration_depth} exceeds max_arbitration_depth {grant.max_arbitration_depth}."
             )
+        idem_key = (arbitrator_id, target_worker_id, task_id, arbitration_depth)
+        if idempotent and idem_key in self._arbitration_receipts:
+            return dict(self._arbitration_receipts[idem_key])
         if isinstance(cost, (bool, float)):
             self._record_refusal(arbitrator_id, "invalid_arbitration_cost_type", {"type": type(cost).__name__})
             raise HypervisorRefusalError("Arbitration cost must be an exact int or Fraction.")
@@ -349,7 +374,7 @@ class ReceiverHypervisor:
             },
             result_fn=lambda: {"admitted": True, "remaining_budget": str(new_rem)},
         )
-        return {
+        out = {
             "arbitration_depth": arbitration_depth,
             "arbitrator_id": arbitrator_id,
             "journal_digest": rec.event_digest,
@@ -357,6 +382,8 @@ class ReceiverHypervisor:
             "target_worker_id": target_worker_id,
             "task_id": task_id,
         }
+        self._arbitration_receipts[idem_key] = dict(out)
+        return out
 
 
 __all__ = [

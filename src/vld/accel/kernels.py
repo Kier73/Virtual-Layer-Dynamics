@@ -759,6 +759,7 @@ class NumericEngine:
         v_full_nd: Any,
         *,
         start_position: int,
+        sliding_window: int | None = None,
     ) -> Any:
         r"""Contiguous `ndarray`-resident Causal Grouped-Query Attention returning `[seq_len, n_heads * head_dim]`."""
         assert _np is not None
@@ -776,6 +777,8 @@ class NumericEngine:
         q_pos = (_np.arange(seq_len) + start_position)[:, None]
         k_pos = _np.arange(total_seq)[None, :]
         causal_mask = k_pos <= q_pos  # [seq_len, total_seq]
+        if sliding_window is not None:
+            causal_mask = causal_mask & (k_pos >= (q_pos - int(sliding_window) + 1))
         masked_scores = _np.where(causal_mask[None, :, :], scores, -_np.inf)
         shifted = _np.exp(masked_scores - _np.max(masked_scores, axis=-1, keepdims=True))
         probs = shifted / _np.sum(shifted, axis=-1, keepdims=True)  # [nq, seq_len, total_seq]

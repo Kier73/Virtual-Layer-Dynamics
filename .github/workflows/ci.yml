@@ -47,6 +47,12 @@ jobs:
           python -m vld verify
           python -m vld benchmark --dim 512 --steps 5000
 
+      - name: Verify POSIX 0600/0700 mTLS PKI permissions under umask 0022 (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          umask 0022
+          python -c "import os, tempfile; from pathlib import Path; from vld.fabric.mtls import generate_ephemeral_mtls_pki; d = Path(tempfile.mkdtemp()) / 'pki'; generate_ephemeral_mtls_pki(d, ('n0.vld.local',)); assert (d.stat().st_mode & 0o777) == 0o700, oct(d.stat().st_mode); k = d / 'n0.vld.local.key.pem'; assert (k.stat().st_mode & 0o777) == 0o600, oct(k.stat().st_mode)"
+
       - name: Verify sdist and wheel build cleanly
         run: python -m build
 

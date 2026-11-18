@@ -739,6 +739,8 @@ class TransformerArchitectureSpec:
     dtype: str = "BF16"
     attention_bias: bool | None = None
     partial_rotary_factor: float = 1.0
+    sliding_window: int | None = None
+    max_window_layers: int = 0
 
     def __post_init__(self) -> None:
         if not _REPO_RE.fullmatch(self.source_model):
@@ -766,6 +768,9 @@ class TransformerArchitectureSpec:
         rot_dim = int(round(self.head_dim * self.partial_rotary_factor))
         if rot_dim <= 0 or rot_dim % 2 != 0:
             raise ModelArtifactError("rotary_dim must be a positive even integer.")
+        if self.sliding_window is not None:
+            _strict_pos_int(self.sliding_window, "sliding_window")
+        _strict_nonneg_int(self.max_window_layers, "max_window_layers")
         if self.dtype not in ("BF16", "F16", "F32"):
             raise ModelArtifactError(f"Unsupported weight dtype {self.dtype!r}.")
 
@@ -800,12 +805,19 @@ class TransformerArchitectureSpec:
         h = int(config["hidden_size"])
         nq = int(config["num_attention_heads"])
         nkv = int(config.get("num_key_value_heads", nq))
-        hd = int(config.get("head_dim") or (h // nq))
+        hd = int(config["head_dim"]) if config.get("head_dim") is not None else (h // nq)
         dt_map = {"bfloat16": "BF16", "float16": "F16", "float32": "F32"}
         raw_dt = str(config.get("torch_dtype", "bfloat16")).lower()
         resolved_dt = dtype if dtype is not None else dt_map.get(raw_dt, "BF16")
-        prf = float(config.get("partial_rotary_factor") or (0.5 if mtype == "glm4" else 1.0))
+        prf = (
+            float(config["partial_rotary_factor"])
+            if config.get("partial_rotary_factor") is not None
+            else (0.5 if mtype == "glm4" else 1.0)
+        )
         abias = config.get("attention_bias")
+        use_sw = bool(config.get("use_sliding_window", False))
+        sw_val = int(config["sliding_window"]) if (use_sw and config.get("sliding_window") is not None) else None
+        mwl = int(config.get("max_window_layers", 0)) if sw_val is not None else 0
         return cls(
             source_model=source_model,
             revision=revision,
@@ -828,6 +840,8 @@ class TransformerArchitectureSpec:
             dtype=resolved_dt,
             attention_bias=None if abias is None else bool(abias),
             partial_rotary_factor=prf,
+            sliding_window=sw_val,
+            max_window_layers=mwl,
         )
 
     @property
@@ -860,6 +874,11 @@ class TransformerArchitectureSpec:
     def has_interleaved_rope(self) -> bool:
         return self.model_type == "glm4"
 
+    def sliding_window_for_layer(self, layer_index: int) -> int | None:
+        if self.sliding_window is not None and layer_index >= self.max_window_layers:
+            return self.sliding_window
+        return None
+
     @property
     def fingerprint(self) -> str:
         return domain_digest("vld.transformer-arch.v1", self.to_dict())
@@ -886,9 +905,14 @@ class TransformerArchitectureSpec:
             "tie_word_embeddings": self.tie_word_embeddings,
             "vocab_size": self.vocab_size,
         }
-        if self.model_type not in ("qwen3", "qwen3_moe"):
+        # Preserve canonical Qwen3/Qwen3-MoE fingerprint backward compatibility ONLY when default settings hold;
+        # always bind non-default attention_bias, partial_rotary_factor, and sliding_window to prevent collisions!
+        if self.model_type not in ("qwen3", "qwen3_moe") or self.has_qkv_bias or self.partial_rotary_factor != 1.0:
             base["attention_bias"] = self.has_qkv_bias
             base["partial_rotary_factor"] = self.partial_rotary_factor
+        if self.sliding_window is not None:
+            base["max_window_layers"] = self.max_window_layers
+            base["sliding_window"] = self.sliding_window
         return base
 
     def parameter_inventory(self) -> dict[str, int]:

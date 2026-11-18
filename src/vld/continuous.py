@@ -65,7 +65,7 @@ from vld.fabric import (
 )
 from vld.ground import ByteLens, LensKind, NavigationCostVector, VirtualGroundSpec
 from vld.journal import GENESIS_PREV_DIGEST, HashChainedJournal
-from vld.memory import InMemoryPageBacking, PagedByteManifest, PagedObjectStore, StructuralMemoryRegistry
+from vld.memory import InMemoryPageBacking, PagedByteManifest, PagedObjectStore, PagedStoreError, StructuralMemoryRegistry
 from vld.models import (
     DeepSeekV41ArchitectureSpec,
     DeepSeekV41LayerRealizer,
@@ -264,7 +264,7 @@ class ContinuousVirtualSystem:
         active_quorum_members: Sequence[str],
         journal: HashChainedJournal | None = None,
         require_independent_verifier: bool = False,
-        reverify_recovered_stages: bool = False,
+        reverify_recovered_stages: bool | None = None,
     ) -> None:
         self.pipeline_id = pipeline_id
         self.store = store
@@ -272,7 +272,9 @@ class ContinuousVirtualSystem:
         self.active_quorum_members = tuple(active_quorum_members)
         self.journal = journal if journal is not None else HashChainedJournal()
         self.require_independent_verifier = bool(require_independent_verifier)
-        self.reverify_recovered_stages = bool(reverify_recovered_stages)
+        self.reverify_recovered_stages = (
+            self.require_independent_verifier if reverify_recovered_stages is None else bool(reverify_recovered_stages)
+        )
 
     def execute_stages(
         self,
@@ -363,8 +365,21 @@ class ContinuousVirtualSystem:
                     f"Recovered stage {slot_idx - 1} representation contract ({rcpt.source_representation!r} -> {rcpt.target_representation!r}) "
                     f"disagrees with requested ({expected_stage.input_representation!r} -> {expected_stage.output_representation!r})."
                 )
+            if not rcpt.oracle_verdict.startswith("PASS"):
+                raise ContinuousSystemError(
+                    f"Recovered stage {slot_idx - 1} carries non-PASS oracle_verdict {rcpt.oracle_verdict!r}."
+                )
+            if self.require_independent_verifier and "|VERIFIED:" not in rcpt.oracle_verdict:
+                raise ContinuousSystemError(
+                    f"Recovered stage {slot_idx - 1} ({rcpt.stage_id!r}) lacks mandatory independent '|VERIFIED:' attestation."
+                )
             in_bytes = len(canonical_bytes(cur_state))
-            raw_recovered = self.store.read_bytes(rcpt.state_manifest)
+            try:
+                raw_recovered = self.store.read_bytes(rcpt.state_manifest)
+            except PagedStoreError as exc:
+                raise ContinuousSystemError(
+                    f"Corrupted or missing M1 state page for recovered stage {slot_idx - 1}: {exc}"
+                ) from exc
             recovered_state = parse_strict_json(raw_recovered)
             t_ver_ns = 0
             if self.reverify_recovered_stages and expected_stage.verify_fn is not None:
@@ -585,7 +600,11 @@ class ContinuousVirtualSystem:
         for ev in reversed(events):
             if ev.operation == "continuous.seal_stage" and ev.payload.get("slot_token_digest") == token_digest:
                 env_m = PagedByteManifest.from_dict(ev.payload["envelope_manifest"])
-                env_doc = parse_strict_json(self.store.read_bytes(env_m))
+                try:
+                    env_raw = self.store.read_bytes(env_m)
+                except PagedStoreError as exc:
+                    raise ContinuousSystemError(f"Corrupted M1 receipt envelope for slot {token_digest}: {exc}") from exc
+                env_doc = parse_strict_json(env_raw)
                 sealed_rcpt = CrossGroundContinuityReceipt.from_dict(env_doc["continuity_receipt"])
                 if not self.quorum.verify_certificate(sealed_rcpt.quorum_certificate):
                     raise ContinuousSystemError("Persisted continuity_receipt failed QuorumCommitCertificate verification.")
@@ -593,7 +612,11 @@ class ContinuousVirtualSystem:
         for ev in reversed(events):
             if ev.operation == "continuous.pre_stage" and ev.payload.get("slot_token_digest") == token_digest:
                 pre_m = PagedByteManifest.from_dict(ev.payload["pre_manifest"])
-                pre = parse_strict_json(self.store.read_bytes(pre_m))["pre_stage"]
+                try:
+                    pre_raw = self.store.read_bytes(pre_m)
+                except PagedStoreError as exc:
+                    raise ContinuousSystemError(f"Corrupted M1 pre-seal envelope for slot {token_digest}: {exc}") from exc
+                pre = parse_strict_json(pre_raw)["pre_stage"]
                 sc = pre["stage_cost"]
                 rebuilt = CrossGroundContinuityReceipt(
                     pipeline_id=str(pre["pipeline_id"]),

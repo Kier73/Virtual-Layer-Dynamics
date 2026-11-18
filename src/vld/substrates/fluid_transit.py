@@ -221,6 +221,21 @@ class OnlineFlashStreamState:
             or any(len(r) != self.value_dim for r in self.weighted_values)
         ):
             raise FluidTransitError("OnlineFlashStreamState shape mismatch.")
+        if self.keys_accumulated < 0:
+            raise FluidTransitError("keys_accumulated must be non-negative.")
+        for qi in range(self.num_queries):
+            ms = float(self.max_scores[qi])
+            se = float(self.sum_exps[qi])
+            wv = self.weighted_values[qi]
+            if not math.isfinite(se) or se < 0.0:
+                raise FluidTransitError("sum_exps entries must be finite and non-negative.")
+            if any(not math.isfinite(float(v)) for v in wv):
+                raise FluidTransitError("Non-finite weighted_values in OnlineFlashStreamState.")
+            if se == 0.0:
+                if ms != -math.inf or any(float(v) != 0.0 for v in wv):
+                    raise FluidTransitError("Zero-support OnlineFlashStreamState query must equal (-inf, 0.0, 0).")
+            elif not math.isfinite(ms):
+                raise FluidTransitError("Positive-support OnlineFlashStreamState query requires finite max_score.")
 
     @classmethod
     def identity(cls, num_queries: int, value_dim: int) -> OnlineFlashStreamState:
@@ -258,7 +273,15 @@ class OnlineFlashStreamState:
         dv = len(values[0])
         if dv == 0 or any(len(k) != dk for k in keys) or any(len(v) != dv for v in values):
             raise FluidTransitError("Malformed key or value dimensions in shard.")
+        if (
+            any(not math.isfinite(float(x)) for q in queries for x in q)
+            or any(not math.isfinite(float(x)) for k in keys for x in k)
+            or any(not math.isfinite(float(x)) for v in values for x in v)
+        ):
+            raise FluidTransitError("Non-finite query, key, or value entry in OnlineFlashStreamState shard.")
         sc = float(scale) if scale is not None else (1.0 / math.sqrt(dk))
+        if not math.isfinite(sc):
+            raise FluidTransitError("Non-finite attention scale.")
 
         m_list: list[float] = []
         l_list: list[float] = []
@@ -624,15 +647,63 @@ class TransitOperation:
         return cls(op=str(data["op"]), params=dict(data.get("params", {})))
 
 
+_SUPPORTED_TRANSIT_OPS = frozenset(
+    {
+        "reverse",
+        "rotate",
+        "transpose_2d",
+        "affine_map",
+        "prefix_scan_mod",
+        "reduce_sum",
+        "reduce_xor",
+        "vm_register_poly",
+    }
+)
+
+
+def _validate_transit_op_in_context(
+    raw_op: TransitOperation,
+    *,
+    current_representation: str,
+    vector_length: int | None,
+) -> None:
+    if raw_op.op not in _SUPPORTED_TRANSIT_OPS:
+        raise FluidTransitError(f"Unsupported transit operation {raw_op.op!r}.")
+    if current_representation != "int_vector":
+        raise FluidTransitError(
+            f"Operation {raw_op.op!r} requires 'int_vector' representation, got {current_representation!r}."
+        )
+    if raw_op.op == "transpose_2d":
+        rows = int(raw_op.params["rows"])
+        cols = int(raw_op.params["cols"])
+        if rows <= 0 or cols <= 0 or (vector_length is not None and rows * cols != vector_length):
+            raise FluidTransitError("transpose_2d dimensions mismatch payload length.")
+    elif raw_op.op in ("affine_map", "prefix_scan_mod", "vm_register_poly"):
+        if int(raw_op.params["modulus"]) <= 0:
+            raise FluidTransitError(f"{raw_op.op} requires a positive modulus.")
+    elif raw_op.op == "rotate":
+        _ = int(raw_op.params.get("shift", 0))
+
+
 def optimize_transit_schedule(
     schedule: Sequence[TransitOperation],
     *,
     vector_length: int | None = None,
+    initial_representation: str = "int_vector",
 ) -> tuple[TransitOperation, ...]:
-    """Algebraically fuse and commute in-transit operations so information transforms with minimal work."""
+    """Algebraically fuse and commute in-transit operations while strictly preserving error & type semantics."""
     ops: list[TransitOperation] = []
+    cur_rep = initial_representation
     for raw_op in schedule:
-        # Drop identity rotations or identity affine maps immediately
+        _validate_transit_op_in_context(raw_op, current_representation=cur_rep, vector_length=vector_length)
+        if raw_op.op in ("reduce_sum", "reduce_xor"):
+            while ops and ops[-1].op in ("reverse", "rotate", "transpose_2d"):
+                ops.pop()
+            ops.append(raw_op)
+            cur_rep = "interpretable_scalar"
+            continue
+
+        # Drop identity rotations or identity affine maps immediately (after validation!)
         if raw_op.op == "rotate" and int(raw_op.params.get("shift", 0)) == 0:
             continue
         if raw_op.op == "affine_map":
@@ -684,10 +755,6 @@ def optimize_transit_schedule(
                 if not (a_f == 1 and b_f == 0):
                     ops.append(TransitOperation("affine_map", {"bias": b_f, "modulus": mod, "scale": a_f}))
                 continue
-            # 5. Pullback commutation: reduce_sum / reduce_xor absorbs preceding pure permutations!
-            if raw_op.op in ("reduce_sum", "reduce_xor"):
-                while ops and ops[-1].op in ("reverse", "rotate", "transpose_2d"):
-                    ops.pop()
 
         ops.append(raw_op)
     return tuple(ops)
@@ -720,11 +787,15 @@ def _apply_single_transit_op(payload: Any, op: TransitOperation) -> tuple[Any, s
         sc = int(op.params["scale"])
         bi = int(op.params["bias"])
         mod = int(op.params["modulus"])
+        if mod <= 0:
+            raise FluidTransitError("affine_map requires a positive modulus.")
         return [(sc * int(x) + bi) % mod for x in payload], "int_vector"
     if op.op == "prefix_scan_mod":
         if not isinstance(payload, list):
             raise FluidTransitError("prefix_scan_mod requires a list vector payload.")
         mod = int(op.params["modulus"])
+        if mod <= 0:
+            raise FluidTransitError("prefix_scan_mod requires a positive modulus.")
         out: list[int] = []
         acc = 0
         for x in payload:
@@ -750,6 +821,8 @@ def _apply_single_transit_op(payload: Any, op: TransitOperation) -> tuple[Any, s
         c1 = int(op.params.get("c1", 1))
         c0 = int(op.params.get("c0", 0))
         mod = int(op.params["modulus"])
+        if mod <= 0:
+            raise FluidTransitError("vm_register_poly requires a positive modulus.")
         return [(c2 * int(x) * int(x) + c1 * int(x) + c0) % mod for x in payload], "int_vector"
     raise FluidTransitError(f"Unsupported transit operation {op.op!r}.")
 
@@ -920,11 +993,16 @@ class InTransitPathMachine:
         optimize: bool = True,
         transport: str = "stream",
     ) -> tuple[TransitInformationPacket, dict[str, Any]]:
+        init_rep = "int_vector" if isinstance(initial_payload, list) else "raw"
         vec_len = len(initial_payload) if isinstance(initial_payload, list) else None
-        active_ops = optimize_transit_schedule(schedule, vector_length=vec_len) if optimize else tuple(schedule)
+        active_ops = (
+            optimize_transit_schedule(schedule, vector_length=vec_len, initial_representation=init_rep)
+            if optimize
+            else tuple(schedule)
+        )
         pkt = TransitInformationPacket(
             packet_id=packet_id,
-            current_representation="int_vector" if isinstance(initial_payload, list) else "raw",
+            current_representation=init_rep,
             target_representation=target_representation,
             payload=parse_strict_json(canonical_json(initial_payload)),
             remaining_ops=active_ops,
@@ -935,18 +1013,34 @@ class InTransitPathMachine:
         if transport == "headless_os_pipe":
             hos = HeadlessOS(page_size=4096)
             p0 = hos.spawn_process("stream.src", (VMInstruction("HALT", ()),))
+            pipe_chunk = 4096
+            buf_w_addr = 256
+            buf_r_addr = 4608
+            vmem = hos._procs[p0].vm_proc.memory
             for hop_node in self.interpreters:
-                hos.posix_invoke(p0, 22, address=64)
-                fd_r, fd_w = struct.unpack("<ii", hos._procs[p0].vm_proc.memory.read_bytes(64, 8))
-                # Write wire frame into POSIX pipe via process virtual memory and read out on interpreter side
-                buf_addr = 256
-                hos._procs[p0].vm_proc.memory.write_bytes(buf_addr, wire)
-                hos.posix_invoke(p0, 1, fd=fd_w, address=buf_addr, size=len(wire))
-                out_addr = buf_addr + len(wire) + 64
-                hos.posix_invoke(p0, 0, fd=fd_r, address=out_addr, size=len(wire))
-                received = hos._procs[p0].vm_proc.memory.read_bytes(out_addr, len(wire))
-                hos.posix_invoke(p0, 3, fd=fd_r)
-                hos.posix_invoke(p0, 3, fd=fd_w)
+                r_pipe = hos.posix_invoke(p0, 22, address=64)
+                if not r_pipe.ok:
+                    raise FluidTransitError(f"HeadlessOS pipe() syscall failed: {r_pipe.error}")
+                fd_r, fd_w = struct.unpack("<ii", vmem.read_bytes(64, 8))
+                # Stream arbitrarily large wire frames in O(page_size) bounded slices through the POSIX pipe!
+                received_buf = bytearray()
+                offset = 0
+                while offset < len(wire):
+                    part = wire[offset : offset + pipe_chunk]
+                    vmem.write_bytes(buf_w_addr, part)
+                    r_wr = hos.posix_invoke(p0, 1, fd=fd_w, address=buf_w_addr, size=len(part))
+                    if not r_wr.ok or r_wr.result != len(part):
+                        raise FluidTransitError(f"HeadlessOS pipe write failed: {r_wr.error}")
+                    r_rd = hos.posix_invoke(p0, 0, fd=fd_r, address=buf_r_addr, size=len(part))
+                    if not r_rd.ok or r_rd.result != len(part):
+                        raise FluidTransitError(f"HeadlessOS pipe read failed: {r_rd.error}")
+                    received_buf.extend(vmem.read_bytes(buf_r_addr, len(part)))
+                    offset += len(part)
+                r_cr = hos.posix_invoke(p0, 3, fd=fd_r)
+                r_cw = hos.posix_invoke(p0, 3, fd=fd_w)
+                if not r_cr.ok or not r_cw.ok:
+                    raise FluidTransitError("HeadlessOS pipe close() syscall failed.")
+                received = bytes(received_buf)
                 wire_bytes_moved += len(received)
                 wire = hop_node.interpret_frame(received)
         elif transport == "stream":

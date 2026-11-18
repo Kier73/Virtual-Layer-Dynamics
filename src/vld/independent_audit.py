@@ -346,11 +346,60 @@ def verify_snc_1d_capsule_standalone(capsule: Mapping[str, Any]) -> dict[str, An
     if capsule.get("source_atlas_digest") != independent_domain_digest("vld.semantic-atlas.v1", atlas):
         raise IndependentAuditError("1D SNC source_atlas_digest mismatch.")
     net = capsule["network"]
-    w1 = [Fraction(row[0]) for row in net["hidden_weight"]]
-    b1 = [Fraction(v) for v in net["hidden_bias"]]
-    w2 = [[Fraction(v) for v in row] for row in net["output_weight"]]
-    b2 = [Fraction(v) for v in net["output_bias"]]
+    if not isinstance(net, Mapping) or net.get("hidden_activation") != "relu":
+        raise IndependentAuditError("1D SNC capsule requires hidden_activation == 'relu'.")
+    raw_w1 = net.get("hidden_weight")
+    raw_b1 = net.get("hidden_bias")
+    raw_w2 = net.get("output_weight")
+    raw_b2 = net.get("output_bias")
+    if (
+        not isinstance(raw_w1, (list, tuple))
+        or not raw_w1
+        or any(not isinstance(r, (list, tuple)) or len(r) != 1 for r in raw_w1)
+        or not isinstance(raw_b1, (list, tuple))
+        or len(raw_b1) != len(raw_w1)
+    ):
+        raise IndependentAuditError("Invalid 1D SNC hidden layer geometry.")
+    if (
+        not isinstance(raw_b2, (list, tuple))
+        or not raw_b2
+        or not isinstance(raw_w2, (list, tuple))
+        or len(raw_w2) != len(raw_b2)
+        or any(not isinstance(r, (list, tuple)) or len(r) != len(raw_w1) for r in raw_w2)
+    ):
+        raise IndependentAuditError("Invalid 1D SNC output layer geometry.")
+
+    w1 = [Fraction(row[0]) for row in raw_w1]
+    b1 = [Fraction(v) for v in raw_b1]
+    w2 = [[Fraction(v) for v in row] for row in raw_w2]
+    b2 = [Fraction(v) for v in raw_b2]
     out_dim = len(b2)
+
+    if not atlas:
+        raise IndependentAuditError("1D SNC source_atlas cannot be empty.")
+    parsed_regions: list[tuple[Fraction | None, Fraction | None, list[tuple[Fraction, Fraction]]]] = []
+    for idx, reg in enumerate(atlas):
+        if not isinstance(reg, Mapping) or set(reg.keys()) != {"left", "right", "affines"}:
+            raise IndependentAuditError("Invalid atlas region keys.")
+        l_val = None if reg["left"] == "-inf" else Fraction(reg["left"])
+        r_val = None if reg["right"] == "+inf" else Fraction(reg["right"])
+        if (l_val is None) != (idx == 0) or (r_val is None) != (idx == len(atlas) - 1):
+            raise IndependentAuditError("Atlas must partition (-inf, +inf) with infinite bounds only at ends.")
+        if l_val is not None and r_val is not None and l_val >= r_val:
+            raise IndependentAuditError("Inverted or empty interval in 1D SNC source_atlas.")
+        raw_aff = reg["affines"]
+        if not isinstance(raw_aff, (list, tuple)) or len(raw_aff) != out_dim:
+            raise IndependentAuditError("Inconsistent output arity in 1D SNC source_atlas.")
+        affs = [(Fraction(pair[0]), Fraction(pair[1])) for pair in raw_aff]
+        if parsed_regions:
+            prev_l, prev_r, prev_affs = parsed_regions[-1]
+            if prev_r != l_val:
+                raise IndependentAuditError("Gap or overlap between adjacent 1D SNC atlas intervals.")
+            assert l_val is not None
+            for (m1, c1), (m2, c2) in zip(prev_affs, affs):
+                if m1 * l_val + c1 != m2 * l_val + c2:
+                    raise IndependentAuditError(f"Discontinuous 1D SNC atlas at breakpoint {l_val}.")
+        parsed_regions.append((l_val, r_val, affs))
 
     def eval_net(x: Fraction) -> list[Fraction]:
         h = [max(Fraction(0), w * x + b) for w, b in zip(w1, b1)]
@@ -361,11 +410,11 @@ def verify_snc_1d_capsule_standalone(capsule: Mapping[str, Any]) -> dict[str, An
 
     # Collect all breakpoints from both atlas and network kinks -b1_j / w1_j
     kinks: set[Fraction] = set()
-    for reg in atlas:
-        if reg["left"] != "-inf":
-            kinks.add(Fraction(reg["left"]))
-        if reg["right"] != "+inf":
-            kinks.add(Fraction(reg["right"]))
+    for l_val, r_val, _ in parsed_regions:
+        if l_val is not None:
+            kinks.add(l_val)
+        if r_val is not None:
+            kinks.add(r_val)
     for w, b in zip(w1, b1):
         if w != 0:
             kinks.add(-b / w)
@@ -382,11 +431,11 @@ def verify_snc_1d_capsule_standalone(capsule: Mapping[str, Any]) -> dict[str, An
         cells.append((sorted_pts[-1] + 1, sorted_pts[-1] + 2))
 
     def eval_atlas(x: Fraction) -> list[Fraction]:
-        for reg in atlas:
-            ok_l = True if reg["left"] == "-inf" else (x >= Fraction(reg["left"]))
-            ok_r = True if reg["right"] == "+inf" else (x <= Fraction(reg["right"]))
+        for l_val, r_val, affs in parsed_regions:
+            ok_l = True if l_val is None else (x >= l_val)
+            ok_r = True if r_val is None else (x <= r_val)
             if ok_l and ok_r:
-                return [Fraction(a[0]) * x + Fraction(a[1]) for a in reg["affines"]]
+                return [m * x + c for m, c in affs]
         raise IndependentAuditError(f"Atlas does not cover point {x}.")
 
     checked_points = 0
