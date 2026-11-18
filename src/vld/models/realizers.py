@@ -150,13 +150,16 @@ def _apply_rope_3d(
     *,
     start_position: int,
     rope_theta: float,
+    rotary_dim: int | None = None,
+    interleaved: bool = False,
 ) -> list[list[list[float]]]:
     seq_len = len(heads_3d)
     if seq_len == 0:
         return []
     head_dim = len(heads_3d[0][0])
-    half = head_dim // 2
-    inv_freq = [rope_theta ** (-2.0 * i / head_dim) for i in range(half)]
+    rdim = head_dim if rotary_dim is None else int(rotary_dim)
+    half = rdim // 2
+    inv_freq = [rope_theta ** (-2.0 * i / rdim) for i in range(half)]
     out: list[list[list[float]]] = []
     for t in range(seq_len):
         pos = start_position + t
@@ -164,13 +167,64 @@ def _apply_rope_3d(
         sin_half = [math.sin(pos * f) for f in inv_freq]
         token_heads: list[list[float]] = []
         for h_vec in heads_3d[t]:
-            first = h_vec[:half]
-            second = h_vec[half:]
-            rot_first = [x1 * c - x2 * s for x1, x2, c, s in zip(first, second, cos_half, sin_half)]
-            rot_second = [x2 * c + x1 * s for x1, x2, c, s in zip(first, second, cos_half, sin_half)]
-            token_heads.append(rot_first + rot_second)
+            tail = h_vec[rdim:] if rdim < head_dim else []
+            if interleaved:
+                rot_part: list[float] = []
+                for i in range(half):
+                    x0 = h_vec[2 * i]
+                    x1 = h_vec[2 * i + 1]
+                    c, s = cos_half[i], sin_half[i]
+                    rot_part.append(x0 * c - x1 * s)
+                    rot_part.append(x1 * c + x0 * s)
+                token_heads.append(rot_part + tail)
+            else:
+                first = h_vec[:half]
+                second = h_vec[half:rdim]
+                rot_first = [x1 * c - x2 * s for x1, x2, c, s in zip(first, second, cos_half, sin_half)]
+                rot_second = [x2 * c + x1 * s for x1, x2, c, s in zip(first, second, cos_half, sin_half)]
+                token_heads.append(rot_first + rot_second + tail)
         out.append(token_heads)
     return out
+
+
+def _apply_rope_3d_nd(
+    heads_nd: Any,  # [seq_len, n_heads, head_dim]
+    *,
+    start_position: int,
+    rope_theta: float,
+    rotary_dim: int,
+    interleaved: bool,
+    engine: NumericEngine,
+) -> Any:
+    import numpy as np
+
+    head_dim = int(heads_nd.shape[2])
+    if not interleaved and rotary_dim == head_dim:
+        return engine.rope_3d_nd(heads_nd, start_position=start_position, rope_theta=rope_theta)
+    seq_len = int(heads_nd.shape[0])
+    half = rotary_dim // 2
+    inv_freq = np.power(float(rope_theta), -2.0 * np.arange(half, dtype=np.float64) / float(rotary_dim))
+    positions = np.arange(start_position, start_position + seq_len, dtype=np.float64)[:, None]
+    angles = positions * inv_freq[None, :]
+    cos_a = np.cos(angles)[:, None, :]  # [seq_len, 1, half]
+    sin_a = np.sin(angles)[:, None, :]
+    rot_slice = heads_nd[:, :, :rotary_dim].astype(np.float64)
+    if interleaved:
+        x0 = rot_slice[:, :, 0::2]
+        x1 = rot_slice[:, :, 1::2]
+        y0 = x0 * cos_a - x1 * sin_a
+        y1 = x1 * cos_a + x0 * sin_a
+        rot_out = np.empty_like(rot_slice)
+        rot_out[:, :, 0::2] = y0
+        rot_out[:, :, 1::2] = y1
+    else:
+        x0 = rot_slice[:, :, :half]
+        x1 = rot_slice[:, :, half:]
+        rot_out = np.concatenate((x0 * cos_a - x1 * sin_a, x1 * cos_a + x0 * sin_a), axis=-1)
+    if rotary_dim < head_dim:
+        full = np.concatenate((rot_out.astype(np.float32), heads_nd[:, :, rotary_dim:].astype(np.float32)), axis=-1)
+        return np.ascontiguousarray(full, dtype=np.float32)
+    return np.ascontiguousarray(rot_out, dtype=np.float32)
 
 
 @dataclass(frozen=True, slots=True)
@@ -316,16 +370,37 @@ class TransformerLayerRealizer:
         q_flat = self.engine.linear_x_wt_nd(normed_x, self._load_tensor_nd(p + "self_attn.q_proj.weight", loaded_log))
         k_flat = self.engine.linear_x_wt_nd(normed_x, self._load_tensor_nd(p + "self_attn.k_proj.weight", loaded_log))
         v_flat = self.engine.linear_x_wt_nd(normed_x, self._load_tensor_nd(p + "self_attn.v_proj.weight", loaded_log))
+        if self.arch.has_qkv_bias:
+            q_flat = np.ascontiguousarray(q_flat + self._load_tensor_nd(p + "self_attn.q_proj.bias", loaded_log)[None, :], dtype=np.float32)
+            k_flat = np.ascontiguousarray(k_flat + self._load_tensor_nd(p + "self_attn.k_proj.bias", loaded_log)[None, :], dtype=np.float32)
+            v_flat = np.ascontiguousarray(v_flat + self._load_tensor_nd(p + "self_attn.v_proj.bias", loaded_log)[None, :], dtype=np.float32)
 
-        q_norm_w = self._load_tensor_nd(p + "self_attn.q_norm.weight", loaded_log)
-        k_norm_w = self._load_tensor_nd(p + "self_attn.k_norm.weight", loaded_log)
-
-        q_heads = self.engine.rms_norm_nd(q_flat.reshape(seq_len, nq, hd), q_norm_w, eps)
-        k_heads = self.engine.rms_norm_nd(k_flat.reshape(seq_len, nkv, hd), k_norm_w, eps)
+        if self.arch.has_qk_norm:
+            q_norm_w = self._load_tensor_nd(p + "self_attn.q_norm.weight", loaded_log)
+            k_norm_w = self._load_tensor_nd(p + "self_attn.k_norm.weight", loaded_log)
+            q_heads = self.engine.rms_norm_nd(q_flat.reshape(seq_len, nq, hd), q_norm_w, eps)
+            k_heads = self.engine.rms_norm_nd(k_flat.reshape(seq_len, nkv, hd), k_norm_w, eps)
+        else:
+            q_heads = np.ascontiguousarray(q_flat.reshape(seq_len, nq, hd), dtype=np.float32)
+            k_heads = np.ascontiguousarray(k_flat.reshape(seq_len, nkv, hd), dtype=np.float32)
         v_heads = np.ascontiguousarray(v_flat.reshape(seq_len, nkv, hd), dtype=np.float32)
 
-        q_rot = self.engine.rope_3d_nd(q_heads, start_position=start_pos, rope_theta=self.arch.rope_theta)
-        k_rot = self.engine.rope_3d_nd(k_heads, start_position=start_pos, rope_theta=self.arch.rope_theta)
+        q_rot = _apply_rope_3d_nd(
+            q_heads,
+            start_position=start_pos,
+            rope_theta=self.arch.rope_theta,
+            rotary_dim=self.arch.rotary_dim,
+            interleaved=self.arch.has_interleaved_rope,
+            engine=self.engine,
+        )
+        k_rot = _apply_rope_3d_nd(
+            k_heads,
+            start_position=start_pos,
+            rope_theta=self.arch.rope_theta,
+            rotary_dim=self.arch.rotary_dim,
+            interleaved=self.arch.has_interleaved_rope,
+            engine=self.engine,
+        )
 
         if start_pos > 0:
             try:
@@ -346,6 +421,12 @@ class TransformerLayerRealizer:
         attn_concat = self.engine.causal_gqa_nd(q_rot, k_full_nd, v_full_nd, start_position=start_pos)
         o_proj_w = self._load_tensor_nd(p + "self_attn.o_proj.weight", loaded_log)
         attn_proj = self.engine.linear_x_wt_nd(attn_concat, o_proj_w)
+        if self.arch.has_sandwich_norms:
+            attn_proj = self.engine.rms_norm_nd(
+                attn_proj,
+                self._load_tensor_nd(p + "post_self_attn_layernorm.weight", loaded_log),
+                eps,
+            )
         post_attn = np.ascontiguousarray(x_nd + attn_proj, dtype=np.float32)
 
         post_norm_w = self._load_tensor_nd(p + "post_attention_layernorm.weight", loaded_log)
@@ -353,8 +434,14 @@ class TransformerLayerRealizer:
 
         moe_receipts: list[MoERoutingReceipt] = []
         if not self.arch.is_moe:
-            gate = self.engine.linear_x_wt_nd(normed_ffn, self._load_tensor_nd(p + "mlp.gate_proj.weight", loaded_log))
-            up = self.engine.linear_x_wt_nd(normed_ffn, self._load_tensor_nd(p + "mlp.up_proj.weight", loaded_log))
+            if self.arch.has_fused_gate_up:
+                f_sz = int(self.arch.intermediate_size or 0)
+                gu = self.engine.linear_x_wt_nd(normed_ffn, self._load_tensor_nd(p + "mlp.gate_up_proj.weight", loaded_log))
+                gate = np.ascontiguousarray(gu[:, :f_sz], dtype=np.float32)
+                up = np.ascontiguousarray(gu[:, f_sz:], dtype=np.float32)
+            else:
+                gate = self.engine.linear_x_wt_nd(normed_ffn, self._load_tensor_nd(p + "mlp.gate_proj.weight", loaded_log))
+                up = self.engine.linear_x_wt_nd(normed_ffn, self._load_tensor_nd(p + "mlp.up_proj.weight", loaded_log))
             act = self.engine.swiglu_nd(gate, up)
             ffn_out = self.engine.linear_x_wt_nd(act, self._load_tensor_nd(p + "mlp.down_proj.weight", loaded_log))
         else:
@@ -387,6 +474,13 @@ class TransformerLayerRealizer:
                     e_out = self.engine.linear_x_wt_nd(swi, dw)[0]
                     ffn_out[t_rel] += float(exp_w) * e_out.astype(np.float64)
             ffn_out = ffn_out.astype(np.float32)
+
+        if self.arch.has_sandwich_norms:
+            ffn_out = self.engine.rms_norm_nd(
+                ffn_out,
+                self._load_tensor_nd(p + "post_mlp_layernorm.weight", loaded_log),
+                eps,
+            )
 
         final_nd = np.ascontiguousarray(post_attn.astype(np.float64) + ffn_out.astype(np.float64), dtype=np.float64)
         if not bool(np.isfinite(final_nd).all()):
@@ -441,25 +535,53 @@ class TransformerLayerRealizer:
         q_flat = self.engine.linear_x_wt(normed_x, self._load_tensor(p + "self_attn.q_proj.weight", loaded_log))
         k_flat = self.engine.linear_x_wt(normed_x, self._load_tensor(p + "self_attn.k_proj.weight", loaded_log))
         v_flat = self.engine.linear_x_wt(normed_x, self._load_tensor(p + "self_attn.v_proj.weight", loaded_log))
+        if self.arch.has_qkv_bias:
+            qb = self._load_tensor(p + "self_attn.q_proj.bias", loaded_log)
+            kb = self._load_tensor(p + "self_attn.k_proj.bias", loaded_log)
+            vb = self._load_tensor(p + "self_attn.v_proj.bias", loaded_log)
+            q_flat = [[float(x) + float(b) for x, b in zip(row, qb)] for row in q_flat]
+            k_flat = [[float(x) + float(b) for x, b in zip(row, kb)] for row in k_flat]
+            v_flat = [[float(x) + float(b) for x, b in zip(row, vb)] for row in v_flat]
 
-        q_norm_w = self._load_tensor(p + "self_attn.q_norm.weight", loaded_log)
-        k_norm_w = self._load_tensor(p + "self_attn.k_norm.weight", loaded_log)
-
-        q_heads = [
-            self.engine.rms_norm_2d([q_flat[t][h * hd : (h + 1) * hd] for h in range(nq)], q_norm_w, eps)
-            for t in range(seq_len)
-        ]
-        k_heads = [
-            self.engine.rms_norm_2d([k_flat[t][h * hd : (h + 1) * hd] for h in range(nkv)], k_norm_w, eps)
-            for t in range(seq_len)
-        ]
+        if self.arch.has_qk_norm:
+            q_norm_w = self._load_tensor(p + "self_attn.q_norm.weight", loaded_log)
+            k_norm_w = self._load_tensor(p + "self_attn.k_norm.weight", loaded_log)
+            q_heads = [
+                self.engine.rms_norm_2d([q_flat[t][h * hd : (h + 1) * hd] for h in range(nq)], q_norm_w, eps)
+                for t in range(seq_len)
+            ]
+            k_heads = [
+                self.engine.rms_norm_2d([k_flat[t][h * hd : (h + 1) * hd] for h in range(nkv)], k_norm_w, eps)
+                for t in range(seq_len)
+            ]
+        else:
+            q_heads = [
+                [[float(x) for x in q_flat[t][h * hd : (h + 1) * hd]] for h in range(nq)]
+                for t in range(seq_len)
+            ]
+            k_heads = [
+                [[float(x) for x in k_flat[t][h * hd : (h + 1) * hd]] for h in range(nkv)]
+                for t in range(seq_len)
+            ]
         v_heads = [
             [[float(x) for x in v_flat[t][h * hd : (h + 1) * hd]] for h in range(nkv)]
             for t in range(seq_len)
         ]
 
-        q_rot = _apply_rope_3d(q_heads, start_position=start_pos, rope_theta=self.arch.rope_theta)
-        k_rot = _apply_rope_3d(k_heads, start_position=start_pos, rope_theta=self.arch.rope_theta)
+        q_rot = _apply_rope_3d(
+            q_heads,
+            start_position=start_pos,
+            rope_theta=self.arch.rope_theta,
+            rotary_dim=self.arch.rotary_dim,
+            interleaved=self.arch.has_interleaved_rope,
+        )
+        k_rot = _apply_rope_3d(
+            k_heads,
+            start_position=start_pos,
+            rope_theta=self.arch.rope_theta,
+            rotary_dim=self.arch.rotary_dim,
+            interleaved=self.arch.has_interleaved_rope,
+        )
 
         k_full = [
             *([[list(hv) for hv in tok] for tok in past_k]),
@@ -494,6 +616,12 @@ class TransformerLayerRealizer:
 
         o_proj_w = self._load_tensor(p + "self_attn.o_proj.weight", loaded_log)
         attn_proj = self.engine.linear_x_wt(attn_concat, o_proj_w)
+        if self.arch.has_sandwich_norms:
+            attn_proj = self.engine.rms_norm_2d(
+                attn_proj,
+                self._load_tensor(p + "post_self_attn_layernorm.weight", loaded_log),
+                eps,
+            )
         post_attn = [
             [float(x0) + float(dx) for x0, dx in zip(r0, dr)]
             for r0, dr in zip(hidden_states, attn_proj)
@@ -505,8 +633,14 @@ class TransformerLayerRealizer:
 
         moe_receipts: list[MoERoutingReceipt] = []
         if not self.arch.is_moe:
-            gate = self.engine.linear_x_wt(normed_ffn, self._load_tensor(p + "mlp.gate_proj.weight", loaded_log))
-            up = self.engine.linear_x_wt(normed_ffn, self._load_tensor(p + "mlp.up_proj.weight", loaded_log))
+            if self.arch.has_fused_gate_up:
+                f_sz = int(self.arch.intermediate_size or 0)
+                gu = self.engine.linear_x_wt(normed_ffn, self._load_tensor(p + "mlp.gate_up_proj.weight", loaded_log))
+                gate = [row[:f_sz] for row in gu]
+                up = [row[f_sz:] for row in gu]
+            else:
+                gate = self.engine.linear_x_wt(normed_ffn, self._load_tensor(p + "mlp.gate_proj.weight", loaded_log))
+                up = self.engine.linear_x_wt(normed_ffn, self._load_tensor(p + "mlp.up_proj.weight", loaded_log))
             act = self.engine.swiglu_2d(gate, up)
             ffn_out = self.engine.linear_x_wt(act, self._load_tensor(p + "mlp.down_proj.weight", loaded_log))
         else:
@@ -541,6 +675,13 @@ class TransformerLayerRealizer:
                     for h_i in range(self.arch.hidden_size):
                         accum[h_i] += exp_w * e_out[h_i]
                 ffn_out.append(accum)
+
+        if self.arch.has_sandwich_norms:
+            ffn_out = self.engine.rms_norm_2d(
+                ffn_out,
+                self._load_tensor(p + "post_mlp_layernorm.weight", loaded_log),
+                eps,
+            )
 
         final_hidden = [
             [float(r0[i]) + float(df[i]) for i in range(self.arch.hidden_size)]
@@ -596,7 +737,8 @@ class IndependentReferenceOracle:
         nq = arch.num_attention_heads
         nkv = arch.num_key_value_heads
         hd = arch.head_dim
-        half = hd // 2
+        rdim = arch.rotary_dim
+        half = rdim // 2
         eps = arch.rms_norm_eps
 
         for l_idx in range(arch.num_hidden_layers):
@@ -606,8 +748,13 @@ class IndependentReferenceOracle:
             wk = W(p + "self_attn.k_proj.weight")
             wv = W(p + "self_attn.v_proj.weight")
             wo = W(p + "self_attn.o_proj.weight")
-            wqn = W(p + "self_attn.q_norm.weight")
-            wkn = W(p + "self_attn.k_norm.weight")
+            wqn = W(p + "self_attn.q_norm.weight") if arch.has_qk_norm else None
+            wkn = W(p + "self_attn.k_norm.weight") if arch.has_qk_norm else None
+            bq = W(p + "self_attn.q_proj.bias") if arch.has_qkv_bias else None
+            bk = W(p + "self_attn.k_proj.bias") if arch.has_qkv_bias else None
+            bv = W(p + "self_attn.v_proj.bias") if arch.has_qkv_bias else None
+            w_post_sa = W(p + "post_self_attn_layernorm.weight") if arch.has_sandwich_norms else None
+            w_post_mlp = W(p + "post_mlp_layernorm.weight") if arch.has_sandwich_norms else None
 
             q_seq: list[list[list[float]]] = []
             k_seq: list[list[list[float]]] = []
@@ -617,20 +764,39 @@ class IndependentReferenceOracle:
                 qf = cls._matvec(wq, nx)
                 kf = cls._matvec(wk, nx)
                 vf = cls._matvec(wv, nx)
-                qh_list = [cls._rms(qf[h * hd : (h + 1) * hd], wqn, eps) for h in range(nq)]
-                kh_list = [cls._rms(kf[h * hd : (h + 1) * hd], wkn, eps) for h in range(nkv)]
+                if bq is not None and bk is not None and bv is not None:
+                    qf = [x + float(b) for x, b in zip(qf, bq)]
+                    kf = [x + float(b) for x, b in zip(kf, bk)]
+                    vf = [x + float(b) for x, b in zip(vf, bv)]
+                if wqn is not None and wkn is not None:
+                    qh_list = [cls._rms(qf[h * hd : (h + 1) * hd], wqn, eps) for h in range(nq)]
+                    kh_list = [cls._rms(kf[h * hd : (h + 1) * hd], wkn, eps) for h in range(nkv)]
+                else:
+                    qh_list = [[float(x) for x in qf[h * hd : (h + 1) * hd]] for h in range(nq)]
+                    kh_list = [[float(x) for x in kf[h * hd : (h + 1) * hd]] for h in range(nkv)]
                 vh_list = [vf[h * hd : (h + 1) * hd] for h in range(nkv)]
 
                 def rot_tok(h_vecs: list[list[float]], position: int) -> list[list[float]]:
                     res_h = []
                     for hv in h_vecs:
-                        r1, r2 = [], []
-                        for i in range(half):
-                            ang = position * (arch.rope_theta ** (-2.0 * i / hd))
-                            c, s = math.cos(ang), math.sin(ang)
-                            r1.append(hv[i] * c - hv[i + half] * s)
-                            r2.append(hv[i + half] * c + hv[i] * s)
-                        res_h.append(r1 + r2)
+                        tail = hv[rdim:] if rdim < hd else []
+                        if arch.has_interleaved_rope:
+                            rp = []
+                            for i in range(half):
+                                ang = position * (arch.rope_theta ** (-2.0 * i / rdim))
+                                c, s = math.cos(ang), math.sin(ang)
+                                x0, x1 = hv[2 * i], hv[2 * i + 1]
+                                rp.append(x0 * c - x1 * s)
+                                rp.append(x1 * c + x0 * s)
+                            res_h.append(rp + tail)
+                        else:
+                            r1, r2 = [], []
+                            for i in range(half):
+                                ang = position * (arch.rope_theta ** (-2.0 * i / rdim))
+                                c, s = math.cos(ang), math.sin(ang)
+                                r1.append(hv[i] * c - hv[i + half] * s)
+                                r2.append(hv[i + half] * c + hv[i] * s)
+                            res_h.append(r1 + r2 + tail)
                     return res_h
 
                 q_seq.append(rot_tok(qh_list, pos))
@@ -654,20 +820,30 @@ class IndependentReferenceOracle:
                     pr = [val / sm for val in ex]
                     cat.extend([sum(pr[s] * v_seq[s][kv_i][d] for s in range(t + 1)) for d in range(hd)])
                 proj = cls._matvec(wo, cat)
+                if w_post_sa is not None:
+                    proj = cls._rms(proj, w_post_sa, eps)
                 after_attn.append([a + b for a, b in zip(hidden[t], proj)])
 
             w_post = W(p + "post_attention_layernorm.weight")
             next_hidden: list[list[float]] = []
             if not arch.is_moe:
-                wg = W(p + "mlp.gate_proj.weight")
-                wu = W(p + "mlp.up_proj.weight")
                 wd = W(p + "mlp.down_proj.weight")
+                if arch.has_fused_gate_up:
+                    f_sz = int(arch.intermediate_size or 0)
+                    wgu = W(p + "mlp.gate_up_proj.weight")
+                    wg = wgu[:f_sz]
+                    wu = wgu[f_sz:]
+                else:
+                    wg = W(p + "mlp.gate_proj.weight")
+                    wu = W(p + "mlp.up_proj.weight")
                 for t in range(seq_len):
                     ny = cls._rms(after_attn[t], w_post, eps)
                     gv = cls._matvec(wg, ny)
                     uv = cls._matvec(wu, ny)
                     act = [(g / (1.0 + math.exp(-g))) * u for g, u in zip(gv, uv)]
                     dv = cls._matvec(wd, act)
+                    if w_post_mlp is not None:
+                        dv = cls._rms(dv, w_post_mlp, eps)
                     next_hidden.append([a + b for a, b in zip(after_attn[t], dv)])
             else:
                 assert arch.num_experts is not None and arch.num_experts_per_tok is not None

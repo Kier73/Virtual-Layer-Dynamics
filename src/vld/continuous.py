@@ -24,6 +24,7 @@ from dataclasses import dataclass
 import hashlib
 import math
 import struct
+import time
 from typing import Any, Callable, Mapping, Sequence
 
 from vld.accel import (
@@ -193,6 +194,36 @@ class CrossGroundContinuityReceipt:
 
 
 @dataclass(frozen=True, slots=True)
+class MeasuredStageTelemetry:
+    """Empirically measured physical execution & persistence telemetry (kept strictly distinct from model NavigationCostVector)."""
+
+    stage_index: int
+    stage_id: str
+    exec_elapsed_ms: float
+    verify_elapsed_ms: float
+    total_elapsed_ms: float
+    input_bytes: int
+    output_bytes: int
+    m1_bytes_persisted: int
+    m1_pages_persisted: int
+    recovered_from_quorum: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "exec_elapsed_ms": round(self.exec_elapsed_ms, 6),
+            "input_bytes": self.input_bytes,
+            "m1_bytes_persisted": self.m1_bytes_persisted,
+            "m1_pages_persisted": self.m1_pages_persisted,
+            "output_bytes": self.output_bytes,
+            "recovered_from_quorum": self.recovered_from_quorum,
+            "stage_id": self.stage_id,
+            "stage_index": self.stage_index,
+            "total_elapsed_ms": round(self.total_elapsed_ms, 6),
+            "verify_elapsed_ms": round(self.verify_elapsed_ms, 6),
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class ContinuousStageSpec:
     """Declarative specification of one stage inside a continuous multi-Ground computation."""
 
@@ -202,6 +233,7 @@ class ContinuousStageSpec:
     output_representation: str
     scheduler_id: str
     execute_fn: Callable[[Mapping[str, Any]], tuple[dict[str, Any], NavigationCostVector, str]]
+    verify_fn: Callable[[Mapping[str, Any], Mapping[str, Any]], tuple[bool, str]] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -215,6 +247,9 @@ class ContinuousPipelineResult:
     stages_recovered_from_quorum: int
     total_cost: NavigationCostVector
     final_continuity_digest: str
+    stage_telemetry: tuple[MeasuredStageTelemetry, ...] = ()
+    measured_wall_ms: float = 0.0
+    measured_m1_bytes: int = 0
 
 
 class ContinuousVirtualSystem:
@@ -228,12 +263,16 @@ class ContinuousVirtualSystem:
         quorum: QuorumLineageCoordinator,
         active_quorum_members: Sequence[str],
         journal: HashChainedJournal | None = None,
+        require_independent_verifier: bool = False,
+        reverify_recovered_stages: bool = False,
     ) -> None:
         self.pipeline_id = pipeline_id
         self.store = store
         self.quorum = quorum
         self.active_quorum_members = tuple(active_quorum_members)
         self.journal = journal if journal is not None else HashChainedJournal()
+        self.require_independent_verifier = bool(require_independent_verifier)
+        self.reverify_recovered_stages = bool(reverify_recovered_stages)
 
     def execute_stages(
         self,
@@ -246,19 +285,32 @@ class ContinuousVirtualSystem:
         """Execute or resume `stages` with Paxos term fencing, M1 state manifests & `ClockBridgeReceipt`s."""
         if not stages:
             raise ContinuousSystemError("stages cannot be empty.")
+        if self.require_independent_verifier:
+            for st_spec in stages:
+                if st_spec.verify_fn is None:
+                    raise ContinuousSystemError(
+                        f"Stage {st_spec.stage_id!r} lacks mandatory independent verify_fn."
+                    )
 
         # Fence next Paxos term on strict majority so any dead/zombie predecessor host is fenced!
         max_promised = self.quorum.max_observed_term(active_member_ids=self.active_quorum_members)
         term = max_promised + 1
         self.quorum.fence_term(term, active_member_ids=self.active_quorum_members, owner_id=host_id)
+        probe_limit = max(len(stages) + 8, self.quorum.high_water_slot + 4)
         locked_max = max(
-            (s for s in range(1, len(stages) + 1) if self.quorum.locked_slot_record(s) is not None),
+            (s for s in range(1, probe_limit + 1) if self.quorum.locked_slot_record(s) is not None),
             default=0,
         )
         hw_slot = max(self.quorum.high_water_slot, locked_max)
+        if hw_slot > len(stages):
+            raise ContinuousSystemError(
+                f"Committed quorum high-water slot {hw_slot} exceeds supplied stage count {len(stages)} for pipeline {self.pipeline_id!r}."
+            )
 
-        # Recover all previously sealed/quorum-accepted stages without re-executing them!
+        # Recover all previously sealed/quorum-accepted stages without re-executing them, while strictly
+        # verifying genesis input digest and every stage specification/representation contract!
         recovered_receipts: list[CrossGroundContinuityReceipt] = []
+        telemetry_log: list[MeasuredStageTelemetry] = []
         cur_state: dict[str, Any] = parse_strict_json(canonical_json(dict(initial_input)))
         prev_cont_digest = GENESIS_PREV_DIGEST
         prev_manifest_digest = GENESIS_PREV_DIGEST
@@ -266,6 +318,8 @@ class ContinuousVirtualSystem:
         prev_ground_fp = domain_digest("vld.pipeline-genesis.v1", {"input": cur_state, "pipeline_id": self.pipeline_id})
 
         for slot_idx in range(1, hw_slot + 1):
+            t_rec_start = time.perf_counter_ns()
+            expected_stage = stages[slot_idx - 1]
             acc = self.quorum.locked_slot_record(slot_idx)
             cert_s = self.quorum.certificate_at(slot_idx)
             if cert_s is None and acc is not None:
@@ -283,21 +337,74 @@ class ContinuousVirtualSystem:
             if s_dg is None or cert_s is None:
                 raise ContinuousSystemError(f"Missing quorum record for committed slot {slot_idx}.")
             rcpt = self._recover_receipt_by_digest(s_dg, cert_s)
+            if rcpt.pipeline_id != self.pipeline_id:
+                raise ContinuousSystemError(
+                    f"Recovered stage {slot_idx - 1} belongs to pipeline {rcpt.pipeline_id!r}, expected {self.pipeline_id!r}."
+                )
             if rcpt.stage_index != slot_idx - 1 or rcpt.prev_continuity_digest != prev_cont_digest:
                 raise ContinuousSystemError(f"Broken continuity chain at recovered stage {slot_idx - 1}.")
-            cur_state = parse_strict_json(self.store.read_bytes(rcpt.state_manifest))
+            if rcpt.stage_id != expected_stage.stage_id:
+                raise ContinuousSystemError(
+                    f"Recovered stage {slot_idx - 1} stage_id {rcpt.stage_id!r} disagrees with requested {expected_stage.stage_id!r}."
+                )
+            if rcpt.source_ground_fingerprint != prev_ground_fp:
+                raise ContinuousSystemError(
+                    f"Recovered stage {slot_idx - 1} source_ground_fingerprint mismatch (initial input or upstream Ground changed)."
+                )
+            if rcpt.target_ground_fingerprint != expected_stage.ground_spec.fingerprint:
+                raise ContinuousSystemError(
+                    f"Recovered stage {slot_idx - 1} target_ground_fingerprint disagrees with requested stage Ground."
+                )
+            if (
+                rcpt.source_representation != expected_stage.input_representation
+                or rcpt.target_representation != expected_stage.output_representation
+            ):
+                raise ContinuousSystemError(
+                    f"Recovered stage {slot_idx - 1} representation contract ({rcpt.source_representation!r} -> {rcpt.target_representation!r}) "
+                    f"disagrees with requested ({expected_stage.input_representation!r} -> {expected_stage.output_representation!r})."
+                )
+            in_bytes = len(canonical_bytes(cur_state))
+            raw_recovered = self.store.read_bytes(rcpt.state_manifest)
+            recovered_state = parse_strict_json(raw_recovered)
+            t_ver_ns = 0
+            if self.reverify_recovered_stages and expected_stage.verify_fn is not None:
+                tv0 = time.perf_counter_ns()
+                v_ok, v_msg = expected_stage.verify_fn(cur_state, recovered_state)
+                t_ver_ns = time.perf_counter_ns() - tv0
+                if not isinstance(v_ok, bool) or not v_ok:
+                    raise ContinuousSystemError(
+                        f"Recovered stage {expected_stage.stage_id!r} failed independent re-verification: {v_msg}"
+                    )
+            cur_state = recovered_state
             recovered_receipts.append(rcpt)
             prev_cont_digest = rcpt.continuity_digest
             prev_manifest_digest = s_dg
             prev_temporal = rcpt.temporal_coordinate
             prev_ground_fp = rcpt.target_ground_fingerprint
+            t_rec_total = time.perf_counter_ns() - t_rec_start
+            telemetry_log.append(
+                MeasuredStageTelemetry(
+                    stage_index=slot_idx - 1,
+                    stage_id=expected_stage.stage_id,
+                    exec_elapsed_ms=0.0,
+                    verify_elapsed_ms=t_ver_ns / 1e6,
+                    total_elapsed_ms=t_rec_total / 1e6,
+                    input_bytes=in_bytes,
+                    output_bytes=len(raw_recovered),
+                    m1_bytes_persisted=0,
+                    m1_pages_persisted=0,
+                    recovered_from_quorum=True,
+                )
+            )
 
         recovered_count = len(recovered_receipts)
         executed_count = 0
         all_receipts = list(recovered_receipts)
 
         for idx in range(recovered_count, len(stages)):
+            t_stage_0 = time.perf_counter_ns()
             stage = stages[idx]
+            in_bytes = len(canonical_bytes(cur_state))
             next_clock = VectorClock.from_mapping({host_id: idx + 1})
             next_temporal = TemporalCoordinate(scheduler_id=stage.scheduler_id, epoch=term, clock=next_clock)
             bridge_digest: str | None = None
@@ -318,12 +425,26 @@ class ContinuousVirtualSystem:
                 else:
                     next_temporal = prev_temporal.advance(host_id, 1)
 
+            t_exec_0 = time.perf_counter_ns()
             next_state, stage_cost, verdict = stage.execute_fn(cur_state)
-            if not verdict.startswith("PASS"):
+            t_exec_ns = time.perf_counter_ns() - t_exec_0
+            if not isinstance(verdict, str) or not verdict.startswith("PASS"):
                 raise ContinuousSystemError(f"Stage {stage.stage_id!r} failed independent oracle: {verdict}")
 
             clean_next = parse_strict_json(canonical_json(dict(next_state)))
-            state_m = self.store.put_bytes(canonical_bytes(clean_next), media_type="application/json")
+            t_ver_ns = 0
+            if stage.verify_fn is not None:
+                t_ver_0 = time.perf_counter_ns()
+                v_ok, v_note = stage.verify_fn(cur_state, clean_next)
+                t_ver_ns = time.perf_counter_ns() - t_ver_0
+                if not isinstance(v_ok, bool) or not v_ok:
+                    raise ContinuousSystemError(
+                        f"Stage {stage.stage_id!r} rejected by mandatory independent verifier: {v_note}"
+                    )
+                verdict = f"{verdict}|VERIFIED:{v_note}"
+
+            out_raw = canonical_bytes(clean_next)
+            state_m = self.store.put_bytes(out_raw, media_type="application/json")
 
             # Write-ahead pre-seal envelope BEFORE quorum proposal so zero crash window exists!
             prelim_env = {
@@ -382,6 +503,21 @@ class ContinuousVirtualSystem:
                 stage_cost=stage_cost,
             )
             self._save_slot_envelope(slot_token_dg, rcpt)
+            t_stage_ns = time.perf_counter_ns() - t_stage_0
+            telemetry_log.append(
+                MeasuredStageTelemetry(
+                    stage_index=idx,
+                    stage_id=stage.stage_id,
+                    exec_elapsed_ms=t_exec_ns / 1e6,
+                    verify_elapsed_ms=t_ver_ns / 1e6,
+                    total_elapsed_ms=t_stage_ns / 1e6,
+                    input_bytes=in_bytes,
+                    output_bytes=len(out_raw),
+                    m1_bytes_persisted=state_m.size_bytes,
+                    m1_pages_persisted=len(state_m.chunks),
+                    recovered_from_quorum=False,
+                )
+            )
 
             all_receipts.append(rcpt)
             cur_state = clean_next
@@ -408,6 +544,9 @@ class ContinuousVirtualSystem:
             stages_recovered_from_quorum=recovered_count,
             total_cost=tot_cost,
             final_continuity_digest=prev_cont_digest,
+            stage_telemetry=tuple(telemetry_log),
+            measured_wall_ms=sum(t.total_elapsed_ms for t in telemetry_log),
+            measured_m1_bytes=sum(t.m1_bytes_persisted for t in telemetry_log),
         )
 
     def _save_pre_seal_envelope(
@@ -1084,13 +1223,88 @@ def _run_campaign_with_pki(
                             f"PASS:dsv41_diff={ds_diff:.2e},glm53_mla_diff={abs_check['max_abs_diff']:.2e}",
                         )
 
+                    def _verify_s0(inp: Mapping[str, Any], out: Mapping[str, Any]) -> tuple[bool, str]:
+                        exp_ttl = (int(inp["initial_ttl"]) - 2 * 5) % 256
+                        exp_ints = list(struct.unpack("<IIII", seed_asset[-16:]))
+                        ok = (
+                            int(out.get("jumped_ttl", -1)) == exp_ttl
+                            and int(out.get("lifted_len", -1)) == len(seed_asset)
+                            and list(out.get("seed_ints", ())) == exp_ints
+                        )
+                        return ok, f"ttl={exp_ttl},seed_ok={ok}"
+
+                    def _verify_s1(inp: Mapping[str, Any], out: Mapping[str, Any]) -> tuple[bool, str]:
+                        s0_v = int(inp["seed_ints"][0])
+                        exp_p = [(s0_v + 11 * (10**9 + k)) % 251 for k in range(8)]
+                        ok = list(out.get("piped_bytes", ())) == exp_p and len(str(out.get("os_snapshot_digest", ""))) == 64
+                        return ok, "posix_pipe_exact"
+
+                    def _verify_s2(inp: Mapping[str, Any], out: Mapping[str, Any]) -> tuple[bool, str]:
+                        v0_ref = [int(x) % p_mod for x in list(inp["piped_bytes"])[:6]]
+                        exp_vec = _mat_vec_fp(_mat_pow_fp(op_chain.composite_matrix(), horizon, p_mod), v0_ref, p_mod)
+                        ok = list(out.get("orbit_vec", ())) == list(exp_vec)
+                        return ok, "fp97_matrix_pow_oracle"
+
+                    def _verify_s3(inp: Mapping[str, Any], out: Mapping[str, Any]) -> tuple[bool, str]:
+                        ov_ref = [int(x) for x in inp["orbit_vec"]]
+                        # Independent closed-form affine LCG check mod 65521: x_{t+1} = (17 * x_t + 29) mod 65521
+                        m_w = 65521
+                        a_n = pow(17, 10_000, m_w)
+                        geom = ((a_n - 1) * pow(16, m_w - 2, m_w)) % m_w
+                        exp_wasm = (a_n * (ov_ref[0] % m_w) + 29 * geom) % m_w
+                        if int(out.get("wasm_scalar", -1)) != exp_wasm:
+                            return False, "wasm_lcg_mismatch"
+                        a_ref = [[float((ov_ref[(r + k) % 6] + exp_wasm % 13) * 0.05) for k in range(8)] for r in range(2)]
+                        b_ref = [[float(((k * 3 + c) % 11 - 5) * 0.05) for c in range(16)] for k in range(8)]
+                        acts = out.get("egpu_activations", ())
+                        for r in range(2):
+                            for c in range(16):
+                                ref = math.fsum(a_ref[r][k] * b_ref[k][c] for k in range(8))
+                                if abs(float(acts[r][c]) - ref) >= 1e-5:
+                                    return False, "egpu_matmul_mismatch"
+                        return True, "lcg_closed_form_and_fsum_matmul"
+
+                    def _verify_s4(inp: Mapping[str, Any], out: Mapping[str, Any]) -> tuple[bool, str]:
+                        acts_in = inp["egpu_activations"]
+                        got_out = out.get("cut_output", ())
+                        for r_idx, x_row in enumerate(acts_in):
+                            inter: list[float] = []
+                            for h_i in range(32):
+                                g_v = math.fsum(float(wg_cut[h_i][c]) * float(x_row[c]) for c in range(16))
+                                u_v = math.fsum(float(wu_cut[h_i][c]) * float(x_row[c]) for c in range(16))
+                                s_v = (g_v / (1.0 + math.exp(-g_v))) * u_v
+                                inter.append(s_v)
+                            for o_i in range(16):
+                                ref_o = float(b_cut[o_i]) + math.fsum(float(wd_cut[o_i][h_i]) * inter[h_i] for h_i in range(32))
+                                if abs(float(got_out[r_idx][o_i]) - ref_o) >= 1e-4:
+                                    return False, "swiglu_cut_oracle_mismatch"
+                        return True, "independent_swiglu_fp64_oracle"
+
+                    def _verify_s5(inp: Mapping[str, Any], out: Mapping[str, Any]) -> tuple[bool, str]:
+                        co = inp["cut_output"]
+                        exp_toks = [
+                            int(abs(round(float(co[0][0]) * 100)) + int(inp["wasm_scalar"])) % 32,
+                            int(abs(round(float(co[1][1]) * 100)) + 3) % 32,
+                            int(abs(round(float(co[0][2]) * 100)) + 7) % 32,
+                        ]
+                        if list(out.get("prompt_tokens", ())) != exp_toks:
+                            return False, "prompt_token_derivation_mismatch"
+                        ds_ref = DeepSeekV41ReferenceOracle.forward_full(ds_arch, ds_weights, exp_toks)
+                        exp_ds_top1 = max(range(32), key=lambda idx: ds_ref[-1][idx])
+                        ok = (
+                            int(out.get("deepseek_v41_top1", -1)) == exp_ds_top1
+                            and float(out.get("deepseek_v41_oracle_diff", 1.0)) < 1e-4
+                            and float(out.get("glm_53_mla_diff", 1.0)) < 1e-5
+                        )
+                        return ok, "dsv41_ref_oracle_and_glm53_mla_bound"
+
                     return (
-                        ContinuousStageSpec("s0_internet_router", g0, "init_json", "encounter_seed", "sched.path.0", _run_s0),
-                        ContinuousStageSpec("s1_headless_os", g1, "encounter_seed", "posix_pipe", "sched.os.1", _run_s1),
-                        ContinuousStageSpec("s2_observer_orbit", g2, "posix_pipe", "fp97_orbit", "sched.orbit.2", _run_s2),
-                        ContinuousStageSpec("s3_wasm_egpu", g3, "fp97_orbit", "egpu_tensor", "sched.substrate.3", _run_s3),
-                        ContinuousStageSpec("s4_mtls_fabric", cut_ground, "egpu_tensor", "cut_activations", "sched.fabric.4", _run_s4),
-                        ContinuousStageSpec("s5_frontier_models", g5, "cut_activations", "frontier_logits", "sched.frontier.5", _run_s5),
+                        ContinuousStageSpec("s0_internet_router", g0, "init_json", "encounter_seed", "sched.path.0", _run_s0, _verify_s0),
+                        ContinuousStageSpec("s1_headless_os", g1, "encounter_seed", "posix_pipe", "sched.os.1", _run_s1, _verify_s1),
+                        ContinuousStageSpec("s2_observer_orbit", g2, "posix_pipe", "fp97_orbit", "sched.orbit.2", _run_s2, _verify_s2),
+                        ContinuousStageSpec("s3_wasm_egpu", g3, "fp97_orbit", "egpu_tensor", "sched.substrate.3", _run_s3, _verify_s3),
+                        ContinuousStageSpec("s4_mtls_fabric", cut_ground, "egpu_tensor", "cut_activations", "sched.fabric.4", _run_s4, _verify_s4),
+                        ContinuousStageSpec("s5_frontier_models", g5, "cut_activations", "frontier_logits", "sched.frontier.5", _run_s5, _verify_s5),
                     )
 
                 def _new_quorum(lineage_id: str) -> QuorumLineageCoordinator:
@@ -1106,6 +1320,7 @@ def _run_campaign_with_pki(
                     store=PagedObjectStore(InMemoryPageBacking(4096)),
                     quorum=_new_quorum("lineage.pass1"),
                     active_quorum_members=("q0", "q1", "q2"),
+                    require_independent_verifier=True,
                 )
                 pass1_res = sys_p1.execute_stages(_make_stages(False), {"initial_ttl": 64}, host_id="host.alpha")
                 hits_delta_p1 = origin_srv.origin_hits - hits_before_p1
@@ -1185,6 +1400,7 @@ def _run_campaign_with_pki(
                     quorum=shared_quorum_p2,
                     active_quorum_members=("q0", "q1"),
                     journal=shared_journal_p2,
+                    require_independent_verifier=True,
                 )
                 # Host 1 executes Stages 0, 1, 2 and is interrupted after stage 2!
                 p2_partial = sys_p2_host1.execute_stages(
@@ -1201,6 +1417,8 @@ def _run_campaign_with_pki(
                     quorum=shared_quorum_p2,
                     active_quorum_members=("q1", "q2"),
                     journal=shared_journal_p2,
+                    require_independent_verifier=True,
+                    reverify_recovered_stages=True,
                 )
                 p2_resumed = sys_p2_host2.execute_stages(
                     _make_stages(True),
@@ -1232,6 +1450,7 @@ __all__ = [
     "ContinuousSystemError",
     "ContinuousVirtualSystem",
     "CrossGroundContinuityReceipt",
+    "MeasuredStageTelemetry",
     "SelfImprovingCampaignReport",
     "build_compact_deepseek_v41_fixture",
     "build_compact_glm53_fixture",

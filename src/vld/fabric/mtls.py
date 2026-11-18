@@ -22,6 +22,7 @@ from datetime import datetime, timedelta, timezone
 import hashlib
 import ipaddress
 import math
+import os
 from pathlib import Path
 import secrets
 import socket
@@ -287,6 +288,31 @@ class PeerIdentityBundle:
     key_path: Path
 
 
+def _write_private_key_secure(path: Path, pem_text: str) -> None:
+    """Write PEM private key material with owner-only `0600` mode from file creation (zero `0644` TOCTOU window)."""
+    raw = pem_text.encode("ascii")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    fd = os.open(str(path), flags, 0o600)
+    try:
+        try:
+            if hasattr(os, "fchmod"):
+                os.fchmod(fd, 0o600)  # type: ignore[attr-defined]
+        except OSError:
+            pass
+        written = 0
+        while written < len(raw):
+            n = os.write(fd, raw[written:])
+            if n <= 0:
+                raise MutualTLSError(f"Short write persisting private key {path}.")
+            written += n
+    finally:
+        os.close(fd)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
 def generate_ephemeral_mtls_pki(
     out_dir: str | Path,
     peer_dns_names: Sequence[str],
@@ -295,7 +321,11 @@ def generate_ephemeral_mtls_pki(
 ) -> dict[str, PeerIdentityBundle]:
     """Generate a fresh Root CA and SAN-bound mTLS leaf certificates on disk with zero external tools."""
     root = Path(out_dir)
-    root.mkdir(parents=True, exist_ok=True)
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        os.chmod(root, 0o700)
+    except OSError:
+        pass
     ca_key = _generate_rsa_keypair(2048)
     ca_pem, ca_ski = _build_x509_v3_cert_pem(
         subject_cn=ca_common_name,
@@ -323,7 +353,7 @@ def generate_ephemeral_mtls_pki(
         cert_p = root / f"{safe}.crt.pem"
         key_p = root / f"{safe}.key.pem"
         cert_p.write_text(leaf_pem, encoding="ascii")
-        key_p.write_text(_encode_rsa_private_key_pem(leaf_key), encoding="ascii")
+        _write_private_key_secure(key_p, _encode_rsa_private_key_pem(leaf_key))
         bundles[dns] = PeerIdentityBundle(peer_dns=dns, ca_cert_path=ca_path, cert_path=cert_p, key_path=key_p)
     return bundles
 

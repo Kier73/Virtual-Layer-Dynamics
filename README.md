@@ -39,13 +39,14 @@ For an $n$-step trajectory or $M \times N$ operator evaluation, Virtual Layer Dy
 
 ## Documentation Map
 
-- [**Mathematical Foundations**](docs/MATHEMATICAL_FOUNDATIONS.md) — Formal equations governing byte lifting, Virtual Grounds, Kleene $\mathcal{K}_3$ guards, multi-rung law certification, operator contraction, frontier `DeepSeek-V4.1` (`mHC` + `FP8`/`FP4` + Sink-MLA) & `GLM-5.3` (`MLA` Matrix Absorption) Grounds, $\mathbb{F}_p$ commutant block reduction, and continuous cross-Ground continuity.
-- [**Research State & Lineage**](docs/RESEARCH_STATE_AND_LINEAGE.md) — Audited status of all four predecessor codebases, live `510.29 GB` `DeepSeek-V4.1-Flash` & `1.507 TB` `GLM-5.3-BF16` HTTP `206` verification records, and strict epistemic boundaries.
-- [**Master Development Plan**](docs/DEVELOPMENT_PLAN.md) — Phased architecture and gate-driven engineering roadmap (`Phase 0` through `Phase 8`).
+- [**Mathematical Foundations**](docs/MATHEMATICAL_FOUNDATIONS.md) — Formal equations governing byte lifting, Virtual Grounds, Kleene $\mathcal{K}_3$ guards, multi-rung law certification, operator contraction, Fluid In-Transit CPU/GPU/VM lifting, frontier `DeepSeek-V4.1`, `GLM-5.3`, `DeepSeek-R1-Distill`, `GLM-Z1`, `Qwen3` & `SmolLM2` Grounds, recursive in-layer arbitration, and continuous cross-Ground continuity.
+- [**Research State & Lineage**](docs/RESEARCH_STATE_AND_LINEAGE.md) — Audited status of all four predecessor codebases, peer-audit verification & hardening record, live 7-model Hugging Face `206` & local execution measurements, and strict epistemic boundaries.
+- [**Master Development Plan**](docs/DEVELOPMENT_PLAN.md) — Phased architecture and gate-driven engineering roadmap (`Phase 0` through `Phase 9`).
+- [**Emergent Idea & Horizon Ledger**](docs/IDEA_LEDGER.md) — Living equational ledger of verified laws, negative controls, homomorphic latent consensus, sheaf-cohomological observer obstructions, and open multi-domain frontiers.
 
 ---
 
-## Consolidated Repository Layout (`v0.5.0` — Phases 0 through 8 Complete & Live-Verified)
+## Consolidated Repository Layout (`v0.6.0` — Phases 0 through 9 Complete, Hardened & Live-Verified)
 
 ```text
 Virtual-Layer-Dynamics/
@@ -54,25 +55,28 @@ Virtual-Layer-Dynamics/
 ├── docs/
 │   ├── MATHEMATICAL_FOUNDATIONS.md
 │   ├── RESEARCH_STATE_AND_LINEAGE.md
-│   └── DEVELOPMENT_PLAN.md
+│   ├── DEVELOPMENT_PLAN.md
+│   └── IDEA_LEDGER.md
 ├── src/vld/
 │   ├── canonical.py                # Deterministic JSON & domain-separated SHA-256 addressing
 │   ├── triad.py                    # Kleene K_3 guards, Myhill-Nerode quotient & erasure entropy
 │   ├── ground.py                   # VirtualGroundSpec, ByteLens, dual-derivation AffineOrbitLaw, Pareto cost
 │   ├── journal.py                  # Multi-process hash-chained receipt journal & idempotency fencing
+│   ├── independent_audit.py        # Standalone zero-import cryptographic & mathematical receipt/capsule auditor
 │   ├── signal/                     # Signal8, ModularRing & ExactRational backends, footprints, base-8 compiler
 │   ├── memory/                     # M1 PagedObjectStore (+ retention GC G15), 5-rung Law Certifier, 2-adic inverses
 │   ├── inquiry/                    # Greedy, beam & exact minimax probe planners + HypothesisRevisionLedger
 │   ├── authority/                  # Scheduler-scoped clocks (G13), 2q>N quorum M3 sessions & VirtualProcessor
 │   ├── navigation/                 # Lazy NavigableComputationDAG, ComposedGroundNavigator, F_p commutant blocks & congruence
 │   ├── accel/                      # StructuralLinearOperator, FP8/UE8M0/FP4 codecs, Birkhoff Sinkhorn mHC, NumPy + Rust CDLL
-│   ├── fabric/                     # VantageEnvelope, ReliableChannel, mTLS mesh, ComputationalFabricRouter & 4-cut SwiGLU
-│   ├── substrates/                 # HeadlessOS x86_64 POSIX ABI, ELF64/WASM lifters, SIMT/E-GPU, IPv4/Internet Path & ROOM
-│   ├── models/                     # HostedModelGlance, DeepSeek-V4.1, GLM-5.3 MLA Absorption, Qwen3, AKS & SNC/PNF
-│   ├── agents/                     # ProofGround hypergraph, ReceiverHypervisor, InLayerModelAgent & ContinuousLayerBuilderAgent
-│   ├── continuous.py               # Quorum-fenced, crash-resumable ContinuousVirtualSystem across Grounds, hosts & paths
-│   └── cli.py                      # `vld` CLI (`info`, `verify`, `navigate`, `benchmark`, `glance`, `continuous`, `serve`)
-└── tests/                          # 95 invariant, differential, frontier-LLM, OS, mTLS, crash-recovery & hygiene tests
+│   ├── fabric/                     # VantageEnvelope, ReliableChannel, 0600-key mTLS mesh, FabricRouter & 4-cut SwiGLU
+│   ├── substrates/                 # HeadlessOS POSIX ABI, Fluid In-Transit CPU/GPU/VM lifting, ELF64/WASM, SIMT, Path & ROOM
+│   ├── models/                     # DeepSeek-V4.1, GLM-5.3, DeepSeek-R1/Qwen2, GLM-Z1/GLM4, Qwen3, Llama/SmolLM2 & SNC/PNF
+│   ├── agents/                     # ProofGround hypergraph, ReceiverHypervisor (ARBITRATE_MODEL), InLayerModelAgent & Builder
+│   ├── continuous.py               # Genesis/spec-bound ContinuousVirtualSystem with mandatory independent verifiers & telemetry
+│   ├── arbitration.py              # Multi-source model arbitration, recursive InLayerMetaArbitratorModel, service & IdeaLedger
+│   └── cli.py                      # `vld` CLI (`info`, `verify`, `navigate`, `benchmark`, `glance`, `continuous`, `arbitrate`, `serve`)
+└── tests/                          # 102 invariant, differential, frontier-LLM, fluid-transit, arbitration, audit & hygiene tests
 ```
 
 ---
@@ -88,6 +92,7 @@ python -m vld verify
 python -m vld glance --profile deepseek-v4.1-flash
 python -m vld glance --profile glm-5.3-bf16
 python -m vld continuous
+python -m vld arbitrate --state-dir ./local-state/arb --cycles 2
 python -m vld benchmark --dim 1024 --steps 25000
 python -m vld navigate --seed 73 --coordinate 1000000000000
 python -m vld serve --host 127.0.0.1 --port 8730

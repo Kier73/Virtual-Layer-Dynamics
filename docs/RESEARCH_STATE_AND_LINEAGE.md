@@ -76,3 +76,16 @@ Following completion of Phases 0–7 (`v0.4.0`), a second predecessor research p
    - Executed full 64-head Layer 0 `MLA` Matrix Absorption verification over HTTPS `206` Range touching `1/282` shards (`0.104%` of checkpoint), achieving `0.0` binary32 `max_abs_diff` between materialized 64-head KV attention and latent-absorbed `(c_kv, k_pe)` attention.
 3. **Unified Continuous Operation (`vld continuous`):**
    - Verified end-to-end across a 6-stage pipeline (`IPv4 Router + HTTP Path` $\to$ `HeadlessOS POSIX CoW + Pipe` $\to$ `Signal8 Congruence + F_97 Commutant Orbit` $\to$ `WASM 1.0 + Tiled E-GPU` $\to$ `4-Worker mTLS Tensor-Cut Fabric` $\to$ `DeepSeek-V4.1 + GLM-5.3`), surviving mid-pipeline host replacement and real `os._exit(73)` child process destruction with zero stage replay while `ContinuousLayerBuilderAgent` upgrades reduce Pass 2 cost from `(L=9.2, E=12012, B=11112, R=78)` to `(L=3.8, E=4332, B=2116, R=78)` (`Pareto dominance = True`).
+
+---
+
+## 6. Phase 9 Peer-Audit Hardening, Fluid In-Transit Substrate & Live 7-Model Arbitration Record (`v0.6.0`, 2026-11-18)
+
+1. **Peer Read-Only Examination Findings Resolved & Regression-Tested:**
+   - Fixed `.github/workflows/ci.yml` unquoted YAML colon (`lambda _: None`) via block scalar `run: |` and added automated workflow YAML validation in `tests/test_phase9_fluid_and_arbitration.py`.
+   - Enforced atomic `0600` private-key file creation (`os.open(..., 0o600)`) and `0700` PKI directory permissions in `vld.fabric.mtls.generate_ephemeral_mtls_pki`.
+   - Enforced 7-invariant inductive genesis-input & stage-spec recovery binding, mandatory independent `verify_fn` contracts, and separated empirical wall-clock/M1 byte telemetry (`MeasuredStageTelemetry`) in `vld.continuous.ContinuousVirtualSystem`, paired with standalone zero-import verification (`vld.independent_audit`).
+2. **PyTorch `transformers` (`4.51.3`) FP32 Reference Parity Across Multi-Family Realizers:**
+   - Verified `TransformerLayerRealizer` directly against `LlamaForCausalLM` (`max_abs_logit_diff = 1.2e-7`), `Qwen2ForCausalLM` (`6.0e-8`), and `Glm4ForCausalLM` (`1.0e-7`), alongside previously verified `Qwen3ForCausalLM` (`7.0e-6`), `DeepSeek-V4.1`, and `GLM-5.3`.
+3. **Live 7-Model Recursive Arbitration Campaign Across `Virtual-Layer-Dynamics` $\leftrightarrow$ `In-Formation-Space` (`MVA-001`):**
+   - Executed end-to-end 30-layer greedy decode on live `HuggingFaceTB/SmolLM2-135M-Instruct` (`5` coalesced HTTP `206` spans, `ckpt = d6ae996b...`), 28-layer local greedy decode on `Qwen/Qwen3-0.6B` (`ckpt = cd3b3540...`), live HTTP `206` Layer 0 execution on `deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B` (`2.635%` of shard) and `THUDM/GLM-Z1-9B-0414` (`2.171%` of checkpoint), and live structural glances on `DeepSeek-V4.1-Flash` (`510.29 GB`), `GLM-5.3-BF16` (`1.507 TB`), and `Qwen3-30B-A3B` (`61.06 GB`), arbitrated by nested Depth-1 $\to$ Depth-2 `InLayerMetaArbitratorModel`s (`final_continuity_digest = b3437cfdbd8407e7...`, standalone audit `VERIFIED`).

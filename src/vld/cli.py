@@ -30,6 +30,15 @@ from vld.agents import (
     ReceiverHypervisor,
     create_default_exploration_grant,
 )
+from vld.arbitration import (
+    ContinuousArbitrationService,
+    ExplorationTaskSpec,
+    InLayerMetaArbitratorModel,
+    build_deepseek_v41_worker,
+    build_glm_53_worker,
+    build_nested_sub_arbitrator_worker,
+    create_meta_arbitrator_grant,
+)
 from vld.authority import (
     CausalOrder,
     CrossSchedulerComparisonError,
@@ -45,6 +54,7 @@ from vld.authority import (
 from vld.canonical import canonical_bytes, canonical_json, domain_digest, parse_strict_json
 from vld.continuous import (
     ContinuousStageSpec,
+    ContinuousSystemError,
     ContinuousVirtualSystem,
     build_compact_deepseek_v41_fixture,
     build_compact_glm53_fixture,
@@ -74,6 +84,11 @@ from vld.ground import (
     certify_modular_progression,
     expected_shortcut_cost,
     propose_modular_progression,
+)
+from vld.independent_audit import (
+    verify_continuity_receipt_chain_standalone,
+    verify_snc_1d_capsule_standalone,
+    verify_transit_packet_receipts_standalone,
 )
 from vld.journal import HashChainedJournal, IdempotencyConflictError
 from vld.memory import DiskPageBacking, InMemoryPageBacking, PagedObjectStore, StructuralMemoryRegistry, certify_sequence_law
@@ -111,6 +126,7 @@ from vld.signal import Signal8Backend, verify_differential_backends, verify_sign
 from vld.substrates import (
     BarrierDivergenceError,
     HeadlessOS,
+    InTransitPathMachine,
     InternetPathRefused,
     O_RDONLY,
     PF_R,
@@ -119,8 +135,12 @@ from vld.substrates import (
     SEEK_SET,
     SIMTInstruction,
     SIMTWorkgroupExecutor,
+    StreamInterpreterNode,
     TTL_PROBES,
+    TransitOperation,
+    TropicalMinPlusMatrix,
     VMInstruction,
+    VirtualMemoryMovementView,
     VirtualPageSpace,
     WasmRealizer,
     assemble_wasm_affine_orbit_module,
@@ -129,9 +149,12 @@ from vld.substrates import (
     build_minimal_elf64_image,
     build_room_intention,
     execute_room_on_realizer,
+    fold_cpu_stream_in_transit,
     lift_elf64_image,
     lift_wasm_module,
+    stream_flash_attention_in_transit,
     verify_ipv4_router_hop_ground,
+    verify_premature_normalization_counterexample,
 )
 from vld.triad import (
     EpistemicStatus,
@@ -642,6 +665,93 @@ def run_self_verification() -> dict[str, Any]:
     assert c_done.stages_recovered_from_quorum == 1 and c_done.stages_executed_this_invocation == 1 and c_done.final_state["v"] == 36
     checks["phase8_os_fabric_orbit_and_continuous_system"] = 14
 
+    # 13. Phase 9: Recovery-Identity Audit, Standalone Zero-Import Verifier, Fluid In-Transit Substrate, Multi-Family Models & Recursive Arbitration
+    try:
+        ContinuousVirtualSystem(
+            "verify.pipe", store=c_store, quorum=c_quorum, active_quorum_members=("c0", "c2"), journal=c_jour
+        ).execute_stages(c_stages, {"x": 999}, host_id="h.3")
+        raise AssertionError("Expected ContinuousSystemError when genesis initial_input changes on recovery")
+    except ContinuousSystemError:
+        pass
+
+    sa_rep = verify_continuity_receipt_chain_standalone(
+        [r.to_dict() for r in c_done.receipts],
+        pipeline_id="verify.pipe",
+        initial_input={"x": 7},
+        quorum_member_ids=("c0", "c1", "c2"),
+        quorum_member_secrets=c_secs,
+    )
+    assert sa_rep["status"] == "VERIFIED" and sa_rep["stages_verified"] == 2
+    snc_1d = compile_piecewise_affine_relu(
+        [
+            {"left": "-inf", "right": "0", "affines": [["0", "0"]]},
+            {"left": "0", "right": "+inf", "affines": [["3", "0"]]},
+        ]
+    )
+    assert verify_snc_1d_capsule_standalone(snc_1d)["status"] == "VERIFIED"
+
+    t_m1 = TropicalMinPlusMatrix(2, ((0.0, 3.0), (5.0, 1.0)))
+    t_m2 = TropicalMinPlusMatrix(2, ((2.0, math.inf), (1.0, 4.0)))
+    assert t_m1.compose(t_m2).apply_left_state((0.0, 10.0)) == t_m2.apply_left_state(t_m1.apply_left_state((0.0, 10.0)))
+    fsm_out, _ = fold_cpu_stream_in_transit(((1, 0, 1), (1, 1)), num_states=4, step_fn=lambda s, x: (2 * s + x) % 4, initial_state=0)
+    assert fsm_out == 3
+
+    fl_out, fl_stats = stream_flash_attention_in_transit(
+        [[1.0, 0.5], [-0.5, 1.0]],
+        (([[0.5, 1.0]], [[2.0, 4.0]]), ([[-1.0, 0.5]], [[6.0, 8.0]])),
+        query_start_pos=1,
+        causal=True,
+    )
+    assert len(fl_out) == 2 and fl_stats["hops"] == 2
+    assert verify_premature_normalization_counterexample()["sound_collapse_requires_max_and_sum_exp"] is True
+
+    vm_base = bytes(range(1, 17))
+    vm_view = VirtualMemoryMovementView.from_buffer("buf0", 16).transpose_2d(4, 4).rotate_view(3).reverse_view().cow_write(2, 200)
+    vm_mat = vm_view.materialize(vm_base)
+    assert vm_view.commute_invariant_reduction(vm_base, "sum") == sum(vm_mat)
+    assert vm_view.commute_invariant_reduction(vm_base, "xor") == eval("^".join(str(b) for b in vm_mat))
+
+    path_m = InTransitPathMachine((StreamInterpreterNode("n0", max_ops_per_hop=2), StreamInterpreterNode("n1", max_ops_per_hop=2)))
+    sched_ops = (
+        TransitOperation("affine_map", {"scale": 3, "bias": 1, "modulus": 97}),
+        TransitOperation("affine_map", {"scale": 5, "bias": 2, "modulus": 97}),
+        TransitOperation("reverse", {}),
+        TransitOperation("rotate", {"shift": 2}),
+        TransitOperation("reduce_sum", {}),
+    )
+    arr_pkt, p_tel = path_m.execute_in_transit(
+        "pkt.verify", initial_payload=[2, 4, 6, 8], schedule=sched_ops, target_representation="interpretable_scalar", transport="headless_os_pipe"
+    )
+    ref_val, _ = InTransitPathMachine.naive_hardware_reference([2, 4, 6, 8], sched_ops)
+    assert arr_pkt.payload == ref_val and p_tel["ops_eliminated_in_transit"] >= 3
+    assert verify_transit_packet_receipts_standalone(parse_strict_json(arr_pkt.to_wire_bytes()))["status"] == "VERIFIED"
+
+    for p_name in ("deepseek-r1-distill-qwen-1.5b", "smollm2-135m-instruct", "glm-z1-9b-0414"):
+        p_arch = TransformerArchitectureSpec.from_published_profile(p_name)
+        assert p_arch.parameter_inventory()["declared_elements"] > 100_000_000
+
+    arb_hyp = ReceiverHypervisor("verify.arb.hyp")
+    arb_hyp.register_agent(create_meta_arbitrator_grant("arb.d1", probe_budget=16, max_arbitration_depth=2))
+    arb_hyp.register_agent(create_meta_arbitrator_grant("arb.d2", probe_budget=16, max_arbitration_depth=2))
+    sub_m = InLayerMetaArbitratorModel("arb.d2", arb_hyp, arbitration_depth=2)
+    top_m = InLayerMetaArbitratorModel("arb.d1", arb_hyp, arbitration_depth=1)
+    w_d = build_deepseek_v41_worker("w.ds")
+    w_g = build_glm_53_worker("w.glm")
+    w_sub = build_nested_sub_arbitrator_worker("w.nested", sub_arbitrator=sub_m, sub_workers={"w.ds": w_d, "w.glm": w_g})
+    a_mem = QuorumMembership("verify.arb.q", ("aq0", "aq1", "aq2"))
+    a_secs = {m: f"arb-sec-{m}-0123456789".encode("utf-8") for m in a_mem.member_ids}
+    a_rep = top_m.arbitrate_and_execute(
+        ExplorationTaskSpec("t.ver", "Verify Recursive Arbitration", ("meta_arbitration", "sparse_moe"), "probe", desired_worker_count=2),
+        {"w.ds": w_d, "w.glm": w_g, "w.nested": w_sub},
+        cycle_index=0,
+        store=PagedObjectStore(InMemoryPageBacking(2048)),
+        quorum=QuorumLineageCoordinator(a_mem, [QuorumAuthorityMember(m, a_secs[m]) for m in a_mem.member_ids], a_secs),
+        active_quorum_members=("aq0", "aq1"),
+        journal=HashChainedJournal(),
+    )
+    assert "w.nested" in a_rep.selected_workers and len(a_rep.pipeline_result.final_continuity_digest) == 64
+    checks["phase9_fluid_transit_arbitration_and_independent_audit"] = 18
+
     return {
         "accelerators": {
             "native_rust_cdll": get_native_accelerator().available,
@@ -682,6 +792,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     cont_cmd = sub.add_parser("continuous", help="Run the 6-stage self-improving ContinuousVirtualSystem campaign across Grounds & hosts.")
     cont_cmd.add_argument("--horizon", type=int, default=10**12, help="Target algebraic orbit horizon (default: 10^12).")
 
+    arb_cmd = sub.add_parser("arbitrate", help="Run crash-resumable multi-model Virtual Layer arbitration cycles (including nested in-layer arbitrators).")
+    arb_cmd.add_argument("--state-dir", type=str, required=True, help="Directory for durable M1 pages, quorum journals & cursor.")
+    arb_cmd.add_argument("--ifs-output-dir", type=str, default="", help="Optional In-Formation-Space directory to emit verified artifacts.")
+    arb_cmd.add_argument("--cycles", type=int, default=2, help="Number of arbitration cycles to execute (default: 2).")
+    arb_cmd.add_argument("--interval-sec", type=float, default=0.0, help="Pause between cycles in seconds for continuous service mode.")
+
     serve = sub.add_parser("serve", help="Host a live HTTP/1.1 Information-Flow Vantage Node.")
     serve.add_argument("--host", type=str, default="127.0.0.1", help="Bind address (default: 127.0.0.1).")
     serve.add_argument("--port", type=int, default=8730, help="Bind port (default: 8730).")
@@ -708,10 +824,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "vld.navigation (unbounded lazy NavigableComputationDAG, K_3 guards, ComposedGroundNavigator, F_p commutant blocks & observer congruence)",
                 "vld.accel (StructuralLinearOperator, LinearRecurrenceGround, FP8/UE8M0/FP4 codecs, Birkhoff Sinkhorn mHC, NumPy + Rust CDLL)",
                 "vld.fabric (VantageEnvelope, ReliableChannel, X.509 v3 mTLS mesh, ComputationalFabricRouter & PartitionedTensorCutCoordinator)",
-                "vld.substrates (HeadlessOS x86_64 POSIX ABI, ELF64/WASM lifters, SIMT barriers, delta tensor log, IPv4/Internet Path Grounds & ROOM)",
-                "vld.models (HostedModelGlance, LazyFrontierWeightGround, DeepSeek-V4.1, GLM-5.3 MLA Absorption, Qwen3 & SNC/PNF compilers)",
-                "vld.agents (ProofGround hypergraph, ReceiverHypervisor CAS/capabilities, InLayerModelAgent & ContinuousLayerBuilderAgent)",
-                "vld.continuous (quorum-fenced crash-resumable ContinuousVirtualSystem across changing Grounds, hosts & physical paths)",
+                "vld.substrates (HeadlessOS x86_64 POSIX ABI, ELF64/WASM lifters, SIMT barriers, Fluid In-Transit CPU/GPU/VM lifting, Path Grounds & ROOM)",
+                "vld.models (HostedModelGlance, DeepSeek-V4.1, GLM-5.3, Qwen3, Qwen2/DeepSeek-R1, Llama/SmolLM2, GLM-4/Z1 & SNC/PNF compilers)",
+                "vld.agents (ProofGround hypergraph, ReceiverHypervisor ARBITRATE_MODEL/CAS, InLayerModelAgent & ContinuousLayerBuilderAgent)",
+                "vld.continuous (quorum-fenced crash-resumable ContinuousVirtualSystem with genesis/spec binding, independent verifiers & physical telemetry)",
+                "vld.arbitration (multi-source model arbitration, recursive InLayerMetaArbitratorModel, ContinuousArbitrationService & IdeaLedger)",
+                "vld.independent_audit (standalone zero-import cryptographic & mathematical receipt/capsule verifier)",
             ],
             "package": "virtual-layer-dynamics",
             "repository": "https://github.com/Kier73/Virtual-Layer-Dynamics",
@@ -748,9 +866,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             "origin_hits_delta_pass2": camp.origin_hits_delta_pass2,
             "pass1_cost": camp.pass1.total_cost.to_dict(),
             "pass1_final_state": dict(camp.pass1.final_state),
+            "pass1_measured_m1_bytes": camp.pass1.measured_m1_bytes,
+            "pass1_measured_wall_ms": round(camp.pass1.measured_wall_ms, 4),
             "pass2_cost": camp.pass2_resumed.total_cost.to_dict(),
             "pass2_final_continuity_digest": camp.pass2_resumed.final_continuity_digest,
             "pass2_final_state": dict(camp.pass2_resumed.final_state),
+            "pass2_measured_m1_bytes": camp.pass2_resumed.measured_m1_bytes,
+            "pass2_measured_wall_ms": round(camp.pass2_resumed.measured_wall_ms, 4),
             "pass2_pareto_dominates_pass1": camp.pass2_pareto_dominates_pass1,
             "pass2_stages_executed_after_host_switch": camp.pass2_resumed.stages_executed_this_invocation,
             "pass2_stages_recovered_from_quorum": camp.pass2_resumed.stages_recovered_from_quorum,
@@ -758,6 +880,52 @@ def main(argv: Sequence[str] | None = None) -> int:
             "warm_weight_bytes_pass2": camp.warm_weight_bytes_pass2,
         }
         print(json.dumps(out, indent=2, sort_keys=True))
+        return 0
+
+    if args.command == "arbitrate":
+        if args.cycles <= 0 or args.interval_sec < 0.0:
+            parser.error("--cycles must be > 0 and --interval-sec >= 0.")
+        svc = ContinuousArbitrationService(
+            args.state_dir,
+            ifs_output_dir=args.ifs_output_dir or None,
+        )
+        default_tasks = (
+            ExplorationTaskSpec(
+                "ifs.sparse_moe_and_mla",
+                "Compare Sparse MoE Expert Activation & Latent MLA Absorption",
+                ("sparse_moe", "mla_absorption", "meta_arbitration"),
+                "Compare active expert sparsity in DeepSeek-V4.1 against GLM-5.3 MLA compression.",
+                prompt_tokens=(3, 11, 17, 23),
+                desired_worker_count=2,
+            ),
+            ExplorationTaskSpec(
+                "ifs.frontier_reasoning_orbit",
+                "Cross-Model Frontier Reasoning & Nested In-Layer Arbitration",
+                ("frontier_reasoning", "meta_arbitration"),
+                "Arbitrate DeepSeek-V4.1 and GLM-5.3 through a nested Virtual-Layer sub-arbitrator.",
+                prompt_tokens=(5, 13, 19, 29),
+                desired_worker_count=3,
+            ),
+        )
+        reps = svc.run_cycles(default_tasks, num_cycles=args.cycles, interval_sec=args.interval_sec)
+        summary = {
+            "completed_cycles_total": svc.completed_cycles(),
+            "cycles_executed_now": len(reps),
+            "reports": [
+                {
+                    "arbitrator_id": r.arbitrator_id,
+                    "continuity_digest": r.pipeline_result.final_continuity_digest,
+                    "cycle_index": r.cycle_index,
+                    "encounter_envelope_digest": r.encounter_envelope_digest,
+                    "measured_wall_ms": round(r.pipeline_result.measured_wall_ms, 4),
+                    "selected_workers": list(r.selected_workers),
+                    "task_id": r.task_id,
+                }
+                for r in reps
+            ],
+            "status": "PASS",
+        }
+        print(json.dumps(summary, indent=2, sort_keys=True))
         return 0
 
     if args.command == "navigate":

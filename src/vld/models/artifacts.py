@@ -656,12 +656,67 @@ PUBLISHED_QWEN3_PROFILES: dict[str, dict[str, Any]] = {
         "tie_word_embeddings": False,
         "dtype": "BF16",
     },
+    "deepseek-r1-distill-qwen-1.5b": {
+        "source_model": "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
+        "revision": "ad9f0ae0864d7fbcd1cd905e3c6c5b069cc8b562",
+        "model_type": "qwen2",
+        "hidden_size": 1536,
+        "num_hidden_layers": 28,
+        "num_attention_heads": 12,
+        "num_key_value_heads": 2,
+        "head_dim": 128,
+        "intermediate_size": 8960,
+        "vocab_size": 151936,
+        "max_position_embeddings": 131072,
+        "rms_norm_eps": 1e-6,
+        "rope_theta": 10000.0,
+        "tie_word_embeddings": False,
+        "attention_bias": True,
+        "dtype": "BF16",
+    },
+    "smollm2-135m-instruct": {
+        "source_model": "HuggingFaceTB/SmolLM2-135M-Instruct",
+        "revision": "12fd25f77366fa6b3b4b768ec3050bf629380bac",
+        "model_type": "llama",
+        "hidden_size": 576,
+        "num_hidden_layers": 30,
+        "num_attention_heads": 9,
+        "num_key_value_heads": 3,
+        "head_dim": 64,
+        "intermediate_size": 1536,
+        "vocab_size": 49152,
+        "max_position_embeddings": 8192,
+        "rms_norm_eps": 1e-5,
+        "rope_theta": 100000.0,
+        "tie_word_embeddings": True,
+        "attention_bias": False,
+        "dtype": "BF16",
+    },
+    "glm-z1-9b-0414": {
+        "source_model": "THUDM/GLM-Z1-9B-0414",
+        "revision": "b221b06fefb23ca320922cf6e68ab5f2fb82de81",
+        "model_type": "glm4",
+        "hidden_size": 4096,
+        "num_hidden_layers": 40,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 2,
+        "head_dim": 128,
+        "intermediate_size": 13696,
+        "vocab_size": 151552,
+        "max_position_embeddings": 32768,
+        "rms_norm_eps": 1e-5,
+        "rope_theta": 10000.0,
+        "tie_word_embeddings": False,
+        "attention_bias": True,
+        "partial_rotary_factor": 0.5,
+        "dtype": "BF16",
+    },
 }
 
 
 @dataclass(frozen=True, slots=True)
 class TransformerArchitectureSpec:
-    """Lazy architectural Ground supporting dense `qwen3` (0.6B+) and sparse `qwen3_moe` (30B/235B+)."""
+    """Lazy architectural Ground supporting `qwen3`, `qwen3_moe`, `qwen2` (`DeepSeek-R1-Distill`), `llama` (`SmolLM2`), and `glm4` (`GLM-Z1`)."""
 
     source_model: str
     revision: str
@@ -682,13 +737,15 @@ class TransformerArchitectureSpec:
     norm_topk_prob: bool = True
     tie_word_embeddings: bool = False
     dtype: str = "BF16"
+    attention_bias: bool | None = None
+    partial_rotary_factor: float = 1.0
 
     def __post_init__(self) -> None:
         if not _REPO_RE.fullmatch(self.source_model):
             raise ModelArtifactError(f"source_model must match 'owner/name', got {self.source_model!r}.")
         if not _HEX40_RE.fullmatch(self.revision):
             raise ModelArtifactError("revision must be a pinned 40-char lowercase Git SHA.")
-        if self.model_type not in ("qwen3", "qwen3_moe"):
+        if self.model_type not in ("qwen3", "qwen3_moe", "qwen2", "llama", "glm4"):
             raise ModelArtifactError(f"Unsupported model_type {self.model_type!r}.")
         for name, val in (
             ("hidden_size", self.hidden_size),
@@ -704,10 +761,15 @@ class TransformerArchitectureSpec:
             raise ModelArtifactError("Invalid GQA head grouping or odd RoPE head_dim.")
         if not (0.0 < self.rms_norm_eps < 1.0) or not math.isfinite(self.rope_theta) or self.rope_theta <= 0.0:
             raise ModelArtifactError("Invalid rms_norm_eps or rope_theta.")
+        if not math.isfinite(self.partial_rotary_factor) or not (0.0 < self.partial_rotary_factor <= 1.0):
+            raise ModelArtifactError("partial_rotary_factor must lie in (0, 1].")
+        rot_dim = int(round(self.head_dim * self.partial_rotary_factor))
+        if rot_dim <= 0 or rot_dim % 2 != 0:
+            raise ModelArtifactError("rotary_dim must be a positive even integer.")
         if self.dtype not in ("BF16", "F16", "F32"):
             raise ModelArtifactError(f"Unsupported weight dtype {self.dtype!r}.")
 
-        if self.model_type == "qwen3":
+        if self.model_type != "qwen3_moe":
             _strict_pos_int(self.intermediate_size, "intermediate_size")
         else:
             _strict_pos_int(self.num_experts, "num_experts")
@@ -724,16 +786,86 @@ class TransformerArchitectureSpec:
             raise ModelArtifactError(f"Unknown published profile {profile_name!r}.")
         return cls(**PUBLISHED_QWEN3_PROFILES[key])
 
+    @classmethod
+    def from_huggingface_config(
+        cls,
+        source_model: str,
+        revision: str,
+        config: Mapping[str, Any],
+        *,
+        dtype: str | None = None,
+    ) -> TransformerArchitectureSpec:
+        """Lift any supported Hugging Face `config.json` (`qwen3`, `qwen3_moe`, `qwen2`, `llama`, `glm4`) into a pinned Spec."""
+        mtype = str(config.get("model_type", "")).lower()
+        h = int(config["hidden_size"])
+        nq = int(config["num_attention_heads"])
+        nkv = int(config.get("num_key_value_heads", nq))
+        hd = int(config.get("head_dim") or (h // nq))
+        dt_map = {"bfloat16": "BF16", "float16": "F16", "float32": "F32"}
+        raw_dt = str(config.get("torch_dtype", "bfloat16")).lower()
+        resolved_dt = dtype if dtype is not None else dt_map.get(raw_dt, "BF16")
+        prf = float(config.get("partial_rotary_factor") or (0.5 if mtype == "glm4" else 1.0))
+        abias = config.get("attention_bias")
+        return cls(
+            source_model=source_model,
+            revision=revision,
+            model_type=mtype,
+            hidden_size=h,
+            num_hidden_layers=int(config["num_hidden_layers"]),
+            num_attention_heads=nq,
+            num_key_value_heads=nkv,
+            head_dim=hd,
+            vocab_size=int(config["vocab_size"]),
+            max_position_embeddings=int(config.get("max_position_embeddings", 8192)),
+            rms_norm_eps=float(config.get("rms_norm_eps", 1e-6)),
+            rope_theta=float(config.get("rope_theta", 10000.0)),
+            intermediate_size=int(config["intermediate_size"]) if config.get("intermediate_size") is not None else None,
+            num_experts=int(config["num_experts"]) if config.get("num_experts") is not None else None,
+            num_experts_per_tok=int(config["num_experts_per_tok"]) if config.get("num_experts_per_tok") is not None else None,
+            moe_intermediate_size=int(config["moe_intermediate_size"]) if config.get("moe_intermediate_size") is not None else None,
+            norm_topk_prob=bool(config.get("norm_topk_prob", True)),
+            tie_word_embeddings=bool(config.get("tie_word_embeddings", False)),
+            dtype=resolved_dt,
+            attention_bias=None if abias is None else bool(abias),
+            partial_rotary_factor=prf,
+        )
+
     @property
     def is_moe(self) -> bool:
         return self.model_type == "qwen3_moe"
+
+    @property
+    def has_qk_norm(self) -> bool:
+        return self.model_type in ("qwen3", "qwen3_moe")
+
+    @property
+    def has_qkv_bias(self) -> bool:
+        if self.attention_bias is not None:
+            return bool(self.attention_bias)
+        return self.model_type in ("qwen2", "glm4")
+
+    @property
+    def has_sandwich_norms(self) -> bool:
+        return self.model_type == "glm4"
+
+    @property
+    def has_fused_gate_up(self) -> bool:
+        return self.model_type == "glm4"
+
+    @property
+    def rotary_dim(self) -> int:
+        return int(round(self.head_dim * self.partial_rotary_factor))
+
+    @property
+    def has_interleaved_rope(self) -> bool:
+        return self.model_type == "glm4"
 
     @property
     def fingerprint(self) -> str:
         return domain_digest("vld.transformer-arch.v1", self.to_dict())
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        base = {
             "dtype": self.dtype,
             "head_dim": self.head_dim,
             "hidden_size": self.hidden_size,
@@ -754,6 +886,10 @@ class TransformerArchitectureSpec:
             "tie_word_embeddings": self.tie_word_embeddings,
             "vocab_size": self.vocab_size,
         }
+        if self.model_type not in ("qwen3", "qwen3_moe"):
+            base["attention_bias"] = self.has_qkv_bias
+            base["partial_rotary_factor"] = self.partial_rotary_factor
+        return base
 
     def parameter_inventory(self) -> dict[str, int]:
         """Compute exact declared and per-token active parameter counts without allocating weights."""
@@ -764,8 +900,10 @@ class TransformerArchitectureSpec:
         layers = self.num_hidden_layers
         emb = self.vocab_size * h
         lm_head = 0 if self.tie_word_embeddings else self.vocab_size * h
-        attn_per_layer = h * (2 * nq * hd + 2 * nkv * hd) + 2 * hd
-        norms_per_layer = 2 * h
+        qk_norm_elems = (2 * hd) if self.has_qk_norm else 0
+        qkv_bias_elems = (nq * hd + 2 * nkv * hd) if self.has_qkv_bias else 0
+        attn_per_layer = h * (2 * nq * hd + 2 * nkv * hd) + qk_norm_elems + qkv_bias_elems
+        norms_per_layer = (4 * h) if self.has_sandwich_norms else (2 * h)
         if not self.is_moe:
             assert self.intermediate_size is not None
             ffn_total = 3 * h * self.intermediate_size
@@ -803,19 +941,47 @@ class TransformerArchitectureSpec:
             TensorSpace(p + "self_attn.k_proj.weight", self.dtype, (nkv * hd, h)),
             TensorSpace(p + "self_attn.v_proj.weight", self.dtype, (nkv * hd, h)),
             TensorSpace(p + "self_attn.o_proj.weight", self.dtype, (h, nq * hd)),
-            TensorSpace(p + "self_attn.q_norm.weight", self.dtype, (hd,)),
-            TensorSpace(p + "self_attn.k_norm.weight", self.dtype, (hd,)),
         ]
+        if self.has_qk_norm:
+            spaces.extend(
+                [
+                    TensorSpace(p + "self_attn.q_norm.weight", self.dtype, (hd,)),
+                    TensorSpace(p + "self_attn.k_norm.weight", self.dtype, (hd,)),
+                ]
+            )
+        if self.has_qkv_bias:
+            spaces.extend(
+                [
+                    TensorSpace(p + "self_attn.q_proj.bias", self.dtype, (nq * hd,)),
+                    TensorSpace(p + "self_attn.k_proj.bias", self.dtype, (nkv * hd,)),
+                    TensorSpace(p + "self_attn.v_proj.bias", self.dtype, (nkv * hd,)),
+                ]
+            )
+        if self.has_sandwich_norms:
+            spaces.extend(
+                [
+                    TensorSpace(p + "post_self_attn_layernorm.weight", self.dtype, (h,)),
+                    TensorSpace(p + "post_mlp_layernorm.weight", self.dtype, (h,)),
+                ]
+            )
         if not self.is_moe:
             assert self.intermediate_size is not None
             f = self.intermediate_size
-            spaces.extend(
-                [
-                    TensorSpace(p + "mlp.gate_proj.weight", self.dtype, (f, h)),
-                    TensorSpace(p + "mlp.up_proj.weight", self.dtype, (f, h)),
-                    TensorSpace(p + "mlp.down_proj.weight", self.dtype, (h, f)),
-                ]
-            )
+            if self.has_fused_gate_up:
+                spaces.extend(
+                    [
+                        TensorSpace(p + "mlp.gate_up_proj.weight", self.dtype, (2 * f, h)),
+                        TensorSpace(p + "mlp.down_proj.weight", self.dtype, (h, f)),
+                    ]
+                )
+            else:
+                spaces.extend(
+                    [
+                        TensorSpace(p + "mlp.gate_proj.weight", self.dtype, (f, h)),
+                        TensorSpace(p + "mlp.up_proj.weight", self.dtype, (f, h)),
+                        TensorSpace(p + "mlp.down_proj.weight", self.dtype, (h, f)),
+                    ]
+                )
         else:
             assert self.num_experts is not None and self.moe_intermediate_size is not None
             mid = self.moe_intermediate_size

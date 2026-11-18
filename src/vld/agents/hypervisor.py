@@ -42,6 +42,7 @@ class AgentCapability(str, Enum):
     GLANCE_MODEL = "glance_model"
     ADMIT_SIMILARITY_BLOCKS = "admit_similarity_blocks"
     QUALIFY_PATH_HOST = "qualify_path_host"
+    ARBITRATE_MODEL = "arbitrate_model"
     COMMIT_STATE = "commit_state"
 
 
@@ -53,12 +54,15 @@ class CapabilityGrant:
     capabilities: frozenset[AgentCapability]
     probe_budget: Fraction = Fraction(10)
     allowed_memory_prefix: str = ""
+    max_arbitration_depth: int = 2
 
     def __post_init__(self) -> None:
         if not isinstance(self.agent_id, str) or not self.agent_id.strip():
             raise ValueError("agent_id must be a non-empty string.")
         if isinstance(self.probe_budget, (bool, float)) or Fraction(self.probe_budget) < 0:
             raise ValueError("probe_budget must be a non-negative exact Fraction or int.")
+        if isinstance(self.max_arbitration_depth, bool) or not isinstance(self.max_arbitration_depth, int) or self.max_arbitration_depth < 0:
+            raise ValueError("max_arbitration_depth must be a non-negative integer.")
         object.__setattr__(self, "probe_budget", Fraction(self.probe_budget))
         object.__setattr__(self, "capabilities", frozenset(self.capabilities))
 
@@ -284,6 +288,75 @@ class ReceiverHypervisor:
             result_fn=lambda: {"admitted": True, "new_state_digest": new_digest},
         )
         return new_digest
+
+    def authorize_model_arbitration(
+        self,
+        arbitrator_id: str,
+        *,
+        target_worker_id: str,
+        task_id: str,
+        arbitration_depth: int = 1,
+        cost: int | Fraction = Fraction(1),
+    ) -> dict[str, Any]:
+        """Authorize an in-layer model (`arbitrator_id`) to schedule & arbitrate `target_worker_id` on `task_id`."""
+        grant = self._require_capability(arbitrator_id, AgentCapability.ARBITRATE_MODEL)
+        if not target_worker_id or target_worker_id == arbitrator_id:
+            self._record_refusal(
+                arbitrator_id,
+                "invalid_arbitration_target",
+                {"target_worker_id": target_worker_id, "task_id": task_id},
+            )
+            raise HypervisorRefusalError("Model cannot self-arbitrate or target an empty worker ID.")
+        if isinstance(arbitration_depth, bool) or not isinstance(arbitration_depth, int) or arbitration_depth < 1:
+            self._record_refusal(arbitrator_id, "invalid_arbitration_depth", {"depth": arbitration_depth})
+            raise HypervisorRefusalError("arbitration_depth must be a positive integer.")
+        if arbitration_depth > grant.max_arbitration_depth:
+            self._record_refusal(
+                arbitrator_id,
+                "arbitration_depth_exceeded",
+                {"depth": arbitration_depth, "max_depth": grant.max_arbitration_depth},
+            )
+            raise HypervisorRefusalError(
+                f"Arbitration depth {arbitration_depth} exceeds max_arbitration_depth {grant.max_arbitration_depth}."
+            )
+        if isinstance(cost, (bool, float)):
+            self._record_refusal(arbitrator_id, "invalid_arbitration_cost_type", {"type": type(cost).__name__})
+            raise HypervisorRefusalError("Arbitration cost must be an exact int or Fraction.")
+        c = Fraction(cost)
+        if c <= 0:
+            self._record_refusal(arbitrator_id, "non_positive_arbitration_cost", {"cost": str(c)})
+            raise HypervisorRefusalError("Arbitration cost must be positive.")
+        rem = self.remaining_budget(arbitrator_id)
+        if c > rem:
+            self._record_refusal(
+                arbitrator_id,
+                "arbitration_budget_exceeded",
+                {"cost": str(c), "remaining": str(rem), "task_id": task_id},
+            )
+            raise HypervisorRefusalError(f"Arbitration cost {c} exceeds remaining budget {rem}.")
+        self._spent_budget[arbitrator_id] += c
+        new_rem = self.remaining_budget(arbitrator_id)
+        rec, _ = self.journal.record(
+            request_id=self._next_audit_id("arbitrate"),
+            ground_fingerprint=self.state_digest,
+            operation="hypervisor.authorize_model_arbitration",
+            payload={
+                "arbitration_depth": arbitration_depth,
+                "arbitrator_id": arbitrator_id,
+                "cost": str(c),
+                "target_worker_id": target_worker_id,
+                "task_id": task_id,
+            },
+            result_fn=lambda: {"admitted": True, "remaining_budget": str(new_rem)},
+        )
+        return {
+            "arbitration_depth": arbitration_depth,
+            "arbitrator_id": arbitrator_id,
+            "journal_digest": rec.event_digest,
+            "remaining_budget": str(new_rem),
+            "target_worker_id": target_worker_id,
+            "task_id": task_id,
+        }
 
 
 __all__ = [
