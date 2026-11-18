@@ -186,3 +186,52 @@ Virtual Layer Dynamics treats neural networks and Large Language Models as struc
 5. **Sufficient-Statistic Operator Contraction (`vld.accel.StructuralLinearOperator`):** For an $M \times N$ operator admitting bilinear, stride-periodic, low-rank, and sparse-residual decomposition
    $$W_{i,j} = (\alpha + \beta i + \gamma j + \delta i j) + c_{(j - s i) \bmod P} + \sum_{r=0}^{R-1} U_{i,r} V_{j,r} + \Delta_{i,j},$$
    matrix-vector multiplication $y = W x$ contracts directly against input moments $(S_0 = \sum_j x_j,\; S_1 = \sum_j j x_j)$, folded periodic buckets $\tilde{x}_q = \sum_{j \equiv q \pmod P} x_j$, and rank-$R$ projections $z_r = \sum_j V_{j,r} x_j$ in $O(M + N + M P + R(M + N) + |\operatorname{supp}(\Delta)|)$ operations without allocating $\Theta(MN)$ dense storage.
+
+---
+
+## 8. Frontier Model Grounds (`DeepSeek-V4.1` & `GLM-5.3`)
+
+Scaling Virtual Layer Dynamics to 500 GB – 1.5 TB+ open-weight frontier checkpoints (`vld.models.frontier`, `vld.accel`) rests on six exact mathematical translations:
+
+1. **Zero-Weight-Download Structural Glancing (`HostedModelGlance`):**
+   A hosted checkpoint $(C_{\text{cfg}}, I_{\text{idx}}, \{H_s\})$ lifts directly from `config.json`, `model.safetensors.index.json`, and bounded Safetensors header prefixes into a content-pinned `VirtualGroundSpec` in $O(|\text{metadata}|) \ll \Theta(|\mathcal{W}_A|)$ bytes (e.g., `7.33 MB` for `510.29 GB` `DeepSeek-V4.1-Flash`; `5.29 MB` for `1.507 TB` `GLM-5.3-BF16`), while `LazyFrontierWeightGround` defers shard header observation to $O(1)$ at initialization and fetches only active vocabulary rows and selected MoE expert slices via HTTP `206 Partial Content`.
+
+2. **Block-Scaled `F8_E4M3` + `UE8M0` & Packed `MXFP4` (`E2M1`) Tensor Codecs:**
+   $$\operatorname{F8\_E4M3}(u) = (-1)^s \cdot \begin{cases} 2^{-6} \cdot \frac{m}{8} & e = 0 \\ 2^{e-7}\!\left(1 + \frac{m}{8}\right) & 1 \le e \le 15,\; (e,m) \neq (15, 7) \\ \text{NaN (refused)} & u \in \{\text{0x7F}, \text{0xFF}\} \end{cases}, \qquad \operatorname{UE8M0}(u) = \begin{cases} 2^{u - 127} & 0 \le u \le 254 \\ \text{NaN (refused)} & u = \text{0xFF} \end{cases}$$
+   $$W_{r,c}^{\text{FP8}} = \operatorname{F8\_E4M3}(Q_{r,c}) \cdot \operatorname{UE8M0}\!\left(S_{\lfloor r / B_r \rfloor, \lfloor c / B_c \rfloor}\right), \qquad W_{r, 2j + b}^{\text{FP4}} = \operatorname{E2M1}\!\left((P_{r,j} \gg 4b)\ \&\ \text{0xF}\right) \cdot \operatorname{UE8M0}\!\left(S_{r, \lfloor (2j+b)/32 \rfloor}\right).$$
+
+3. **Manifold-Constrained Hyper-Connections (`mHC`) & Regularized Birkhoff-Sinkhorn Sub-Stochasticity:**
+   Over an $m$-lane residual stream $H^{(\ell)} \in \mathbb{R}^{T \times m \times d}$ ($m = 4$), staggered `pre_mix` collapses $x^{(\ell)} = \sum_{a=0}^{m-1} \alpha_a^{(\ell)} H_{:,a,:}^{(\ell)}$ ($\alpha_a = \sigma(z_a^{\text{pre}}) + \varepsilon$), while the $m \times m$ residual mixing operator $C^{(\ell)}$ undergoes $K = 20$ alternating row/column Sinkhorn-Knopp normalizations terminating on regularized column normalization ($\varepsilon = 10^{-6}$):
+   $$C^{(0)}_{i,j} = \frac{\exp(Z_{i,j})}{\sum_{k=0}^{m-1} \exp(Z_{i,k})} + \varepsilon, \qquad \widetilde{C}^{(t)}_{i,j} = \frac{C^{(t-1)}_{i,j}}{\sum_{k=0}^{m-1} C^{(t-1)}_{i,k} + \varepsilon}, \qquad C^{(t)}_{i,j} = \frac{\widetilde{C}^{(t)}_{i,j}}{\sum_{r=0}^{m-1} \widetilde{C}^{(t)}_{r,j} + \varepsilon},$$
+   $$H^{(\ell + \frac{1}{2})}_{:,j,:} = \sum_{i=0}^{m-1} C^{(\ell)}_{i,j} H^{(\ell)}_{:,i,:} + 2\sigma(z_j^{\text{post}})\, y^{(\ell)}.$$
+   Because each iteration terminates with division by $S_j + \varepsilon$, every column satisfies strict sub-stochasticity $\sum_{i=0}^{m-1} C^{(K)}_{i,j} = \frac{S_j}{S_j + \varepsilon} = 1 - \frac{\varepsilon}{S_j + \varepsilon} < 1$, bounding $\|C^{(K)}\|_1 < 1$ and $\rho(C^{(K)}) < 1$ against multi-layer spectral explosion even under binary32 rounding.
+
+4. **Sink-Damped Single-KV Attention & Conjugate Inverse Tail RoPE (`DeepSeek-V4.1`):**
+   With shared single-head latent $k_\tau = [k_\tau^{\text{nope}};\, \mathcal{R}_\tau(k_\tau^{\text{rope}})] \in \mathbb{R}^{d_h}$ (`128x`–`256x` KV compression) and per-head learnable sink logit $s_h \in \mathbb{R}$, attention weights form a sub-stochastic distribution over sliding window $W$ while conjugate inverse tail rotation $\mathcal{R}_{-t}^{\text{tail}}$ restores relative position invariance in output values:
+   $$\alpha_{t, \tau}^{(h)} = \frac{\exp\!\left(\frac{\langle q_t^{(h)}, k_\tau \rangle}{\sqrt{d_h}} - \mu_t^{(h)}\right)}{\exp(s_h - \mu_t^{(h)}) + \sum_{\tau' = \max(0, t - W + 1)}^{t} \exp\!\left(\frac{\langle q_t^{(h)}, k_{\tau'} \rangle}{\sqrt{d_h}} - \mu_t^{(h)}\right)}, \qquad o_t^{(h)} = \mathcal{R}_{-t}^{\text{tail}}\!\left(\sum_{\tau} \alpha_{t,\tau}^{(h)} k_\tau\right).$$
+
+5. **Multi-Head Latent Attention (`MLA`) Exact Matrix Absorption (`GLM-5.3`):**
+   Partitioning `kv_b_proj` $\in \mathbb{R}^{H(d_{\text{nope}} + d_v) \times r_{\text{kv}}}$ into per-head $W_{K,\text{nope}}^{(h)} \in \mathbb{R}^{d_{\text{nope}} \times r_{\text{kv}}}$ and $W_V^{(h)} \in \mathbb{R}^{d_v \times r_{\text{kv}}}$, bilinearity of inner products and linearity of value aggregation establish the exact identity:
+   $$\langle q_{t,\text{nope}}^{(h)}, W_{K,\text{nope}}^{(h)} c_\tau^{\text{KV}} \rangle = \left\langle (W_{K,\text{nope}}^{(h)})^\top q_{t,\text{nope}}^{(h)},\; c_\tau^{\text{KV}} \right\rangle, \qquad \sum_{\tau \le t} \alpha_{t,\tau}^{(h)} \big(W_V^{(h)} c_\tau^{\text{KV}}\big) = W_V^{(h)} \!\left(\sum_{\tau \le t} \alpha_{t,\tau}^{(h)} c_\tau^{\text{KV}}\right),$$
+   compressing cached state per token-layer from $2 H d_v = 32,768$ floats to $r_{\text{kv}} + d_{\text{rope}} = 576$ floats (`56.89x` compression on `GLM-5.3-BF16`; `64.0x` on `GLM-5.3-Flash-BF16`) without altering output logits.
+
+6. **Auxiliary-Loss-Free Bias-Decoupled MoE Routing (`noaux_tc`):**
+   $$\tilde{g}_e = g(z_e) + b_e, \qquad \mathcal{S} = \operatorname{arg\,top-}k_{e}(\tilde{g}_e), \qquad w_e = \gamma \cdot \frac{g(z_e)}{\sum_{j \in \mathcal{S}} g(z_j)} \quad (e \in \mathcal{S}),$$
+   with $g(z) = \sqrt{\ln(1 + e^z)}$ (`DeepSeek-V4.1`) or $g(z) = \sigma(z)$ (`GLM-5.3`), decoupling load-balancing selection bias $b_e$ from gate combination weights.
+
+---
+
+## 9. Commutant Block Reduction, Observer Congruence & Continuous Cross-Ground Execution
+
+1. **Exact $\mathbb{F}_p$ Commutant Similarity Block Decomposition (`vld.navigation.observer_orbit`):**
+   Given coupled operator factors $A_1, \dots, A_r \in \mathbb{F}_p^{n \times n}$, solving the simultaneous linear commutant system
+   $$\mathcal{C}(\mathcal{A}) = \left\{C \in \mathbb{F}_p^{n \times n} : C A_\ell - A_\ell C \equiv 0 \pmod p\;\;\forall \ell \in \{1..r\}\right\}$$
+   over $\mathbb{F}_p$ via exact RREF and selecting combinations $C = \sum_{b=1}^{\dim \mathcal{C}} w_b C_b$ that split eigenspaces to minimize $\Phi_{\text{cubic}}(\{d_j\}) = \sum_{j=1}^k d_j^3 < n^3$ yields an independently verifiable similarity basis $P \in \operatorname{GL}_n(\mathbb{F}_p)$ with $P^{-1} A_\ell P = \bigoplus_{j=1}^k B_\ell^{(j)} \pmod p$, reducing horizon-$T$ orbit jumps from $O(n^3 \log T)$ to $O\!\left(\big(\sum_{j=1}^k d_j^3\big)\log T\right)$.
+
+2. **Observer-Covariant Congruence & Contradiction Refusal (`CrossObserverCongruenceGate`):**
+   Readings across heterogeneous representations (`Signal8` unit-character $u \in (\mathbb{Z}/8\mathbb{Z})^\times$, `ModularRing` $\mathbb{Z}/m\mathbb{Z}$, `canonical_int`) map to a common quotient modulus $q$ via $R_{u \to 1}(x) \equiv u^{-1} x \pmod 8$ and $\pi_q: \mathbb{Z}/m\mathbb{Z} \twoheadrightarrow \mathbb{Z}/q\mathbb{Z}$ ($q \mid m$), admitting only unanimous MAC-verified observations and raising `ContradictoryObservationError` on disagreement.
+
+3. **Unified Continuous Cross-Ground Execution (`vld.continuous`, `GGE-001..007`):**
+   Across changing Grounds, representations, schedulers, hosts, and physical paths $(\mathcal{G}_0, \dots, \mathcal{G}_{m-1})$—spanning IPv4 router-hop Grounds (`RFC 1071` + L2 bridge negative control), `HeadlessOS` POSIX processes (`fork` CoW, `pipe`, transactional `execve`, W^X `mmap`/`mprotect`, M1 OS snapshots), $\mathbb{F}_p$ commutant orbits, WASM/E-GPU substrates, mTLS partitioned tensor-cut fabrics (`math.fsum` scalar oracle + epoch-fenced crash reassignment), and frontier `DeepSeek-V4.1`/`GLM-5.3` layers—every stage transition $k$ enforces write-ahead quorum continuity:
+   $$\operatorname{Persist}(M_k, E_k^{\text{pre}}) \prec \operatorname{QuorumSeal}(\text{slot}=k+1, \text{term}=t, d_k) \prec \operatorname{Emit}(R_k), \qquad \tau_{k-1} \prec_{\text{ClockBridge}} \tau_k,$$
+   while internal `ContinuousLayerBuilderAgent`s inspect Pass 1 telemetry and install verified shortcuts/caches/blocks so subsequent passes strictly Pareto-dominate baseline execution ($\mathbf{C}_{\text{Pass 2}} \prec \mathbf{C}_{\text{Pass 1}}$) with zero stage replay across ungraceful host crashes.

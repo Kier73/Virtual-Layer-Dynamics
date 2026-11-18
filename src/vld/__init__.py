@@ -1,6 +1,6 @@
 r"""Virtual Layer Dynamics (`vld`) — Consolidated Computational Ground Architecture.
 
-Active consolidated package layers (`v0.4.0` — Phases 0 through 7 Complete & Hardened):
+Active consolidated package layers (`v0.5.0` — Phases 0 through 8 Complete & Hardened):
   - `vld.canonical`: Deterministic JSON & domain-separated SHA-256 addressing
   - `vld.triad`: Kleene $\mathcal{K}_3$ guards, epistemic tags, Myhill-Nerode quotient & erasure bits
   - `vld.ground`: `VirtualGroundSpec`, reversible `ByteLens`, dual-derivation `AffineOrbitLaw` & Pareto costs
@@ -13,18 +13,20 @@ Active consolidated package layers (`v0.4.0` — Phases 0 through 7 Complete & H
   - `vld.authority`: Lossless temporal coordinates, scheduler-scoped vector clocks (`G13`), decoupled
     `EncounterEnvelope` provenance (`G21`), $2q > N$ quorum fencing, M3 CAS sessions & `VirtualProcessor` continuity
   - `vld.navigation`: Unbounded lazy `NavigableComputationDAG`, Kleene $\mathcal{K}_3$ dynamic guards,
-    interval abstract-interpretation pre-gates, and partition-refinement strong bisimulation
-  - `vld.accel`: Sufficient-statistic `StructuralLinearOperator`, `LinearRecurrenceGround`,
-    contiguous `ndarray`-resident `NumericEngine`, and optional LLVM-compiled Rust CDLL kernels
+    interval & strong-bisimulation pre-gates, `ComposedGroundNavigator`, $\mathbb{F}_p$ commutant similarity blocks,
+    and `CrossObserverCongruenceGate`
+  - `vld.accel`: Sufficient-statistic `StructuralLinearOperator`, `LinearRecurrenceGround`, `F8_E4M3`/`UE8M0`/`FP4`
+    codecs, Birkhoff Sinkhorn `mHC` kernels, YaRN/interleaved RoPE, and NumPy + Rust CDLL acceleration
   - `vld.fabric`: Multi-framing `VantageEnvelope` codec, `ReplayWindowGuard`, crash-resumable `ReliableChannel`,
-    zero-dependency X.509 v3 mTLS peer mesh, HTTP/HTTPS 206 `Range` vantages, and `G11` terminal-to-terminal forwarding
-  - `vld.substrates`: CoW + Structural-Memory `VirtualPageSpace`, `DeterministicVMKernel`, ELF64 & binary WASM
-    process Ground lifters (`Locate`/`Restore`/`Continue`/`Transform`), SIMT barriers, $O(1)$-delta tensor
-    checkpoints, active Path-Native Grounds with negative controls, and portable computational `ROOM`s
-  - `vld.models`: Safetensors Range observer (`HFR`), `ByteLevelBPETokenizerGround`, `Qwen3` dense & sparse MoE
-    realizers, crash-resumable `AutoregressiveModelRunner`, constructive 1D/multivariate ReLU & FSM compilers,
-    Net2Wider/rescaling morphisms, and `GenerativeWeightGround`
-  - `vld.agents`: `ProofGround` AND/OR hypergraph, `ReceiverHypervisor`, and `InLayerModelAgent`
+    zero-dependency X.509 v3 mTLS mesh, `ComputationalFabricRouter`, and `PartitionedTensorCutCoordinator`
+  - `vld.substrates`: `HeadlessOS` (`x86_64` POSIX ABI, CoW `fork`, `pipe`, transactional `execve`, M1 OS snapshots),
+    ELF64 & WASM lifters, SIMT barriers, $O(1)$-delta tensor logs, IPv4 router-hop & Internet Path Grounds, and `ROOM`s
+  - `vld.models`: `HostedModelGlance`, `LazyFrontierWeightGround`, `DeepSeek-V4.1` (`mHC` + `FP8`/`FP4` + Sink-MLA)
+    & `GLM-5.3` (`MLA` Matrix Absorption + hybrid MoE) realizers, `Qwen3`, and constructive SNC/PNF ReLU compilers
+  - `vld.agents`: `ProofGround` AND/OR hypergraph, `ReceiverHypervisor`, `InLayerModelAgent`, and
+    `ContinuousLayerBuilderAgent`
+  - `vld.continuous`: Quorum-fenced, crash-resumable `ContinuousVirtualSystem` across changing Grounds,
+    representations, hosts, and physical paths (`GGE-001..007`)
 """
 
 from __future__ import annotations
@@ -72,7 +74,7 @@ from vld.triad import (
     require_determinate_branch,
 )
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 __all__ = [
     "ActionInformationSummary",

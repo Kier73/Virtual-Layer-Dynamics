@@ -80,6 +80,32 @@ class NativeRustAccelerator:
                 ctypes.POINTER(ctypes.c_float),
             ]
             dll.vld_rms_norm_f32.restype = ctypes.c_int32
+
+            dll.vld_dequant_f8_e4m3_ue8m0_block_f32.argtypes = [
+                ctypes.c_size_t,
+                ctypes.c_size_t,
+                ctypes.c_size_t,
+                ctypes.c_size_t,
+                ctypes.POINTER(ctypes.c_uint8),
+                ctypes.POINTER(ctypes.c_uint8),
+                ctypes.c_size_t,
+                ctypes.POINTER(ctypes.c_float),
+            ]
+            dll.vld_dequant_f8_e4m3_ue8m0_block_f32.restype = ctypes.c_int32
+
+            dll.vld_sinkhorn_birkhoff_f32.argtypes = [
+                ctypes.c_size_t,
+                ctypes.c_size_t,
+                ctypes.c_size_t,
+                ctypes.c_float,
+                ctypes.POINTER(ctypes.c_float),
+                ctypes.POINTER(ctypes.c_float),
+                ctypes.POINTER(ctypes.c_float),
+                ctypes.POINTER(ctypes.c_float),
+                ctypes.POINTER(ctypes.c_float),
+                ctypes.POINTER(ctypes.c_float),
+            ]
+            dll.vld_sinkhorn_birkhoff_f32.restype = ctypes.c_int32
             self._dll = dll
 
     @property
@@ -197,6 +223,95 @@ class NativeRustAccelerator:
         if rc != 0:
             raise RuntimeError(f"vld_rms_norm_f32 failed with code {rc}.")
         return [[float(out_arr[r * cols + c]) for c in range(cols)] for r in range(rows)]
+
+    def dequant_f8_e4m3_ue8m0_block_f32(
+        self,
+        weight_raw: bytes,
+        rows: int,
+        cols: int,
+        scale_raw: bytes,
+        scale_cols: int,
+        *,
+        block_r: int = 32,
+        block_c: int = 32,
+    ) -> list[list[float]]:
+        if self._dll is None:
+            raise RuntimeError("NativeRustAccelerator is not available on this host.")
+        if rows <= 0 or cols <= 0 or block_r <= 0 or block_c <= 0:
+            raise ValueError("Dimensions and block sizes must be positive.")
+        scale_rows = (rows + block_r - 1) // block_r
+        if len(weight_raw) != rows * cols or len(scale_raw) != scale_rows * scale_cols:
+            raise ValueError("Byte buffer length mismatch in dequant_f8_e4m3_ue8m0_block_f32.")
+        w_arr = (ctypes.c_uint8 * len(weight_raw)).from_buffer_copy(weight_raw)
+        s_arr = (ctypes.c_uint8 * len(scale_raw)).from_buffer_copy(scale_raw)
+        out_arr = (ctypes.c_float * (rows * cols))()
+        rc = int(
+            self._dll.vld_dequant_f8_e4m3_ue8m0_block_f32(
+                rows,
+                cols,
+                block_r,
+                block_c,
+                w_arr,
+                s_arr,
+                scale_cols,
+                out_arr,
+            )
+        )
+        if rc != 0:
+            raise ValueError(f"vld_dequant_f8_e4m3_ue8m0_block_f32 failed (code={rc}; NaN or invalid scale).")
+        return [[float(out_arr[r * cols + c]) for c in range(cols)] for r in range(rows)]
+
+    def sinkhorn_birkhoff_f32(
+        self,
+        mixes_2d: Sequence[Sequence[float]],
+        hc_scale: Sequence[float],
+        hc_base: Sequence[float],
+        *,
+        hc_mult: int = 4,
+        sinkhorn_iters: int = 20,
+        eps: float = 1e-6,
+    ) -> tuple[list[list[float]], list[list[float]], list[list[list[float]]]]:
+        if self._dll is None:
+            raise RuntimeError("NativeRustAccelerator is not available on this host.")
+        mix_hc = (2 + hc_mult) * hc_mult
+        n_tok = len(mixes_2d)
+        if hc_mult <= 0 or sinkhorn_iters <= 0 or len(hc_scale) != 3 or len(hc_base) != mix_hc:
+            raise ValueError("Invalid mHC Sinkhorn dimensions.")
+        if any(len(row) != mix_hc for row in mixes_2d):
+            raise ValueError("Each mixes_2d row must have length (2 + hc_mult) * hc_mult.")
+        flat_m = [float(v) for row in mixes_2d for v in row]
+        m_arr = (ctypes.c_float * max(1, len(flat_m)))(*flat_m)
+        s_arr = (ctypes.c_float * 3)(*(float(v) for v in hc_scale))
+        b_arr = (ctypes.c_float * mix_hc)(*(float(v) for v in hc_base))
+        pre_arr = (ctypes.c_float * max(1, n_tok * hc_mult))()
+        post_arr = (ctypes.c_float * max(1, n_tok * hc_mult))()
+        comb_arr = (ctypes.c_float * max(1, n_tok * hc_mult * hc_mult))()
+        rc = int(
+            self._dll.vld_sinkhorn_birkhoff_f32(
+                n_tok,
+                hc_mult,
+                sinkhorn_iters,
+                float(eps),
+                m_arr if n_tok > 0 else None,
+                s_arr,
+                b_arr,
+                pre_arr if n_tok > 0 else None,
+                post_arr if n_tok > 0 else None,
+                comb_arr if n_tok > 0 else None,
+            )
+        )
+        if rc != 0:
+            raise ValueError(f"vld_sinkhorn_birkhoff_f32 failed (code={rc}).")
+        pre = [[float(pre_arr[i * hc_mult + j]) for j in range(hc_mult)] for i in range(n_tok)]
+        post = [[float(post_arr[i * hc_mult + j]) for j in range(hc_mult)] for i in range(n_tok)]
+        comb = [
+            [
+                [float(comb_arr[i * hc_mult * hc_mult + j * hc_mult + k]) for k in range(hc_mult)]
+                for j in range(hc_mult)
+            ]
+            for i in range(n_tok)
+        ]
+        return pre, post, comb
 
 
 _DEFAULT_NATIVE: NativeRustAccelerator | None = None

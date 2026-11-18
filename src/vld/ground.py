@@ -516,6 +516,14 @@ class NavigationCostVector:
         strictly_better = any(a < b for a, b in zip(dims_self, dims_other))
         return no_worse and strictly_better
 
+    def to_dict(self) -> dict[str, float]:
+        return {
+            "bytes_moved": self.bytes_moved,
+            "compute_ops": self.compute_ops,
+            "latency_ms": self.latency_ms,
+            "verification_ops": self.verification_ops,
+        }
+
 
 def expected_shortcut_cost(
     *,

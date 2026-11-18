@@ -1,4 +1,4 @@
-r"""Internet, Mutual-TLS, Reliable Channel & Terminal-Forwarding Fabric (`vld.fabric`)."""
+r"""Internet, Mutual-TLS, Reliable Channel, Federated Routing & Terminal-Forwarding Fabric (`vld.fabric`)."""
 
 from __future__ import annotations
 
@@ -33,6 +33,22 @@ from vld.fabric.reliability import (
     ReplayWindowGuard,
     WireFrame,
 )
+from vld.fabric.routing import (
+    ComputationalFabricRouter,
+    FabricBlockerCode,
+    FabricLink,
+    FabricResolutionResult,
+    FabricResolutionStatus,
+    FabricRouteWitness,
+    FabricRoutingError,
+    HostAdvertisement,
+    PartitionedCutReport,
+    PartitionedTensorCutCoordinator,
+    PortableExecutionClaim,
+    RouteMetric,
+    StaleClaimEpochError,
+    TensorCutWorkerNode,
+)
 from vld.fabric.vantage import (
     InformationFlowCodec,
     StreamPipeVantage,
@@ -46,10 +62,18 @@ from vld.fabric.vantage import (
 )
 
 __all__ = [
+    "ComputationalFabricRouter",
     "DEFAULT_STREAM_CHUNK_BYTES",
+    "FabricBlockerCode",
+    "FabricLink",
+    "FabricResolutionResult",
+    "FabricResolutionStatus",
+    "FabricRouteWitness",
+    "FabricRoutingError",
     "ForwardingCoordinator",
     "ForwardingError",
     "ForwardingWorkerNode",
+    "HostAdvertisement",
     "InformationFlowCodec",
     "LossyInMemoryLink",
     "M1ForwardingTicket",
@@ -57,7 +81,10 @@ __all__ = [
     "MTLSPeerClient",
     "MTLSPeerServer",
     "MutualTLSError",
+    "PartitionedCutReport",
+    "PartitionedTensorCutCoordinator",
     "PeerIdentityBundle",
+    "PortableExecutionClaim",
     "ReliabilityPolicy",
     "ReliableChannel",
     "ReliableChannelConflictError",
@@ -65,7 +92,10 @@ __all__ = [
     "ReliableChannelWouldBlock",
     "ReplayRejectedError",
     "ReplayWindowGuard",
+    "RouteMetric",
+    "StaleClaimEpochError",
     "StreamPipeVantage",
+    "TensorCutWorkerNode",
     "UnauthorizedCommitError",
     "VLDHttpVantageClient",
     "VLDHttpVantageServer",

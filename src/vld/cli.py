@@ -10,7 +10,20 @@ import sys
 from typing import Any, Sequence
 
 from vld import __version__ as PACKAGE_VERSION
-from vld.accel import benchmark_virtual_vs_traditional, get_native_accelerator, has_numpy
+from vld.accel import (
+    NumericEngine,
+    benchmark_virtual_vs_traditional,
+    decode_f8_e4m3,
+    decode_f8_e8m0,
+    dequantize_fp4_e2m1_packed,
+    dequantize_fp8_blockwise,
+    encode_f8_e4m3,
+    encode_f8_e8m0,
+    encode_fp4_e2m1_packed,
+    get_native_accelerator,
+    has_numpy,
+    hc_split_sinkhorn,
+)
 from vld.agents import (
     HypervisorRefusalError,
     InLayerModelAgent,
@@ -30,11 +43,24 @@ from vld.authority import (
     VectorClock,
 )
 from vld.canonical import canonical_bytes, canonical_json, domain_digest, parse_strict_json
+from vld.continuous import (
+    ContinuousStageSpec,
+    ContinuousVirtualSystem,
+    build_compact_deepseek_v41_fixture,
+    build_compact_glm53_fixture,
+    run_self_improving_continuous_campaign,
+)
 from vld.fabric import (
+    ComputationalFabricRouter,
+    FabricBlockerCode,
+    FabricLink,
+    FabricResolutionStatus,
+    HostAdvertisement,
     LossyInMemoryLink,
     ReliableChannel,
     ReplayRejectedError,
     ReplayWindowGuard,
+    RouteMetric,
     VLDHttpVantageServer,
     VLDVantageNode,
 )
@@ -53,40 +79,59 @@ from vld.journal import HashChainedJournal, IdempotencyConflictError
 from vld.memory import DiskPageBacking, InMemoryPageBacking, PagedObjectStore, StructuralMemoryRegistry, certify_sequence_law
 from vld.models import (
     AffineKernelAttentionGround,
+    DeepSeekV41LayerRealizer,
+    DeepSeekV41ReferenceOracle,
+    Glm53LayerRealizer,
+    HostedModelGlance,
+    PUBLISHED_FRONTIER_PROFILES,
     TransformerArchitectureSpec,
     compile_multivariate_hinge_relu,
     compile_piecewise_affine_relu,
     direct_affine_kernel_oracle,
+    glance_huggingface_model,
     route_moe_topk,
     verify_compiled_capsule,
+    verify_mla_matrix_absorption,
     verify_multivariate_capsule,
     verify_softmax_insufficiency_witness,
 )
 from vld.navigation import (
+    AttributedObserverReading,
     ComputationNode,
+    CrossObserverCongruenceGate,
+    FiniteFieldOperatorChain,
     IntervalBound,
     NavigableComputationDAG,
     SubgraphThunk,
     analyze_dag_intervals,
     check_strong_bisimulation,
+    discover_similarity_blocks,
 )
-from vld.signal import verify_differential_backends, verify_signal8_ground
+from vld.signal import Signal8Backend, verify_differential_backends, verify_signal8_ground
 from vld.substrates import (
     BarrierDivergenceError,
+    HeadlessOS,
+    InternetPathRefused,
+    O_RDONLY,
     PF_R,
     PF_W,
     PF_X,
+    SEEK_SET,
     SIMTInstruction,
     SIMTWorkgroupExecutor,
+    TTL_PROBES,
+    VMInstruction,
     VirtualPageSpace,
     WasmRealizer,
     assemble_wasm_affine_orbit_module,
     assemble_wasm_f32_dot_indirect_module,
+    build_ethernet_ipv4_udp_frame,
     build_minimal_elf64_image,
     build_room_intention,
     execute_room_on_realizer,
     lift_elf64_image,
     lift_wasm_module,
+    verify_ipv4_router_hop_ground,
 )
 from vld.triad import (
     EpistemicStatus,
@@ -452,6 +497,137 @@ def run_self_verification() -> dict[str, Any]:
     assert journal.verify() == rec1.event_digest
     checks["pareto_and_journal"] = 4
 
+    # 11. Phase 8: FP8/UE8M0/FP4 codecs, Birkhoff mHC, DeepSeek-V4.1 & GLM-5.3 MLA Absorption
+    f8_vals = [0.0, -0.5, 1.5, -12.0, 448.0]
+    assert decode_f8_e4m3(encode_f8_e4m3(f8_vals)) == f8_vals
+    assert decode_f8_e8m0(encode_f8_e8m0([0.125, 1.0, 8.0])) == [0.125, 1.0, 8.0]
+    fp4_row = [[0.0, 0.5, -1.0, 1.5, -2.0, 3.0, -4.0, 6.0] * 4]
+    fp4_p, fp4_s = encode_fp4_e2m1_packed(fp4_row, block_k=32)
+    assert dequantize_fp4_e2m1_packed(fp4_p, (1, 32), fp4_s, (1, 1), use_numpy=False) == fp4_row
+    b_raw = dequantize_fp8_blockwise(encode_f8_e4m3([2.0] * (32 * 32)), (32, 32), encode_f8_e8m0([0.5]), (1, 1), use_numpy=False)
+    assert b_raw[0][0] == 1.0 and b_raw[31][31] == 1.0
+    _, _, comb_hc = hc_split_sinkhorn(
+        [[0.1 * ((j * 7 + 3) % 9 - 4) for j in range(24)]],
+        [0.2, 0.2, 0.2],
+        [0.05 * (j % 5 - 2) for j in range(24)],
+        hc_mult=4,
+        sinkhorn_iters=20,
+    )
+    for col_j in range(4):
+        col_sum = sum(comb_hc[0][r_i][col_j] for r_i in range(4))
+        assert 1.0 - 5e-5 < col_sum <= 1.0 + 1e-6
+
+    ds_gl = HostedModelGlance.from_published_profile("deepseek-v4.1-flash")
+    glm_gl = HostedModelGlance.from_published_profile("glm-5.3-bf16")
+    assert ds_gl.kv_compression_factor == 128.0 and round(glm_gl.kv_compression_factor, 2) == 56.89
+
+    ds_arch, ds_wg = build_compact_deepseek_v41_fixture()
+    ds_realizer = DeepSeekV41LayerRealizer(ds_arch, ds_wg)
+    hc_s, pm_s = ds_realizer.initial_hc_stream([1, 5])
+    l0_ds = ds_realizer.forward_layer(0, hc_s, pm_s)
+    l1_ds = ds_realizer.forward_layer(1, l0_ds.hc_stream, l0_ds.next_pre_mix)
+    ds_logits = ds_realizer.collapse_and_logits(l1_ds.hc_stream, l1_ds.next_pre_mix)
+    ds_ref = DeepSeekV41ReferenceOracle.forward_full(ds_arch, ds_wg, [1, 5])
+    assert NumericEngine.max_abs_diff(ds_logits, ds_ref) < 1e-4
+
+    glm_arch, glm_wg = build_compact_glm53_fixture()
+    glm_realizer = Glm53LayerRealizer(glm_arch, glm_wg, mla_mode="latent_absorbed")
+    glm_emb = glm_realizer.embed_tokens([2, 7])
+    mla_check = verify_mla_matrix_absorption(glm_arch, glm_wg, glm_emb, layer_index=0)
+    assert mla_check["max_abs_diff"] < 1e-5
+    checks["phase8_frontier_deepseek_v41_and_glm_53"] = 12
+
+    # 12. Phase 8: F_p Commutant Blocks, Observer Congruence, Fabric Router, HeadlessOS, Router Path & Continuous System
+    fp_chain = FiniteFieldOperatorChain(
+        dimension=4,
+        modulus=97,
+        factors=(
+            ((3, 5, 0, 0), (2, 7, 0, 0), (0, 0, 11, 4), (0, 0, 6, 9)),
+            ((2, 1, 0, 0), (4, 3, 0, 0), (0, 0, 5, 2), (0, 0, 3, 7)),
+        ),
+    )
+    fp_decomp = discover_similarity_blocks(fp_chain)
+    assert fp_decomp.block_sizes == (2, 2)
+    j_vec, _ = fp_decomp.navigate_horizon([1, 2, 3, 4], 10_000)
+    assert len(j_vec) == 4
+
+    s8_val = Signal8Backend().encode_symbol(5, observer=3)
+    c_gate = CrossObserverCongruenceGate({"o1": b"s1", "o2": b"s2"}, quotient_modulus=8)
+    r_o1 = AttributedObserverReading.sign(b"s1", observer_id="o1", ground_fingerprint=spec.fingerprint, scheduler_id="s", coordinate=9, representation_kind="canonical_int", raw_reading={"value": 21})
+    r_o2 = AttributedObserverReading.sign(b"s2", observer_id="o2", ground_fingerprint=spec.fingerprint, scheduler_id="s", coordinate=9, representation_kind="signal8_phasor", raw_reading={"im": s8_val.phasor.imag, "observer_unit": 3, "phase_eps": 0.0, "re": s8_val.phasor.real})
+    assert c_gate.verify_congruence((r_o1, r_o2))["agreed_quotient_value"] == 5
+
+    f_router = ComputationalFabricRouter("p.src", {"p.dst": b"peer-secret-01234567"})
+    f_router.add_link(FabricLink("p.src", "p.dst", (RouteMetric("latency_ms", "ms", 3),)))
+    f_router.register_advertisement(
+        HostAdvertisement.signed(
+            b"peer-secret-01234567",
+            peer_id="p.dst",
+            host_id="h.dst",
+            tls_dns="dst.vld.local",
+            endpoint_host="127.0.0.1",
+            port=9000,
+            ground_fingerprint=spec.fingerprint,
+            operator_contract="op.v1",
+            substrate_kind="vm",
+            local_metrics=(RouteMetric("latency_ms", "ms", 1),),
+            observed_at=0,
+            expires_at=50,
+        )
+    )
+    assert (
+        f_router.resolve_routes(
+            ground_fingerprint=spec.fingerprint,
+            operator_contract="op.v1",
+            now=10,
+            metric_order=(("latency_ms", "ms"),),
+        ).status
+        is FabricResolutionStatus.FOUND
+    )
+    exp_res = f_router.resolve_routes(
+        ground_fingerprint=spec.fingerprint,
+        operator_contract="op.v1",
+        now=100,
+        metric_order=(("latency_ms", "ms"),),
+    )
+    assert exp_res.status is FabricResolutionStatus.BLOCKED and FabricBlockerCode.LEASE_EXPIRED in exp_res.blockers
+
+    hos = HeadlessOS(page_size=128, structural_memory=sm_reg)
+    sm_reg.certify_and_admit("hos.seq", [10, 13, 16, 19, 22], domain="Z/97Z", declared_modulus=97)
+    hos.vfs.register_structural_file("/proc/seq", memory_id="hos.seq", virtual_size=10**9)
+    pid0 = hos.spawn_process("init", (VMInstruction("HALT", ()),))
+    fd0 = hos.posix_invoke(pid0, 2, path="/proc/seq", flags=O_RDONLY).result
+    hos.posix_invoke(pid0, 8, fd=fd0, offset=1000, whence=SEEK_SET)
+    hos.posix_invoke(pid0, 0, fd=fd0, address=16, size=1)
+    assert hos._procs[pid0].vm_proc.memory.read_bytes(16, 1)[0] == (10 + 3000) % 97
+
+    sf = [build_ethernet_ipv4_udp_frame(sequence=i, ttl=t) for i, t in enumerate(TTL_PROBES)]
+    rf = [build_ethernet_ipv4_udp_frame(sequence=i, ttl=t - 1) for i, t in enumerate(TTL_PROBES)]
+    assert verify_ipv4_router_hop_ground("one", sender_frames=sf, hop_captures=[("one.r1", sf, rf)], receiver_ttls=[t - 1 for t in TTL_PROBES], require_in_path_transform=True).l3_hops == 1
+    try:
+        verify_ipv4_router_hop_ground("bridge", sender_frames=sf, hop_captures=[("bridge.r1", sf, sf)], receiver_ttls=list(TTL_PROBES), require_in_path_transform=True)
+        raise AssertionError("Expected InternetPathRefused on L2 bridge negative control")
+    except InternetPathRefused:
+        pass
+
+    c_mem = QuorumMembership("verify.cont", ("c0", "c1", "c2"))
+    c_secs = {m: f"cont-secret-{m}-0123456789".encode("utf-8") for m in c_mem.member_ids}
+    c_nodes = [QuorumAuthorityMember(m, c_secs[m]) for m in c_mem.member_ids]
+    c_quorum = QuorumLineageCoordinator(c_mem, c_nodes, c_secs)
+    c_store = PagedObjectStore(InMemoryPageBacking(512))
+    c_jour = HashChainedJournal()
+    c_stages = (
+        ContinuousStageSpec("cs0", spec, "in", "mid", "sched.c0", lambda st: ({"v": int(st["x"]) + 5}, NavigationCostVector(0.1, 1.0, 8.0, 1.0), "PASS:cs0")),
+        ContinuousStageSpec("cs1", spec, "mid", "out", "sched.c1", lambda st: ({"v": int(st["v"]) * 3}, NavigationCostVector(0.1, 1.0, 8.0, 1.0), "PASS:cs1")),
+    )
+    c_sys1 = ContinuousVirtualSystem("verify.pipe", store=c_store, quorum=c_quorum, active_quorum_members=("c0", "c1"), journal=c_jour)
+    c_part = c_sys1.execute_stages(c_stages, {"x": 7}, host_id="h.1", interrupt_after_stage=0)
+    assert c_part.stages_executed_this_invocation == 1
+    c_sys2 = ContinuousVirtualSystem("verify.pipe", store=c_store, quorum=c_quorum, active_quorum_members=("c1", "c2"), journal=c_jour)
+    c_done = c_sys2.execute_stages(c_stages, {"x": 7}, host_id="h.2")
+    assert c_done.stages_recovered_from_quorum == 1 and c_done.stages_executed_this_invocation == 1 and c_done.final_state["v"] == 36
+    checks["phase8_os_fabric_orbit_and_continuous_system"] = 12
+
     return {
         "accelerators": {
             "native_rust_cdll": get_native_accelerator().available,
@@ -470,7 +646,7 @@ def run_self_verification() -> dict[str, Any]:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="vld",
-        description="Virtual Layer Dynamics CLI — Ground verification, navigation, Pareto benchmarking & Vantage hosting.",
+        description="Virtual Layer Dynamics CLI — Ground verification, frontier model glancing, continuous execution & Vantage hosting.",
     )
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("info", help="Print package architecture and active acceleration metadata as JSON.")
@@ -483,6 +659,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     bench = sub.add_parser("benchmark", help="Benchmark Virtual Layer structural contraction & horizon leaping vs traditional compute.")
     bench.add_argument("--dim", type=int, default=1024, help="Matrix dimension M=N for StructuralLinearOperator.")
     bench.add_argument("--steps", type=int, default=25000, help="Horizon T for LinearRecurrenceGround.")
+
+    gl_cmd = sub.add_parser("glance", help="Glance at the architectural Ground structure of a published or hosted frontier model.")
+    gl_cmd.add_argument("--profile", type=str, default="deepseek-v4.1-flash", help=f"Published profile ({', '.join(sorted(PUBLISHED_FRONTIER_PROFILES))}).")
+    gl_cmd.add_argument("--repo", type=str, default="", help="Optional live Hugging Face repo_id (e.g. deepseek-ai/DeepSeek-V4.1-Flash).")
+    gl_cmd.add_argument("--revision", type=str, default="", help="40-char Git revision SHA when --repo is supplied.")
+
+    cont_cmd = sub.add_parser("continuous", help="Run the 6-stage self-improving ContinuousVirtualSystem campaign across Grounds & hosts.")
+    cont_cmd.add_argument("--horizon", type=int, default=10**12, help="Target algebraic orbit horizon (default: 10^12).")
 
     serve = sub.add_parser("serve", help="Host a live HTTP/1.1 Information-Flow Vantage Node.")
     serve.add_argument("--host", type=str, default="127.0.0.1", help="Bind address (default: 127.0.0.1).")
@@ -507,12 +691,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "vld.memory (M1 PagedObjectStore, 5-rung Law Certifier, 2-adic inverse locators, counterexample demotion)",
                 "vld.inquiry (greedy, beam & exact minimax active perception planners, HypothesisRevisionLedger)",
                 "vld.authority (scheduler-scoped vector clocks G13, decoupled provenance G21, 2q>N quorum M3 sessions & VirtualProcessor)",
-                "vld.navigation (unbounded lazy NavigableComputationDAG, K_3 dynamic guards, interval & strong-bisimulation pre-gates)",
-                "vld.accel (StructuralLinearOperator contraction, LinearRecurrenceGround, ndarray-resident NumPy + Rust CDLL kernels)",
-                "vld.fabric (VantageEnvelope, ReplayWindowGuard, crash-resumable ReliableChannel, X.509 v3 mTLS mesh & G11 forwarding)",
-                "vld.substrates (CoW + Structural-Memory VM pages, ELF64/WASM lifting, SIMT barriers, O(1) delta tensor log, Path Grounds & ROOM)",
-                "vld.models (Safetensors HFR, BPE Tokenizer Ground, Qwen3 dense/MoE realizers, SNC/PNF procedural models)",
-                "vld.agents (ProofGround hypergraph, ReceiverHypervisor CAS/capabilities, InLayerModelAgent)",
+                "vld.navigation (unbounded lazy NavigableComputationDAG, K_3 guards, ComposedGroundNavigator, F_p commutant blocks & observer congruence)",
+                "vld.accel (StructuralLinearOperator, LinearRecurrenceGround, FP8/UE8M0/FP4 codecs, Birkhoff Sinkhorn mHC, NumPy + Rust CDLL)",
+                "vld.fabric (VantageEnvelope, ReliableChannel, X.509 v3 mTLS mesh, ComputationalFabricRouter & PartitionedTensorCutCoordinator)",
+                "vld.substrates (HeadlessOS x86_64 POSIX ABI, ELF64/WASM lifters, SIMT barriers, delta tensor log, IPv4/Internet Path Grounds & ROOM)",
+                "vld.models (HostedModelGlance, LazyFrontierWeightGround, DeepSeek-V4.1, GLM-5.3 MLA Absorption, Qwen3 & SNC/PNF compilers)",
+                "vld.agents (ProofGround hypergraph, ReceiverHypervisor CAS/capabilities, InLayerModelAgent & ContinuousLayerBuilderAgent)",
+                "vld.continuous (quorum-fenced crash-resumable ContinuousVirtualSystem across changing Grounds, hosts & physical paths)",
             ],
             "package": "virtual-layer-dynamics",
             "repository": "https://github.com/Kier73/Virtual-Layer-Dynamics",
@@ -524,6 +709,41 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "verify":
         report = run_self_verification()
         print(json.dumps(report, indent=2, sort_keys=True))
+        return 0
+
+    if args.command == "glance":
+        try:
+            if args.repo:
+                if not args.revision:
+                    parser.error("--revision (40-char Git SHA) is required when --repo is set.")
+                gl = glance_huggingface_model(args.repo, revision=args.revision)
+            else:
+                gl = HostedModelGlance.from_published_profile(args.profile)
+        except Exception as exc:
+            parser.error(str(exc))
+        print(json.dumps(gl.to_dict(), indent=2, sort_keys=True))
+        return 0
+
+    if args.command == "continuous":
+        if args.horizon <= 0:
+            parser.error("--horizon must be a positive integer.")
+        camp = run_self_improving_continuous_campaign(horizon=args.horizon)
+        out = {
+            "admitted_upgrades": [u.upgrade_id for u in camp.build_cycle.admitted_upgrades],
+            "origin_hits_delta_pass1": camp.origin_hits_delta_pass1,
+            "origin_hits_delta_pass2": camp.origin_hits_delta_pass2,
+            "pass1_cost": camp.pass1.total_cost.to_dict(),
+            "pass1_final_state": dict(camp.pass1.final_state),
+            "pass2_cost": camp.pass2_resumed.total_cost.to_dict(),
+            "pass2_final_continuity_digest": camp.pass2_resumed.final_continuity_digest,
+            "pass2_final_state": dict(camp.pass2_resumed.final_state),
+            "pass2_pareto_dominates_pass1": camp.pass2_pareto_dominates_pass1,
+            "pass2_stages_executed_after_host_switch": camp.pass2_resumed.stages_executed_this_invocation,
+            "pass2_stages_recovered_from_quorum": camp.pass2_resumed.stages_recovered_from_quorum,
+            "refused_upgrades": [r[0] for r in camp.build_cycle.refused_proposals],
+            "warm_weight_bytes_pass2": camp.warm_weight_bytes_pass2,
+        }
+        print(json.dumps(out, indent=2, sort_keys=True))
         return 0
 
     if args.command == "navigate":

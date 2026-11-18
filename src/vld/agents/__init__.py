@@ -1,7 +1,13 @@
-r"""Phase 7 — Agentic Hypervisors, ProofGround & Capability-Bounded Model Agents (`vld.agents`)."""
+r"""Phase 7 — Agentic Hypervisors, ProofGround, Capability-Bounded Model Agents & Continuous Layer Builders (`vld.agents`)."""
 
 from __future__ import annotations
 
+from vld.agents.builder import (
+    ContinuousLayerBuilderAgent,
+    InstalledLayerUpgrade,
+    LayerBuildCycleReport,
+    create_default_builder_grant,
+)
 from vld.agents.controller import (
     AgentExplorationReport,
     InLayerModelAgent,
@@ -29,8 +35,11 @@ __all__ = [
     "AgentExplorationReport",
     "CASConflictError",
     "CapabilityGrant",
+    "ContinuousLayerBuilderAgent",
     "HypervisorRefusalError",
     "InLayerModelAgent",
+    "InstalledLayerUpgrade",
+    "LayerBuildCycleReport",
     "ProofEnvironment",
     "ProofGround",
     "ProofGroundAdapter",
@@ -39,5 +48,6 @@ __all__ = [
     "ProofObligation",
     "ReceiverHypervisor",
     "VerifiedKernelReceipt",
+    "create_default_builder_grant",
     "create_default_exploration_grant",
 ]

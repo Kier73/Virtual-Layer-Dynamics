@@ -39,6 +39,9 @@ class AgentCapability(str, Enum):
     PROPOSE_LAW = "propose_law"
     NAVIGATE_ORBIT = "navigate_orbit"
     ADMIT_NEURAL_CAPSULE = "admit_neural_capsule"
+    GLANCE_MODEL = "glance_model"
+    ADMIT_SIMILARITY_BLOCKS = "admit_similarity_blocks"
+    QUALIFY_PATH_HOST = "qualify_path_host"
     COMMIT_STATE = "commit_state"
 
 
