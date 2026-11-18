@@ -22,6 +22,7 @@ from vld.models.artifacts import (
     observe_safetensors_header,
 )
 from vld.models.frontier import (
+    DeepSeekSharedAttentionState,
     DeepSeekV41ArchitectureSpec,
     DeepSeekV41LayerOutput,
     DeepSeekV41LayerRealizer,
@@ -37,6 +38,7 @@ from vld.models.frontier import (
     glance_huggingface_model,
     glance_model_structure,
     route_moe_noaux_tc,
+    select_deepseek_candidate_blocks,
     verify_mla_matrix_absorption,
 )
 from vld.models.orbit import (
@@ -88,6 +90,7 @@ __all__ = [
     "AutoregressiveModelRunner",
     "ByteLevelBPETokenizerGround",
     "CompiledNeuralFSM",
+    "DeepSeekSharedAttentionState",
     "DeepSeekV41ArchitectureSpec",
     "DeepSeekV41LayerOutput",
     "DeepSeekV41LayerRealizer",
@@ -145,6 +148,7 @@ __all__ = [
     "rescale_block_dyadic",
     "route_moe_noaux_tc",
     "route_moe_topk",
+    "select_deepseek_candidate_blocks",
     "verify_compiled_capsule",
     "verify_mla_matrix_absorption",
     "verify_multivariate_capsule",

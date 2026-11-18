@@ -50,6 +50,7 @@ from vld.accel import (
     dequantize_fp8_blockwise,
     encode_f32_le,
     hc_split_sinkhorn,
+    quantize_dequantize_fp4_rows,
 )
 from vld.canonical import canonical_bytes, canonical_json, domain_digest, parse_strict_json
 from vld.ground import VirtualGroundSpec
@@ -75,7 +76,7 @@ PUBLISHED_FRONTIER_PROFILES: dict[str, dict[str, Any]] = {
     "deepseek-v4.1-flash": {
         "repo_id": "deepseek-ai/DeepSeek-V4.1-Flash",
         "revision": "314113f8a7dadb388215396ba5fbee2c610a04d6",
-        "family": "deepseek_v41",
+        "family": "deepseek_v41_text",
         "declared_checkpoint_bytes": 510_286_023_000,
         "shard_count": 48,
         "vocab_size": 129280,
@@ -102,12 +103,28 @@ PUBLISHED_FRONTIER_PROFILES: dict[str, dict[str, Any]] = {
         "rms_norm_eps": 1e-20,
         "sliding_window": 128,
         "rope_theta": 10000.0,
+        "compress_rope_theta": 160_000.0,
+        "original_seq_len": 65536,
+        "rope_factor": 16.0,
+        "beta_fast": 32.0,
+        "beta_slow": 1.0,
+        "compress_ratios": (0, 0) + (2,) * 18 + (1,) * 20 + (0, 0, 0),
+        "kv_source_layers": (2, 8, 14, 20),
+        "index_source_layers": (2, 8, 14, 20, 24, 28, 32, 36),
+        "index_n_heads": 32,
+        "index_head_dim": 128,
+        "index_topk": 512,
+        "candidate_source_layer": 20,
+        "candidate_topk_blocks": 2048,
+        "candidate_block_size": 8,
         "weight_quant": "fp8_e4m3_32x32+fp4_e2m1_experts",
     },
     "deepseek-v4-pro": {
         "repo_id": "deepseek-ai/DeepSeek-V4-Pro-0813",
         "revision": "72e1d3230f6c080a530b0a1d46f8eb4602340597",
         "family": "deepseek_v4",
+        "declared_checkpoint_bytes": 892_727_580_904,
+        "shard_count": 66,
         "vocab_size": 129280,
         "hidden_size": 7168,
         "num_hidden_layers": 61,
@@ -132,6 +149,14 @@ PUBLISHED_FRONTIER_PROFILES: dict[str, dict[str, Any]] = {
         "rms_norm_eps": 1e-6,
         "sliding_window": 128,
         "rope_theta": 10000.0,
+        "compress_rope_theta": 160_000.0,
+        "original_seq_len": 65536,
+        "rope_factor": 16.0,
+        "beta_fast": 32.0,
+        "beta_slow": 1.0,
+        "index_n_heads": 64,
+        "index_head_dim": 128,
+        "index_topk": 1024,
         "weight_quant": "fp8_e4m3_128x128+fp4_e2m1_experts",
     },
     "glm-5.3-bf16": {
@@ -188,6 +213,7 @@ PUBLISHED_FRONTIER_PROFILES: dict[str, dict[str, Any]] = {
         "scoring_func": "sigmoid",
         "routed_scaling_factor": 2.5,
         "hc_mult": 4,
+        "linear_attn_config": {"head_dim": 128, "num_heads": 64, "short_conv_kernel_size": 4},
         "rms_norm_eps": 1e-5,
         "weight_quant": "bf16",
     },
@@ -298,11 +324,15 @@ class HostedModelGlance:
         repo_id = str(p["repo_id"])
         rev = str(p["revision"])
         cfg = {
-            **p,
+            **{k: (list(v) if isinstance(v, tuple) else v) for k, v in p.items()},
             "architectures": [
                 "DeepseekV41ForCausalLM"
-                if p["family"].startswith("deepseek")
-                else ("GlmMoeDsaForCausalLM" if p["family"] == "glm_moe_dsa" else "Glm5NextForConditionalGeneration")
+                if p["family"] == "deepseek_v41_text"
+                else (
+                    "DeepseekV4ForCausalLM"
+                    if p["family"].startswith("deepseek")
+                    else ("GlmMoeDsaForCausalLM" if p["family"] == "glm_moe_dsa" else "Glm5NextForConditionalGeneration")
+                )
             ],
             "dtype": p.get("weight_quant", "bfloat16"),
             "model_type": p["family"],
@@ -804,7 +834,7 @@ def route_moe_noaux_tc(
 
 @dataclass(frozen=True, slots=True)
 class DeepSeekV41ArchitectureSpec:
-    """Architectural specification for `DeepseekV41ForCausalLM` (`mHC` + Sink-MLA + `FP8`/`FP4` MoE)."""
+    """Architectural specification for `DeepseekV41ForCausalLM` (`mHC` + Sink/Compressed-MLA + `FP8`/`FP4` MoE)."""
 
     source_model: str
     revision: str
@@ -831,7 +861,20 @@ class DeepSeekV41ArchitectureSpec:
     rms_norm_eps: float = 1e-20
     sliding_window: int = 128
     rope_theta: float = 10000.0
+    compress_rope_theta: float = 160_000.0
+    original_seq_len: int = 0
+    rope_factor: float = 16.0
+    beta_fast: float = 32.0
+    beta_slow: float = 1.0
     compress_ratios: tuple[int, ...] = ()
+    kv_source_layers: tuple[int, ...] = ()
+    index_source_layers: tuple[int, ...] = ()
+    index_n_heads: int = 32
+    index_head_dim: int = 128
+    index_topk: int = 512
+    candidate_source_layer: int = -1
+    candidate_topk_blocks: int = 0
+    candidate_block_size: int = 0
 
     def __post_init__(self) -> None:
         if not _REPO_RE.fullmatch(self.source_model) or not _HEX40_RE.fullmatch(self.revision):
@@ -873,6 +916,20 @@ class DeepSeekV41ArchitectureSpec:
             rms_norm_eps=p["rms_norm_eps"],
             sliding_window=p["sliding_window"],
             rope_theta=p["rope_theta"],
+            compress_rope_theta=float(p.get("compress_rope_theta", p["rope_theta"])),
+            original_seq_len=int(p.get("original_seq_len", 0)),
+            rope_factor=float(p.get("rope_factor", 1.0)),
+            beta_fast=float(p.get("beta_fast", 32.0)),
+            beta_slow=float(p.get("beta_slow", 1.0)),
+            compress_ratios=tuple(p.get("compress_ratios", ())),
+            kv_source_layers=tuple(p.get("kv_source_layers", ())),
+            index_source_layers=tuple(p.get("index_source_layers", ())),
+            index_n_heads=int(p.get("index_n_heads", 32)),
+            index_head_dim=int(p.get("index_head_dim", 128)),
+            index_topk=int(p.get("index_topk", 512)),
+            candidate_source_layer=int(p.get("candidate_source_layer", -1)),
+            candidate_topk_blocks=int(p.get("candidate_topk_blocks", 0)),
+            candidate_block_size=int(p.get("candidate_block_size", 0)),
         )
 
     @property
@@ -899,6 +956,54 @@ class DeepSeekV41ArchitectureSpec:
         )
 
 
+class DeepSeekSharedAttentionState:
+    """Cross-layer shared compressed-KV, indexer-key, top-k, and two-level candidate block state (`SharedAttentionRuntime`)."""
+
+    def __init__(self) -> None:
+        self.compress_kv: list[list[float]] = []
+        self.index_k: list[list[float]] = []
+        self.topk_idxs: list[list[int]] = []
+        self.candidates: list[list[bool]] | None = None
+        self.compressor_partial: dict[int, tuple[list[list[float]], list[list[float]]]] = {}
+        self.compress_kv_by_source: dict[int, list[list[float]]] = {}
+        self.index_k_by_source: dict[int, list[list[float]]] = {}
+
+
+def select_deepseek_candidate_blocks(
+    scores_2d: Sequence[Sequence[float]],
+    compress_lens: Sequence[int],
+    topk_blocks: int,
+    block_size: int,
+) -> list[list[bool]]:
+    r"""Two-level candidate block pre-filter (`inference/model.py:select_candidate_blocks`).
+
+    Scores each `block_size` compressed-KV block by its `amax`, pins the query's newest partially-filled
+    block `(compress_len - 1) // block_size` to `+\infty`, and keeps the top `topk_blocks` reachable blocks.
+    """
+    if block_size <= 0 or topk_blocks <= 0:
+        return [[True for _ in row] for row in scores_2d]
+    masks: list[list[bool]] = []
+    for row, c_len in zip(scores_2d, compress_lens):
+        width = len(row)
+        if width == 0:
+            masks.append([])
+            continue
+        num_blocks = math.ceil(width / block_size)
+        last_blk = (c_len - 1) // block_size if c_len > 0 else -1
+        blk_scores: list[float] = []
+        for b_i in range(num_blocks):
+            if b_i == last_blk:
+                blk_scores.append(float("inf"))
+            else:
+                sl = row[b_i * block_size : min(width, (b_i + 1) * block_size)]
+                blk_scores.append(max(sl) if sl else float("-inf"))
+        k_take = min(topk_blocks, num_blocks)
+        picked_blks = sorted(range(num_blocks), key=lambda idx: (-blk_scores[idx], idx))[:k_take]
+        keep_blk = {b_i for b_i in picked_blks if blk_scores[b_i] > float("-inf")}
+        masks.append([(pos // block_size) in keep_blk for pos in range(width)])
+    return masks
+
+
 @dataclass(frozen=True, slots=True)
 class DeepSeekV41LayerOutput:
     """Verified output of one DeepSeek-V4.1 `mHC` block including Birkhoff doubly-stochastic telemetry."""
@@ -909,6 +1014,7 @@ class DeepSeekV41LayerOutput:
     moe_receipts: tuple[MoERoutingReceipt, ...]
     loaded_tensor_names: tuple[str, ...]
     birkhoff_max_row_col_defect: float
+    compressed_kv_selected: tuple[tuple[int, ...], ...] = ()
 
 
 class DeepSeekV41LayerRealizer:
@@ -1069,7 +1175,8 @@ class DeepSeekV41LayerRealizer:
             if lim > 0.0:
                 gate = np.minimum(gate, float(lim))
                 up = np.clip(up, -float(lim), float(lim))
-            sig = np.where(gate >= 0.0, 1.0 / (1.0 + np.exp(-gate)), np.exp(gate) / (1.0 + np.exp(gate)))
+            ez = np.exp(-np.abs(gate))
+            sig = np.where(gate >= 0.0, 1.0 / (1.0 + ez), ez / (1.0 + ez))
             act = ((gate * sig) * up).astype(np.float32)
             out_nd = self.engine.linear_x_wt_nd(act, w2)
             return [[float(v) for v in r] for r in out_nd.tolist()]
@@ -1090,6 +1197,206 @@ class DeepSeekV41LayerRealizer:
             act_rows.append(ar)
         return self.engine.linear_x_wt(act_rows, w2_l)
 
+    def _run_compressor_and_indexer(
+        self,
+        *,
+        layer_index: int,
+        ratio: int,
+        x_norm: Sequence[Sequence[float]],
+        qr_2d: Sequence[Sequence[float]],
+        start_pos: int,
+        eff_theta: float,
+        eff_orig_seq: int,
+        shared_state: DeepSeekSharedAttentionState,
+        loaded: list[str],
+    ) -> tuple[list[list[float]], list[list[int]]]:
+        """Execute `Compressor`, `Indexer`, and `select_candidate_blocks` for `compress_ratios[layer] > 0`."""
+        p = f"layers.{layer_index}."
+        seq_len = len(x_norm)
+        end_pos = start_pos + seq_len
+        compress_len = end_pos // ratio
+        hd = self.arch.head_dim
+        rd = self.arch.qk_rope_head_dim
+        eps = self.arch.rms_norm_eps
+        is_kv_src = layer_index in self.arch.kv_source_layers
+        is_idx_src = layer_index in self.arch.index_source_layers
+
+        latent_pre_rope: list[list[float]] = []
+        group_positions: list[int] = []
+
+        if is_kv_src:
+            wkv_c = self.weights.load_float_tensor(p + "attn.compressor.wkv.weight", loaded, use_numpy=self.engine.uses_numpy)
+            cn_w = self.weights.load_float_tensor(p + "attn.compressor.norm.weight", loaded, use_numpy=self.engine.uses_numpy)
+            if ratio == 1:
+                latent_pre_rope = self.engine.rms_norm_2d(self.engine.linear_x_wt(x_norm, wkv_c), cn_w, eps)
+                group_positions = [start_pos + t for t in range(seq_len)]
+            else:
+                wgate_c = self.weights.load_float_tensor(
+                    p + "attn.compressor.wgate.weight", loaded, use_numpy=self.engine.uses_numpy
+                )
+                kv_proj = self.engine.linear_x_wt(x_norm, wkv_c)
+                sc_proj = self.engine.linear_x_wt(x_norm, wgate_c)
+                buf_kv, buf_sc = shared_state.compressor_partial.get(layer_index, ([], []))
+                buf_kv = [list(r) for r in buf_kv]
+                buf_sc = [list(r) for r in buf_sc]
+                pooled_groups: list[list[float]] = []
+                for t_rel in range(seq_len):
+                    abs_pos = start_pos + t_rel
+                    buf_kv.append(kv_proj[t_rel])
+                    buf_sc.append(sc_proj[t_rel])
+                    if (abs_pos + 1) % ratio == 0 and len(buf_kv) == ratio:
+                        grp_vec: list[float] = []
+                        for d_i in range(hd):
+                            col_s = [buf_sc[g_i][d_i] for g_i in range(ratio)]
+                            m_s = max(col_s)
+                            ex_s = [math.exp(v - m_s) for v in col_s]
+                            denom_s = math.fsum(ex_s)
+                            grp_vec.append(math.fsum(buf_kv[g_i][d_i] * ex_s[g_i] for g_i in range(ratio)) / denom_s)
+                        pooled_groups.append(grp_vec)
+                        group_positions.append(abs_pos + 1 - ratio)
+                        buf_kv = []
+                        buf_sc = []
+                shared_state.compressor_partial[layer_index] = (buf_kv, buf_sc)
+                if pooled_groups:
+                    latent_pre_rope = self.engine.rms_norm_2d(pooled_groups, cn_w, eps)
+            shared_state.compress_kv = shared_state.compress_kv_by_source.setdefault(layer_index, [])
+
+        # Indexer runs BEFORE latent is rotated/overwritten into compress_kv (`inference/model.py:211-212`)
+        if is_idx_src:
+            ih = self.arch.index_n_heads
+            idim = self.arch.index_head_dim
+            if is_kv_src:
+                idx_k_cache = shared_state.index_k_by_source.setdefault(layer_index, [])
+                if latent_pre_rope:
+                    wk_i = self.weights.load_float_tensor(p + "attn.indexer.wk.weight", loaded, use_numpy=self.engine.uses_numpy)
+                    kn_i = self.weights.load_float_tensor(
+                        p + "attn.indexer.k_norm.weight", loaded, use_numpy=self.engine.uses_numpy
+                    )
+                    k_unrot = self.engine.rms_norm_2d(self.engine.linear_x_wt(latent_pre_rope, wk_i), kn_i, eps)
+                    k_rot_list: list[list[float]] = []
+                    for g_row, g_pos in zip(k_unrot, group_positions):
+                        k_rot_list.append(
+                            apply_interleaved_rope_tail(
+                                [g_row],
+                                start_position=g_pos,
+                                rope_dim=rd,
+                                rope_theta=eff_theta,
+                                original_seq_len=eff_orig_seq,
+                                factor=self.arch.rope_factor,
+                                beta_fast=self.arch.beta_fast,
+                                beta_slow=self.arch.beta_slow,
+                            )[0]
+                        )
+                    if idim >= 32 and idim % 32 == 0:
+                        k_rot_list = quantize_dequantize_fp4_rows(k_rot_list, block_k=32, scale_dtype="F8_E8M0")
+                    for g_row, g_pos in zip(k_rot_list, group_positions):
+                        slot_idx = g_pos // ratio
+                        if slot_idx < len(idx_k_cache):
+                            idx_k_cache[slot_idx] = g_row
+                        else:
+                            idx_k_cache.append(g_row)
+                shared_state.index_k = idx_k_cache
+
+            if compress_len == 0:
+                shared_state.topk_idxs = [[] for _ in range(seq_len)]
+            else:
+                wqb_i = self.weights.load_float_tensor(
+                    p + "attn.indexer.wq_b.weight",
+                    loaded,
+                    logical_shape=(ih * idim, self.arch.q_lora_rank),
+                    use_numpy=self.engine.uses_numpy,
+                )
+                wproj_i = self.weights.load_float_tensor(
+                    p + "attn.indexer.weights_proj.weight", loaded, use_numpy=self.engine.uses_numpy
+                )
+                qf_i = self.engine.linear_x_wt(qr_2d, wqb_i)
+                q_idx_3d = [[qf_i[t][h * idim : (h + 1) * idim] for h in range(ih)] for t in range(seq_len)]
+                q_idx_rot = apply_interleaved_rope_tail(
+                    q_idx_3d,
+                    start_position=start_pos,
+                    rope_dim=rd,
+                    rope_theta=eff_theta,
+                    original_seq_len=eff_orig_seq,
+                    factor=self.arch.rope_factor,
+                    beta_fast=self.arch.beta_fast,
+                    beta_slow=self.arch.beta_slow,
+                )
+                if idim >= 32 and idim % 32 == 0:
+                    flat_q_rows = [hv for tok in q_idx_rot for hv in tok]
+                    q_qdq = quantize_dequantize_fp4_rows(flat_q_rows, block_k=32, scale_dtype="F8_E8M0")
+                    q_idx_rot = [q_qdq[t * ih : (t + 1) * ih] for t in range(seq_len)]
+
+                w_scale = (float(idim) ** -0.5) * (float(ih) ** -0.5)
+                head_weights = [[float(v) * w_scale for v in r] for r in self.engine.linear_x_wt(x_norm, wproj_i)]
+                index_k_vis = shared_state.index_k[:compress_len]
+                c_lens = [(start_pos + t_rel + 1) // ratio for t_rel in range(seq_len)]
+
+                scores_2d: list[list[float]] = []
+                for t_rel in range(seq_len):
+                    c_len_t = c_lens[t_rel]
+                    row_sc: list[float] = []
+                    for c_i in range(compress_len):
+                        if c_i >= c_len_t:
+                            row_sc.append(float("-inf"))
+                        else:
+                            kv_c = index_k_vis[c_i]
+                            s_val = 0.0
+                            for h_i in range(ih):
+                                dot_hk = math.fsum(q_idx_rot[t_rel][h_i][d_i] * kv_c[d_i] for d_i in range(idim))
+                                if dot_hk > 0.0:
+                                    s_val += dot_hk * head_weights[t_rel][h_i]
+                            row_sc.append(s_val)
+                    scores_2d.append(row_sc)
+
+                if layer_index == self.arch.candidate_source_layer:
+                    shared_state.candidates = select_deepseek_candidate_blocks(
+                        scores_2d, c_lens, self.arch.candidate_topk_blocks, self.arch.candidate_block_size
+                    )
+                elif 0 <= self.arch.candidate_source_layer < layer_index and shared_state.candidates is not None:
+                    for t_rel in range(seq_len):
+                        cand_row = shared_state.candidates[t_rel]
+                        for c_i in range(min(compress_len, len(cand_row))):
+                            if not cand_row[c_i]:
+                                scores_2d[t_rel][c_i] = float("-inf")
+
+                topk = min(self.arch.index_topk, compress_len)
+                picked_all: list[list[int]] = []
+                for t_rel in range(seq_len):
+                    c_len_t = c_lens[t_rel]
+                    sc_r = scores_2d[t_rel]
+                    top_raw = sorted(range(compress_len), key=lambda idx: (-sc_r[idx], idx))[:topk]
+                    top_sorted = sorted(top_raw)
+                    picked_all.append([idx if (idx < c_len_t and math.isfinite(sc_r[idx])) else -1 for idx in top_sorted])
+                shared_state.topk_idxs = picked_all
+
+        if is_kv_src and latent_pre_rope:
+            ckv_cache = shared_state.compress_kv_by_source.setdefault(layer_index, [])
+            lat_rot: list[list[float]] = []
+            for g_row, g_pos in zip(latent_pre_rope, group_positions):
+                lat_rot.append(
+                    apply_interleaved_rope_tail(
+                        [g_row],
+                        start_position=g_pos,
+                        rope_dim=rd,
+                        rope_theta=eff_theta,
+                        original_seq_len=eff_orig_seq,
+                        factor=self.arch.rope_factor,
+                        beta_fast=self.arch.beta_fast,
+                        beta_slow=self.arch.beta_slow,
+                    )[0]
+                )
+            if hd >= 16 and hd % 16 == 0:
+                lat_rot = quantize_dequantize_fp4_rows(lat_rot, block_k=16, scale_dtype="F8_E4M3")
+            for g_row, g_pos in zip(lat_rot, group_positions):
+                slot_idx = g_pos // ratio
+                if slot_idx < len(ckv_cache):
+                    ckv_cache[slot_idx] = g_row
+                else:
+                    ckv_cache.append(g_row)
+            shared_state.compress_kv = ckv_cache
+
+        return shared_state.compress_kv[:compress_len], shared_state.topk_idxs
+
     def forward_layer(
         self,
         layer_index: int,
@@ -1097,8 +1404,9 @@ class DeepSeekV41LayerRealizer:
         pre_mix: Sequence[Sequence[float]],
         *,
         past_kv: Sequence[Sequence[float]] = (),
+        shared_state: DeepSeekSharedAttentionState | None = None,
     ) -> DeepSeekV41LayerOutput:
-        """Execute one complete DeepSeek-V4.1 layer (`mHC` + Sink-MLA + `sqrtsoftplus` `FP8`/`FP4` MoE)."""
+        """Execute one complete DeepSeek-V4.1 layer (`mHC` + Sliding/Compressed Sink-MLA + `sqrtsoftplus` `FP8`/`FP4` MoE)."""
         if not (0 <= layer_index < self.arch.num_hidden_layers):
             raise RealizerError("layer_index out of bounds.")
         seq_len = len(hc_stream)
@@ -1113,6 +1421,9 @@ class DeepSeekV41LayerRealizer:
         ng = self.arch.o_groups
         ro = self.arch.o_lora_rank
         eps = self.arch.rms_norm_eps
+        ratio = self.arch.compress_ratios[layer_index] if layer_index < len(self.arch.compress_ratios) else 0
+        eff_theta = self.arch.compress_rope_theta if ratio > 0 else self.arch.rope_theta
+        eff_orig_seq = self.arch.original_seq_len if ratio > 0 else 0
 
         # 1. Attention mHC mix + pre-collapse + attn_norm
         attn_pre, attn_post, attn_comb, def_attn = self._hc_mixes(
@@ -1134,6 +1445,7 @@ class DeepSeekV41LayerRealizer:
             kvn_w = self.weights.load_float_tensor(p + "attn.kv_norm.weight", loaded, use_numpy=True, as_ndarray=True)
 
             qr_nd = self.engine.rms_norm_nd(self.engine.linear_x_wt_nd(xn_nd, wqa), qn_w, eps)
+            qr_2d = [[float(v) for v in tok] for tok in qr_nd.tolist()]
             q_flat_nd = self.engine.linear_x_wt_nd(qr_nd, wqb).reshape(seq_len, nh, hd)
             kv_nd = self.engine.rms_norm_nd(self.engine.linear_x_wt_nd(xn_nd, wkv), kvn_w, eps)
             q_heads = [[[float(v) for v in hv] for hv in tok] for tok in q_flat_nd.tolist()]
@@ -1145,20 +1457,51 @@ class DeepSeekV41LayerRealizer:
             wkv_l = self.weights.load_float_tensor(p + "attn.wkv.weight", loaded, use_numpy=False)
             kvn_l = self.weights.load_float_tensor(p + "attn.kv_norm.weight", loaded, use_numpy=False)
 
-            qr_l = self.engine.rms_norm_2d(self.engine.linear_x_wt(x_norm, wqa_l), qn_l, eps)
-            qf_l = self.engine.linear_x_wt(qr_l, wqb_l)
+            qr_2d = self.engine.rms_norm_2d(self.engine.linear_x_wt(x_norm, wqa_l), qn_l, eps)
+            qf_l = self.engine.linear_x_wt(qr_2d, wqb_l)
             q_heads = [[qf_l[t][h * hd : (h + 1) * hd] for h in range(nh)] for t in range(seq_len)]
             kv_new = self.engine.rms_norm_2d(self.engine.linear_x_wt(x_norm, wkv_l), kvn_l, eps)
 
         q_rot = apply_interleaved_rope_tail(
-            q_heads, start_position=start_pos, rope_dim=rd, rope_theta=self.arch.rope_theta
+            q_heads,
+            start_position=start_pos,
+            rope_dim=rd,
+            rope_theta=eff_theta,
+            original_seq_len=eff_orig_seq,
+            factor=self.arch.rope_factor,
+            beta_fast=self.arch.beta_fast,
+            beta_slow=self.arch.beta_slow,
         )
         kv_rot = apply_interleaved_rope_tail(
-            kv_new, start_position=start_pos, rope_dim=rd, rope_theta=self.arch.rope_theta
+            kv_new,
+            start_position=start_pos,
+            rope_dim=rd,
+            rope_theta=eff_theta,
+            original_seq_len=eff_orig_seq,
+            factor=self.arch.rope_factor,
+            beta_fast=self.arch.beta_fast,
+            beta_slow=self.arch.beta_slow,
         )
         kv_full = [*([list(r) for r in past_kv]), *kv_rot]
 
-        # 3. Sliding-Window Attention with Learnable Per-Head `attn_sink` + Inverse Tail RoPE
+        compress_kv_vis: list[list[float]] = []
+        compress_idxs: list[list[int]] = [[] for _ in range(seq_len)]
+        if ratio > 0:
+            if shared_state is None:
+                shared_state = DeepSeekSharedAttentionState()
+            compress_kv_vis, compress_idxs = self._run_compressor_and_indexer(
+                layer_index=layer_index,
+                ratio=ratio,
+                x_norm=x_norm,
+                qr_2d=qr_2d,
+                start_pos=start_pos,
+                eff_theta=eff_theta,
+                eff_orig_seq=eff_orig_seq,
+                shared_state=shared_state,
+                loaded=loaded,
+            )
+
+        # 3. Sliding-Window (+ Optional Compressed-KV Top-k) Attention with Learnable `attn_sink` + Inverse Tail RoPE
         attn_sink = self.weights.load_float_tensor(p + "attn.attn_sink", loaded, use_numpy=self.engine.uses_numpy)
         scale = 1.0 / math.sqrt(float(hd))
         win = self.arch.sliding_window
@@ -1168,13 +1511,18 @@ class DeepSeekV41LayerRealizer:
             import numpy as np
 
             kv_arr = np.asarray(kv_full, dtype=np.float64)  # [total_seq, hd]
+            ckv_arr = np.asarray(compress_kv_vis, dtype=np.float64) if compress_kv_vis else None
             sink_arr = np.asarray(attn_sink, dtype=np.float64)  # [nh]
             for t_rel in range(seq_len):
                 abs_pos = start_pos + t_rel
                 win_start = max(0, abs_pos - win + 1)
                 kv_win = kv_arr[win_start : abs_pos + 1]  # [W, hd]
+                if ckv_arr is not None and t_rel < len(compress_idxs):
+                    valid_c = [ci for ci in compress_idxs[t_rel] if 0 <= ci < len(compress_kv_vis)]
+                    if valid_c:
+                        kv_win = np.concatenate((kv_win, ckv_arr[valid_c]), axis=0)
                 q_t = np.asarray(q_rot[t_rel], dtype=np.float64)  # [nh, hd]
-                scores = (q_t @ kv_win.T) * scale  # [nh, W]
+                scores = (q_t @ kv_win.T) * scale  # [nh, W + C]
                 s_max = np.maximum(np.max(scores, axis=-1), -1e30)  # [nh]
                 ex = np.exp(scores - s_max[:, None])
                 denom = np.sum(ex, axis=-1) + np.exp(sink_arr - s_max)  # [nh]
@@ -1184,24 +1532,35 @@ class DeepSeekV41LayerRealizer:
             for t_rel in range(seq_len):
                 abs_pos = start_pos + t_rel
                 win_start = max(0, abs_pos - win + 1)
+                active_kv_rows = [kv_full[s_i] for s_i in range(win_start, abs_pos + 1)]
+                if compress_kv_vis and t_rel < len(compress_idxs):
+                    active_kv_rows.extend(compress_kv_vis[ci] for ci in compress_idxs[t_rel] if 0 <= ci < len(compress_kv_vis))
                 t_out: list[list[float]] = []
                 for h_i in range(nh):
                     qv = q_rot[t_rel][h_i]
                     sc_list = [
-                        math.fsum(qv[d_i] * kv_full[s_i][d_i] for d_i in range(hd)) * scale
-                        for s_i in range(win_start, abs_pos + 1)
+                        math.fsum(qv[d_i] * kv_r[d_i] for d_i in range(hd)) * scale
+                        for kv_r in active_kv_rows
                     ]
                     s_max = max(max(sc_list), -1e30)
                     ex = [math.exp(v - s_max) for v in sc_list]
                     denom = math.fsum(ex) + math.exp(float(attn_sink[h_i]) - s_max)
                     t_out.append([
-                        math.fsum(ex[idx] * kv_full[win_start + idx][d_i] for idx in range(len(ex))) / denom
+                        math.fsum(ex[idx] * active_kv_rows[idx][d_i] for idx in range(len(ex))) / denom
                         for d_i in range(hd)
                     ])
                 o_heads_rot.append(t_out)
 
         o_unrot = apply_interleaved_rope_tail(
-            o_heads_rot, start_position=start_pos, rope_dim=rd, rope_theta=self.arch.rope_theta, inverse=True
+            o_heads_rot,
+            start_position=start_pos,
+            rope_dim=rd,
+            rope_theta=eff_theta,
+            original_seq_len=eff_orig_seq,
+            factor=self.arch.rope_factor,
+            beta_fast=self.arch.beta_fast,
+            beta_slow=self.arch.beta_slow,
+            inverse=True,
         )
 
         # 4. Block-Diagonal Grouped Output LoRA (`wo_a` [G * r_o, (nh * hd) // G] -> `wo_b` [D, G * r_o])
@@ -1293,6 +1652,7 @@ class DeepSeekV41LayerRealizer:
             moe_receipts=tuple(moe_receipts),
             loaded_tensor_names=tuple(loaded),
             birkhoff_max_row_col_defect=max(def_attn, def_ffn),
+            compressed_kv_selected=tuple(tuple(r) for r in compress_idxs) if ratio > 0 else (),
         )
 
 
@@ -1308,8 +1668,9 @@ class DeepSeekV41ReferenceOracle:
     ) -> list[list[float]]:
         realizer_std = DeepSeekV41LayerRealizer(arch, weights, engine=NumericEngine("stdlib"))
         stream, pre_mix = realizer_std.initial_hc_stream(token_ids)
+        shared_state = DeepSeekSharedAttentionState()
         for l_idx in range(arch.num_hidden_layers):
-            out = realizer_std.forward_layer(l_idx, stream, pre_mix)
+            out = realizer_std.forward_layer(l_idx, stream, pre_mix, shared_state=shared_state)
             stream, pre_mix = out.hc_stream, out.next_pre_mix
         return realizer_std.collapse_and_logits(stream, pre_mix)
 
@@ -1787,6 +2148,7 @@ def verify_mla_matrix_absorption(
 
 
 __all__ = [
+    "DeepSeekSharedAttentionState",
     "DeepSeekV41ArchitectureSpec",
     "DeepSeekV41LayerOutput",
     "DeepSeekV41LayerRealizer",
@@ -1802,5 +2164,6 @@ __all__ = [
     "glance_huggingface_model",
     "glance_model_structure",
     "route_moe_noaux_tc",
+    "select_deepseek_candidate_blocks",
     "verify_mla_matrix_absorption",
 ]

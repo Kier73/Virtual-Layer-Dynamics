@@ -148,12 +148,24 @@ def test_headless_os_posix_syscalls_cow_execve_rollback_and_m1_snapshot() -> Non
     hos._procs[c_pid].vm_proc.memory.write_bytes(128, b"CHILD!")
     assert hos._procs[p1].vm_proc.memory.read_bytes(128, 6) == b"VLD-OS"
 
-    # Snapshot entire OS to M1 and verify CoW page deduplication + exact restore (G28)
+    # Snapshot entire OS to M1 and verify CoW page deduplication + exact restore of open FDs, pipes, offsets & mmap (G28)
+    hos.posix_invoke(p1, 1, fd=pw, address=128, size=6)  # buffer 6 bytes inside kernel pipe before snapshot!
     os_store = PagedObjectStore(InMemoryPageBacking(256))
     snap = hos.snapshot_os_to_m1(os_store)
     restored = HeadlessOS.restore_os_from_m1(snap, os_store, structural_memory=sm)
     assert restored._procs[p1].vm_proc.memory.read_bytes(128, 6) == b"VLD-OS"
     assert restored._procs[c_pid].vm_proc.memory.read_bytes(128, 6) == b"CHILD!"
+    # Restored open file descriptor fd_w retains offset=6 and restored pipe retains buffered 6 bytes!
+    restored._procs[p1].vm_proc.memory.write_bytes(0, b"-CONT")
+    assert restored.posix_invoke(p1, 1, fd=fd_w, address=0, size=5).result == 5
+    assert bytes(restored.vfs._inodes["/tmp/hello.txt"].data) == b"VLD-OS-CONT"
+    assert restored.posix_invoke(c_pid, 0, fd=pr, address=192, size=6).result == 6
+    assert restored._procs[c_pid].vm_proc.memory.read_bytes(192, 6) == b"VLD-OS"
+    # Drain pipe in live hos before continuing live tests
+    assert hos.posix_invoke(p1, 0, fd=pr, address=192, size=6).result == 6
+    # Verify register-level POSIX ABI bridge covers mmap/dup/getcwd/etc.
+    assert restored.posix_invoke_registers(p1, 9, 0, 256, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, 0, 0).ok
+    assert restored.posix_invoke_registers(p1, 79, 0, 64).ok  # getcwd via register bridge
 
     # Transactional execve on child: bad ELF64 must roll back cleanly without corrupting child memory or closing FDs!
     hos.install_elf_binary("/bin/corrupt.elf", b"\x7fELF\x00\x00\x00corrupt")
@@ -312,6 +324,35 @@ def test_fp_commutant_similarity_blocks_and_observer_congruence() -> None:
     direct = _mat_vec_fp(_mat_pow_fp(chain.composite_matrix(), horizon, p), v0, p)
     assert jumped == direct and stats["block_cubic_ops"] < stats["dense_cubic_ops"]
 
+    # Large prime p = 65537 non-triangular similarity decomposition + F_7^2 irreducible quadratic blocks (no eigenvalues in F_7!)
+    p_big = 65537
+    p_dense = (
+        (2, 3, 1, 5, 0, 1),
+        (1, 1, 2, 0, 3, 1),
+        (0, 2, 1, 1, 1, 4),
+        (3, 0, 1, 2, 1, 0),
+        (1, 4, 0, 1, 2, 1),
+        (0, 1, 3, 1, 1, 2),
+    )
+    p_dense_inv = _invert_matrix_fp(p_dense, p_big)
+    d1_big = ((300, 500, 0, 0, 0, 0), (200, 700, 0, 0, 0, 0), (0, 0, 1100, 400, 0, 0), (0, 0, 600, 900, 0, 0), (0, 0, 0, 0, 1300, 800), (0, 0, 0, 0, 500, 1500))
+    d2_big = ((210, 110, 0, 0, 0, 0), (410, 310, 0, 0, 0, 0), (0, 0, 510, 210, 0, 0), (0, 0, 310, 710, 0, 0), (0, 0, 0, 0, 910, 110), (0, 0, 0, 0, 410, 610))
+    big_chain = FiniteFieldOperatorChain(
+        6,
+        p_big,
+        (_mat_mul_fp(_mat_mul_fp(p_dense, d1_big, p_big), p_dense_inv, p_big), _mat_mul_fp(_mat_mul_fp(p_dense, d2_big, p_big), p_dense_inv, p_big)),
+    )
+    big_decomp = discover_similarity_blocks(big_chain)
+    assert big_decomp.block_sizes == (2, 2, 2)
+    j_big, _ = big_decomp.navigate_horizon(v0, 10**12)
+    assert j_big == _mat_vec_fp(_mat_pow_fp(big_chain.composite_matrix(), 10**12, p_big), v0, p_big)
+
+    p4 = ((1, 2, 0, 1), (0, 1, 1, 0), (2, 0, 1, 3), (0, 1, 0, 1))
+    p4_inv = _invert_matrix_fp(p4, 7)
+    q4 = ((0, 6, 0, 0), (1, 0, 0, 0), (0, 0, 0, 5), (0, 0, 1, 0))  # x^2+1 and x^2+2 are irreducible over F_7!
+    quad_decomp = discover_similarity_blocks(FiniteFieldOperatorChain(4, 7, (_mat_mul_fp(_mat_mul_fp(p4, q4, 7), p4_inv, 7),)))
+    assert quad_decomp.block_sizes == (2, 2)
+
     # Irreducible / non-splittable commutant must be refused cleanly
     irred_chain = FiniteFieldOperatorChain(
         dimension=2,
@@ -407,6 +448,38 @@ def test_mtls_partitioned_tensor_cut_failover_fencing_and_corrupted_worker_refus
         assert FabricBlockerCode.RESOURCE_LIMIT in ceil_res.blockers
         hop_res = router.resolve_routes(ground_fingerprint=g_fp, operator_contract="tensor_cut.swiglu.v1", now=10, metric_order=(("latency_ms", "ms"),), max_hops=0)
         assert FabricBlockerCode.HOP_LIMIT in hop_res.blockers
+
+        # Multi-constrained Pareto routing check: fast high-bytes subpath must NOT prune slightly slower low-bytes feasible route!
+        c_router = ComputationalFabricRouter("origin", {"target": b"target-secret-01234567"})
+        c_router.add_link(FabricLink("origin", "x", (RouteMetric("latency_ms", "ms", 1), RouteMetric("bytes", "B", 45))))
+        c_router.add_link(FabricLink("x", "a", (RouteMetric("latency_ms", "ms", 1), RouteMetric("bytes", "B", 45))))
+        c_router.add_link(FabricLink("origin", "a", (RouteMetric("latency_ms", "ms", 5), RouteMetric("bytes", "B", 10))))
+        c_router.add_link(FabricLink("a", "target", (RouteMetric("latency_ms", "ms", 1), RouteMetric("bytes", "B", 20))))
+        c_router.register_advertisement(
+            HostAdvertisement.signed(
+                b"target-secret-01234567",
+                peer_id="target",
+                host_id="h.t",
+                tls_dns="t.vld.local",
+                endpoint_host="127.0.0.1",
+                port=9001,
+                ground_fingerprint=g_fp,
+                operator_contract="op.v1",
+                substrate_kind="vm",
+                local_metrics=(RouteMetric("latency_ms", "ms", 0), RouteMetric("bytes", "B", 0)),
+                observed_at=0,
+                expires_at=100,
+            )
+        )
+        pareto_res = c_router.resolve_routes(
+            ground_fingerprint=g_fp,
+            operator_contract="op.v1",
+            now=10,
+            metric_order=(("latency_ms", "ms"), ("bytes", "B")),
+            ceilings={"bytes": 100},
+        )
+        assert pareto_res.status is FabricResolutionStatus.FOUND
+        assert pareto_res.routes[0].peer_path == ("origin", "a", "target")
 
         coord = PartitionedTensorCutCoordinator(
             cut_id="test.cut",
@@ -586,3 +659,47 @@ sys1.execute_stages(stages, {{"v": 5}}, host_id="host.crash.1")
     )
     with pytest.raises(ContinuousSystemError, match="failed independent oracle"):
         sys_bad.execute_stages((bad_stage,), {"v": 1}, host_id="h.bad")
+
+    # 3. Crash window right between propose_and_seal and _save_slot_envelope across 3 successive hosts!
+    cw_store = PagedObjectStore(InMemoryPageBacking(512))
+    cw_jour = HashChainedJournal()
+    cw_mem = QuorumMembership("cw.lin", ("q0", "q1", "q2"))
+    cw_nodes = [QuorumAuthorityMember(m, secs[m]) for m in cw_mem.member_ids]
+    cw_stages = tuple(
+        ContinuousStageSpec(
+            f"cw{i}", spec, f"r{i}", f"r{i+1}", f"sc{i}", lambda st, _i=i: ({"v": int(st["v"]) + 2}, NavigationCostVector(0.1, 1.0, 4.0, 1.0), "PASS")
+        )
+        for i in range(3)
+    )
+
+    class _CrashBeforeSeal(ContinuousVirtualSystem):
+        def _save_slot_envelope(self, token_digest: str, rcpt: Any) -> None:
+            raise RuntimeError("CRASH_BEFORE_SEAL_STAGE")
+
+    with pytest.raises(RuntimeError, match="CRASH_BEFORE_SEAL_STAGE"):
+        _CrashBeforeSeal(
+            "cw.pipe",
+            store=cw_store,
+            quorum=QuorumLineageCoordinator(cw_mem, cw_nodes, secs),
+            active_quorum_members=("q0", "q1"),
+            journal=cw_jour,
+        ).execute_stages(cw_stages, {"v": 1}, host_id="cw.h1")
+
+    # Host 2 recovers Stage 0 from pre_stage (anchoring seal_stage) and stops after Stage 1
+    ContinuousVirtualSystem(
+        "cw.pipe",
+        store=cw_store,
+        quorum=QuorumLineageCoordinator(cw_mem, cw_nodes, secs),
+        active_quorum_members=("q1", "q2"),
+        journal=cw_jour,
+    ).execute_stages(cw_stages, {"v": 1}, host_id="cw.h2", interrupt_after_stage=1)
+
+    # Host 3 recovers Stages 0 & 1 with unbroken continuity_digest chain and completes Stage 2!
+    cw_final = ContinuousVirtualSystem(
+        "cw.pipe",
+        store=cw_store,
+        quorum=QuorumLineageCoordinator(cw_mem, cw_nodes, secs),
+        active_quorum_members=("q0", "q2"),
+        journal=cw_jour,
+    ).execute_stages(cw_stages, {"v": 1}, host_id="cw.h3")
+    assert cw_final.final_state == {"v": 7} and cw_final.stages_recovered_from_quorum == 2

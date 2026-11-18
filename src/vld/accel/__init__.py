@@ -22,6 +22,7 @@ from vld.accel.kernels import (
     encode_fp4_e2m1_packed,
     has_numpy,
     hc_split_sinkhorn,
+    quantize_dequantize_fp4_rows,
 )
 from vld.accel.native import NativeRustAccelerator, get_native_accelerator
 from vld.accel.structural_ops import (
@@ -55,4 +56,5 @@ __all__ = [
     "get_native_accelerator",
     "has_numpy",
     "hc_split_sinkhorn",
+    "quantize_dequantize_fp4_rows",
 ]

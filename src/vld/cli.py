@@ -506,6 +506,8 @@ def run_self_verification() -> dict[str, Any]:
     assert dequantize_fp4_e2m1_packed(fp4_p, (1, 32), fp4_s, (1, 1), use_numpy=False) == fp4_row
     b_raw = dequantize_fp8_blockwise(encode_f8_e4m3([2.0] * (32 * 32)), (32, 32), encode_f8_e8m0([0.5]), (1, 1), use_numpy=False)
     assert b_raw[0][0] == 1.0 and b_raw[31][31] == 1.0
+    b_tail = dequantize_fp8_blockwise(encode_f8_e4m3([1.0] * (48 * 64)), (48, 64), encode_f8_e8m0([1.0, 1.0, 4.0, 4.0]), (2, 2), use_numpy=False)
+    assert b_tail[25][0] == 1.0 and b_tail[35][0] == 4.0
     _, _, comb_hc = hc_split_sinkhorn(
         [[0.1 * ((j * 7 + 3) % 9 - 4) for j in range(24)]],
         [0.2, 0.2, 0.2],
@@ -518,8 +520,12 @@ def run_self_verification() -> dict[str, Any]:
         assert 1.0 - 5e-5 < col_sum <= 1.0 + 1e-6
 
     ds_gl = HostedModelGlance.from_published_profile("deepseek-v4.1-flash")
+    ds_pro_gl = HostedModelGlance.from_published_profile("deepseek-v4-pro")
     glm_gl = HostedModelGlance.from_published_profile("glm-5.3-bf16")
-    assert ds_gl.kv_compression_factor == 128.0 and round(glm_gl.kv_compression_factor, 2) == 56.89
+    glm_fl_gl = HostedModelGlance.from_published_profile("glm-5.3-flash-bf16")
+    assert ds_gl.kv_compression_factor == 128.0 and ds_gl.model_type == "deepseek_v41_text"
+    assert ds_pro_gl.shard_count == 66 and round(glm_gl.kv_compression_factor, 2) == 56.89
+    assert glm_fl_gl.attention_mechanism == "glm5_hybrid_kda_mla"
 
     ds_arch, ds_wg = build_compact_deepseek_v41_fixture()
     ds_realizer = DeepSeekV41LayerRealizer(ds_arch, ds_wg)
@@ -535,21 +541,25 @@ def run_self_verification() -> dict[str, Any]:
     glm_emb = glm_realizer.embed_tokens([2, 7])
     mla_check = verify_mla_matrix_absorption(glm_arch, glm_wg, glm_emb, layer_index=0)
     assert mla_check["max_abs_diff"] < 1e-5
-    checks["phase8_frontier_deepseek_v41_and_glm_53"] = 12
+    checks["phase8_frontier_deepseek_v41_and_glm_53"] = 15
 
     # 12. Phase 8: F_p Commutant Blocks, Observer Congruence, Fabric Router, HeadlessOS, Router Path & Continuous System
     fp_chain = FiniteFieldOperatorChain(
         dimension=4,
-        modulus=97,
+        modulus=65537,
         factors=(
-            ((3, 5, 0, 0), (2, 7, 0, 0), (0, 0, 11, 4), (0, 0, 6, 9)),
-            ((2, 1, 0, 0), (4, 3, 0, 0), (0, 0, 5, 2), (0, 0, 3, 7)),
+            ((301, 503, 0, 0), (211, 709, 0, 0), (0, 0, 1103, 409), (0, 0, 607, 911)),
+            ((223, 107, 0, 0), (419, 313, 0, 0), (0, 0, 521, 229), (0, 0, 331, 733)),
         ),
     )
     fp_decomp = discover_similarity_blocks(fp_chain)
     assert fp_decomp.block_sizes == (2, 2)
     j_vec, _ = fp_decomp.navigate_horizon([1, 2, 3, 4], 10_000)
     assert len(j_vec) == 4
+    f7_quad = discover_similarity_blocks(
+        FiniteFieldOperatorChain(4, 7, (((0, 6, 0, 0), (1, 0, 0, 0), (0, 0, 0, 5), (0, 0, 1, 0)),))
+    )
+    assert f7_quad.block_sizes == (2, 2)
 
     s8_val = Signal8Backend().encode_symbol(5, observer=3)
     c_gate = CrossObserverCongruenceGate({"o1": b"s1", "o2": b"s2"}, quotient_modulus=8)
@@ -600,6 +610,10 @@ def run_self_verification() -> dict[str, Any]:
     hos.posix_invoke(pid0, 8, fd=fd0, offset=1000, whence=SEEK_SET)
     hos.posix_invoke(pid0, 0, fd=fd0, address=16, size=1)
     assert hos._procs[pid0].vm_proc.memory.read_bytes(16, 1)[0] == (10 + 3000) % 97
+    hos_store = PagedObjectStore(InMemoryPageBacking(128))
+    hos_rest = HeadlessOS.restore_os_from_m1(hos.snapshot_os_to_m1(hos_store), hos_store, structural_memory=sm_reg)
+    assert hos_rest.posix_invoke(pid0, 0, fd=fd0, address=17, size=1).result == 1
+    assert hos_rest._procs[pid0].vm_proc.memory.read_bytes(17, 1)[0] == (10 + 3003) % 97
 
     sf = [build_ethernet_ipv4_udp_frame(sequence=i, ttl=t) for i, t in enumerate(TTL_PROBES)]
     rf = [build_ethernet_ipv4_udp_frame(sequence=i, ttl=t - 1) for i, t in enumerate(TTL_PROBES)]
@@ -626,7 +640,7 @@ def run_self_verification() -> dict[str, Any]:
     c_sys2 = ContinuousVirtualSystem("verify.pipe", store=c_store, quorum=c_quorum, active_quorum_members=("c1", "c2"), journal=c_jour)
     c_done = c_sys2.execute_stages(c_stages, {"x": 7}, host_id="h.2")
     assert c_done.stages_recovered_from_quorum == 1 and c_done.stages_executed_this_invocation == 1 and c_done.final_state["v"] == 36
-    checks["phase8_os_fabric_orbit_and_continuous_system"] = 12
+    checks["phase8_os_fabric_orbit_and_continuous_system"] = 14
 
     return {
         "accelerators": {

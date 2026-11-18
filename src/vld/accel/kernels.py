@@ -244,12 +244,36 @@ def _decode_scale_2d(
     return flat
 
 
+def _resolve_block_axis(dim: int, scale_dim: int, explicit_block: int | None) -> int:
+    r"""Resolve block granularity $b$ for dimension $d$ and scale count $s = \lceil d / b \rceil$.
+
+    By the dyadic uniqueness inequality $d/s \le b < d/(s-1)$ ($s \ge 2 \implies \frac{s}{s-1} \le 2$),
+    at most one power-of-two block size $b = 2^k$ can ever satisfy $\lceil d / b \rceil = s$.
+    """
+    if explicit_block is not None:
+        if explicit_block <= 0 or math.ceil(dim / explicit_block) != scale_dim:
+            raise ValueError(
+                f"Explicit block size {explicit_block} incompatible with dim={dim} and scale_dim={scale_dim}."
+            )
+        return explicit_block
+    if scale_dim == 1:
+        return dim
+    cand = 1 << max(0, math.ceil(math.log2(dim / scale_dim)))
+    if math.ceil(dim / cand) == scale_dim:
+        return cand
+    fallback = math.ceil(dim / scale_dim)
+    if math.ceil(dim / fallback) == scale_dim:
+        return fallback
+    raise ValueError(f"Incompatible dim={dim} and scale_dim={scale_dim}.")
+
+
 def dequantize_fp8_blockwise(
     weight_raw: bytes,
     weight_shape: tuple[int, int],
     scale_raw: bytes,
     scale_shape: tuple[int, int],
     *,
+    block_shape: tuple[int, int] | None = None,
     scale_dtype: str = "F8_E8M0",
     use_numpy: bool | None = None,
     as_ndarray: bool = False,
@@ -261,10 +285,8 @@ def dequantize_fp8_blockwise(
         raise ValueError("weight_shape and scale_shape must be positive 2D shapes.")
     if len(weight_raw) != rows * cols:
         raise ValueError(f"Expected {rows * cols} FP8 bytes, got {len(weight_raw)}.")
-    block_r = math.ceil(rows / sr)
-    block_c = math.ceil(cols / sc)
-    if math.ceil(rows / block_r) != sr or math.ceil(cols / block_c) != sc:
-        raise ValueError(f"Incompatible weight_shape {weight_shape} and scale_shape {scale_shape}.")
+    block_r = _resolve_block_axis(rows, sr, None if block_shape is None else int(block_shape[0]))
+    block_c = _resolve_block_axis(cols, sc, None if block_shape is None else int(block_shape[1]))
 
     want_np = (use_numpy is True or (use_numpy is None and _np is not None)) and _np is not None
     if as_ndarray and _np is None:
@@ -318,6 +340,7 @@ def dequantize_fp4_e2m1_packed(
     scale_raw: bytes,
     scale_shape: tuple[int, int],
     *,
+    block_shape: tuple[int, int] | None = None,
     scale_dtype: str = "F8_E8M0",
     use_numpy: bool | None = None,
     as_ndarray: bool = False,
@@ -329,10 +352,8 @@ def dequantize_fp4_e2m1_packed(
         raise ValueError("logical_shape must have positive rows and even cols.")
     if len(weight_raw) != rows * (cols // 2):
         raise ValueError(f"Expected {rows * (cols // 2)} packed FP4 bytes, got {len(weight_raw)}.")
-    block_r = math.ceil(rows / sr)
-    block_c = math.ceil(cols / sc)
-    if math.ceil(rows / block_r) != sr or math.ceil(cols / block_c) != sc:
-        raise ValueError(f"Incompatible FP4 logical_shape {logical_shape} and scale_shape {scale_shape}.")
+    block_r = _resolve_block_axis(rows, sr, None if block_shape is None else int(block_shape[0]))
+    block_c = _resolve_block_axis(cols, sc, None if block_shape is None else int(block_shape[1]))
 
     want_np = (use_numpy is True or (use_numpy is None and _np is not None)) and _np is not None
     if as_ndarray and _np is None:
@@ -418,6 +439,48 @@ def encode_fp4_e2m1_packed(
                 packed[p_cursor] = (n0 & 0x0F) | ((n1 & 0x0F) << 4)
                 p_cursor += 1
     return bytes(packed), encode_f8_e8m0(scales)
+
+
+def quantize_dequantize_fp4_rows(
+    values_2d: Sequence[Sequence[float]],
+    *,
+    block_k: int = 32,
+    scale_dtype: str = "F8_E8M0",
+) -> list[list[float]]:
+    r"""Fused MXFP4 quantize + dequantize (`fp4_act_quant(..., inplace=True)`) with `F8_E8M0` or `F8_E4M3` block scales."""
+    if not values_2d:
+        return []
+    cols = len(values_2d[0])
+    if cols <= 0 or block_k <= 0 or cols % block_k != 0 or any(len(r) != cols for r in values_2d):
+        raise ValueError("Rows must have positive width divisible by block_k.")
+    if scale_dtype not in ("F8_E8M0", "F8_E4M3"):
+        raise ValueError(f"Unsupported fp4 activation scale_dtype {scale_dtype!r}.")
+    finite_e4m3 = [_F8_E4M3_LUT[b] for b in range(127)]  # non-negative finite E4M3 values [0..448]
+    pos_fp4 = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
+    out_rows: list[list[float]] = []
+    for row in values_2d:
+        frow = [float(x) for x in row]
+        if any(not math.isfinite(x) for x in frow):
+            raise ValueError("Non-finite value in quantize_dequantize_fp4_rows.")
+        out_r: list[float] = []
+        for b_start in range(0, cols, block_k):
+            blk = frow[b_start : b_start + block_k]
+            amax = max(abs(x) for x in blk)
+            if scale_dtype == "F8_E4M3":
+                target_s = min(448.0, max(amax, 6.0 * (2.0**-9)) / 6.0)
+                sc_val = min(finite_e4m3, key=lambda cand: abs(cand - target_s))
+            else:
+                target_s = max(amax, 6.0 * (2.0**-126)) / 6.0
+                exp = max(-127, min(127, math.ceil(math.log2(target_s))))
+                sc_val = math.ldexp(1.0, exp)
+            for x in blk:
+                clamped = max(-6.0, min(6.0, x / sc_val))
+                ax = abs(clamped)
+                q_mag = min(pos_fp4, key=lambda cand: abs(cand - ax))
+                q_signed = -q_mag if clamped < 0.0 else q_mag
+                out_r.append(float(struct.unpack("<f", struct.pack("<f", q_signed * sc_val))[0]))
+        out_rows.append(out_r)
+    return out_rows
 
 
 def compute_yarn_inv_freq(
@@ -542,7 +605,8 @@ def hc_split_sinkhorn(
             raise ValueError("Non-finite input to hc_split_sinkhorn.")
 
         def _sig(z: Any) -> Any:
-            return _np.where(z >= 0.0, 1.0 / (1.0 + _np.exp(-z)), _np.exp(z) / (1.0 + _np.exp(z)))
+            ez = _np.exp(-_np.abs(z))
+            return _np.where(z >= 0.0, 1.0 / (1.0 + ez), ez / (1.0 + ez))
 
         z_pre = m64[:, :hc_mult] * sc64[0] + bs64[:hc_mult]
         pre = (_sig(z_pre) + float(eps)).astype(_np.float32)
@@ -722,7 +786,8 @@ class NumericEngine:
         r"""Contiguous `ndarray`-resident $\operatorname{SiLU}(\text{gate}) \odot \text{up}$."""
         assert _np is not None
         g64 = gate_nd.astype(_np.float64)
-        sig = _np.where(g64 >= 0.0, 1.0 / (1.0 + _np.exp(-g64)), _np.exp(g64) / (1.0 + _np.exp(g64)))
+        ez = _np.exp(-_np.abs(g64))
+        sig = _np.where(g64 >= 0.0, 1.0 / (1.0 + ez), ez / (1.0 + ez))
         ya = (g64 * sig).astype(_np.float32) * up_nd
         return _np.ascontiguousarray(ya, dtype=_np.float32)
 
@@ -782,7 +847,8 @@ class NumericEngine:
         if self.uses_numpy and _np is not None:
             ga = _np.asarray(gate, dtype=_np.float64)
             ua = _np.asarray(up, dtype=_np.float32)
-            sig = _np.where(ga >= 0.0, 1.0 / (1.0 + _np.exp(-ga)), _np.exp(ga) / (1.0 + _np.exp(ga)))
+            ez = _np.exp(-_np.abs(ga))
+            sig = _np.where(ga >= 0.0, 1.0 / (1.0 + ez), ez / (1.0 + ez))
             ya = (ga * sig).astype(_np.float32) * ua
             return [[float(v) for v in row] for row in ya.tolist()]
         out: list[list[float]] = []

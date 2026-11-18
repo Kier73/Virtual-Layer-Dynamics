@@ -554,20 +554,27 @@ class InternetObservationRouter:
         metric_order: Sequence[tuple[str, str]],
         max_hops: int = 5,
     ) -> tuple[InternetObservationCase, ...]:
+        if not metric_order:
+            raise InternetPathRefused("metric_order must be non-empty.")
         valid = [
             c
             for c in self._cases
             if c.ground_fingerprint == ground_fingerprint and (c.observed_at <= now <= c.expires_at)
         ]
-        # Dijkstra over representation graph
+        # Hop-aware multi-metric Dijkstra over representation graph
         import heapq
 
         zero = tuple(0 for _ in metric_order)
         pq: list[tuple[tuple[int, ...], int, str, tuple[InternetObservationCase, ...]]] = [(zero, 0, source_rep, ())]
-        best: dict[str, tuple[int, ...]] = {source_rep: zero}
+        rep_labels: dict[str, list[tuple[tuple[int, ...], int]]] = {source_rep: [(zero, 0)]}
 
         while pq:
             cost_vec, hops, cur_rep, chain = heapq.heappop(pq)
+            if any(
+                (lv, lh) != (cost_vec, hops) and lv <= cost_vec and lh <= hops
+                for lv, lh in rep_labels.get(cur_rep, ())
+            ):
+                continue
             if cur_rep == target_rep and chain:
                 # Re-verify every selected case before returning!
                 for c in chain:
@@ -576,16 +583,27 @@ class InternetObservationRouter:
                 return chain
             if hops >= max_hops:
                 continue
+            visited_reps = {source_rep, *(step.target_rep for step in chain)}
             for c in valid:
-                if c.source_rep != cur_rep:
+                if c.source_rep != cur_rep or c.target_rep in visited_reps:
                     continue
                 by_n = {m.name: m for m in c.costs}
-                step_vec = tuple(by_n[m_n].amount for m_n, _u in metric_order)
+                step_list: list[int] = []
+                for m_n, m_u in metric_order:
+                    found_m = by_n.get(m_n)
+                    if found_m is None or found_m.unit != m_u:
+                        raise InternetPathRefused(f"Missing or unit-mismatched metric {m_n!r} ({m_u!r}) on {c.provider_id!r}.")
+                    step_list.append(found_m.amount)
+                step_vec = tuple(step_list)
                 nxt_vec = tuple(a + b for a, b in zip(cost_vec, step_vec))
-                prev = best.get(c.target_rep)
-                if prev is None or nxt_vec < prev:
-                    best[c.target_rep] = nxt_vec
-                    heapq.heappush(pq, (nxt_vec, hops + 1, c.target_rep, (*chain, c)))
+                nxt_hops = hops + 1
+                existing = rep_labels.get(c.target_rep, [])
+                if any(lv <= nxt_vec and lh <= nxt_hops for lv, lh in existing):
+                    continue
+                rep_labels[c.target_rep] = [
+                    (lv, lh) for lv, lh in existing if not (nxt_vec <= lv and nxt_hops <= lh)
+                ] + [(nxt_vec, nxt_hops)]
+                heapq.heappush(pq, (nxt_vec, nxt_hops, c.target_rep, (*chain, c)))
 
         raise InternetPathRefused(f"No verified non-expired observation route from {source_rep!r} to {target_rep!r}.")
 

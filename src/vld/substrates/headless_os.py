@@ -469,14 +469,36 @@ class HeadlessOS:
             return self.posix_invoke(pid, number, path_address=a1, flags=a2, mode=a3)
         if name == "close":
             return self.posix_invoke(pid, number, fd=a1)
+        if name == "fstat":
+            return self.posix_invoke(pid, number, fd=a1, stat_address=a2)
         if name == "lseek":
             return self.posix_invoke(pid, number, fd=a1, offset=a2, whence=a3)
-        if name == "getpid":
+        if name == "mmap":
+            return self.posix_invoke(pid, number, address=a1, length=a2, prot=a3, flags=a4, fd=a5, offset=a6)
+        if name == "mprotect":
+            return self.posix_invoke(pid, number, address=a1, length=a2, prot=a3)
+        if name == "munmap":
+            return self.posix_invoke(pid, number, address=a1, length=a2)
+        if name == "pipe":
+            return self.posix_invoke(pid, number, address=a1)
+        if name == "dup":
+            return self.posix_invoke(pid, number, fd=a1)
+        if name == "dup2":
+            return self.posix_invoke(pid, number, fd=a1, new_fd=a2)
+        if name in ("getpid", "fork"):
             return self.posix_invoke(pid, number)
-        if name == "fork":
-            return self.posix_invoke(pid, number)
+        if name == "execve":
+            return self.posix_invoke(pid, number, path_address=a1)
         if name == "exit":
             return self.posix_invoke(pid, number, code=a1)
+        if name == "wait4":
+            return self.posix_invoke(pid, number, child_pid=a1, status_address=a2, options=a3)
+        if name == "fcntl":
+            return self.posix_invoke(pid, number, fd=a1, command=a2, arg=a3)
+        if name == "getcwd":
+            return self.posix_invoke(pid, number, address=a1, size=a2)
+        if name == "chdir":
+            return self.posix_invoke(pid, number, path_address=a1)
         return PosixResponse(-int(Errno.ENOSYS), int(Errno.ENOSYS), f"register bridge unsupported for {name}")
 
     def _dispatch_named(self, pid: int, name: str, args: Mapping[str, Any]) -> int:
@@ -590,6 +612,8 @@ class HeadlessOS:
                     raise PosixKernelError(Errno.EISDIR, "Cannot open directory for write.")
                 if ino.kind == "structural" and acc != O_RDONLY:
                     raise PosixKernelError(Errno.EACCES, "Structural-Memory virtual files are immutable read-only.")
+                if ino.kind == "file" and acc != O_RDONLY and not (ino.mode & 0o222):
+                    raise PosixKernelError(Errno.EACCES, "Regular file lacks write permission bits.")
                 fd_num = self._alloc_fd_num(proc)
                 if (flags & O_TRUNC) and acc in (O_WRONLY, O_RDWR) and ino.kind == "file":
                     ino.data.clear()
@@ -811,8 +835,15 @@ class HeadlessOS:
                     raise PosixKernelError(Errno.EINVAL, "MAP_FIXED requires page-aligned positive address.")
                 target_addr = addr_hint
             else:
-                target_addr = self._next_mmap_addr
-                self._next_mmap_addr += aligned_len + self.page_size
+                n_pages_req = aligned_len // self.page_size
+                cand_addr = self._next_mmap_addr
+                while True:
+                    sp = cand_addr // self.page_size
+                    if all((sp + k) not in mem._pages for k in range(n_pages_req)):
+                        break
+                    cand_addr += self.page_size
+                target_addr = cand_addr
+                self._next_mmap_addr = target_addr + aligned_len + self.page_size
             mem.map_region(target_addr, aligned_len, flags=vm_flags, allow_overwrite=bool(flags & MAP_FIXED))
             return target_addr
 
@@ -936,6 +967,10 @@ class HeadlessOS:
                     "env": rec.env,
                     "exit_code": rec.exit_code,
                     "exited": rec.exited,
+                    "fds": {
+                        str(fd_no): {"cloexec": fe.cloexec, "desc_id": fe.desc_id}
+                        for fd_no, fe in sorted(rec.fds.items())
+                    },
                     "halted": rec.vm_proc.halted,
                     "name": rec.vm_proc.name,
                     "pages": pages_list,
@@ -945,10 +980,46 @@ class HeadlessOS:
                     "program": [ins.to_dict() for ins in rec.vm_proc.program],
                     "registers": rec.vm_proc.registers,
                     "state_digest": rec.vm_proc.state_digest,
+                    "stderr_hex": rec.stderr_bytes.hex(),
                     "stdout_hex": rec.stdout_bytes.hex(),
                     "ticks": rec.vm_proc.ticks,
                 }
             )
+
+        referenced_descs = {
+            fe.desc_id
+            for rec in self._procs.values()
+            if not rec.reaped
+            for fe in rec.fds.values()
+        }
+        open_descs_ser = [
+            {
+                "desc_id": did,
+                "flags": desc.flags,
+                "kind": desc.kind,
+                "offset": desc.offset,
+                "pipe_id": desc.pipe_id,
+                "vfs_path": desc.vfs_path,
+            }
+            for did, desc in sorted(self._open_descs.items())
+            if did in referenced_descs
+        ]
+        referenced_pipes = {
+            desc.pipe_id
+            for did, desc in self._open_descs.items()
+            if did in referenced_descs and desc.pipe_id is not None
+        }
+        pipes_ser = [
+            {
+                "buf_hex": pipe.buf.hex(),
+                "capacity": pipe.capacity,
+                "pipe_id": pid_no,
+                "readers": pipe.readers,
+                "writers": pipe.writers,
+            }
+            for pid_no, pipe in sorted(self._pipes.items())
+            if pid_no in referenced_pipes
+        ]
 
         vfs_ser: list[dict[str, Any]] = []
         for path in sorted(self.vfs._inodes.keys()):
@@ -969,7 +1040,12 @@ class HeadlessOS:
         doc = {
             "deduplicated_unique_page_count": len(page_dedup),
             "max_resident_pages": self.max_resident_pages,
+            "next_desc_id": self._next_desc_id,
+            "next_mmap_addr": self._next_mmap_addr,
+            "next_pipe_id": self._next_pipe_id,
+            "open_descs": open_descs_ser,
             "page_size": self.page_size,
+            "pipes": pipes_ser,
             "processes": procs_ser,
             "schema": "vld.headless-os-snapshot.v1",
             "vfs": vfs_ser,
@@ -994,6 +1070,32 @@ class HeadlessOS:
             max_resident_pages=doc["max_resident_pages"],
             structural_memory=structural_memory,
         )
+        os_inst._next_mmap_addr = int(doc.get("next_mmap_addr", cls.MMAP_BASE_START))
+        os_inst._next_desc_id = int(doc.get("next_desc_id", 1))
+        os_inst._next_pipe_id = int(doc.get("next_pipe_id", 1))
+
+        for pipe_item in doc.get("pipes", ()):
+            p_no = int(pipe_item["pipe_id"])
+            os_inst._pipes[p_no] = _KernelPipe(
+                pipe_id=p_no,
+                buf=bytearray.fromhex(str(pipe_item["buf_hex"])),
+                readers=int(pipe_item["readers"]),
+                writers=int(pipe_item["writers"]),
+                capacity=int(pipe_item["capacity"]),
+            )
+            os_inst._next_pipe_id = max(os_inst._next_pipe_id, p_no + 1)
+
+        for d_item in doc.get("open_descs", ()):
+            did = int(d_item["desc_id"])
+            os_inst._open_descs[did] = _OpenFileDescription(
+                kind=str(d_item["kind"]),
+                flags=int(d_item["flags"]),
+                vfs_path=None if d_item["vfs_path"] is None else str(d_item["vfs_path"]),
+                offset=int(d_item["offset"]),
+                pipe_id=None if d_item["pipe_id"] is None else int(d_item["pipe_id"]),
+            )
+            os_inst._next_desc_id = max(os_inst._next_desc_id, did + 1)
+
         os_inst.vfs._inodes.clear()
         for v_item in doc["vfs"]:
             os_inst.vfs._inodes[str(v_item["path"])] = _VFSInode(
@@ -1037,6 +1139,13 @@ class HeadlessOS:
                 raise VMError(f"Restored process {vm_p.pid} state_digest mismatch.")
             os_inst.vm_kernel._processes[vm_p.pid] = vm_p
             os_inst.vm_kernel._next_pid = max(os_inst.vm_kernel._next_pid, vm_p.pid + 1)
+            if "fds" in p_item and isinstance(p_item["fds"], Mapping):
+                restored_fds = {
+                    int(fd_k): _FDEntry(desc_id=int(fe_v["desc_id"]), cloexec=bool(fe_v["cloexec"]))
+                    for fd_k, fe_v in p_item["fds"].items()
+                }
+            else:
+                restored_fds = os_inst._default_stdio_fds()
             os_inst._procs[vm_p.pid] = _OSProcessRecord(
                 pid=vm_p.pid,
                 parent_pid=int(p_item["parent_pid"]),
@@ -1044,10 +1153,11 @@ class HeadlessOS:
                 argv=tuple(str(x) for x in p_item["argv"]),
                 env={str(k): str(v) for k, v in p_item["env"].items()},
                 vm_proc=vm_p,
-                fds=os_inst._default_stdio_fds(),
+                fds=restored_fds,
                 exited=bool(p_item["exited"]),
                 exit_code=int(p_item["exit_code"]),
                 stdout_bytes=bytearray.fromhex(str(p_item["stdout_hex"])),
+                stderr_bytes=bytearray.fromhex(str(p_item.get("stderr_hex", ""))),
             )
         return os_inst
 

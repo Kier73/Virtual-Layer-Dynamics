@@ -398,18 +398,214 @@ class CertifiedSimilarityDecomposition:
         return result, {"block_cubic_ops": block_mul_ops, "dense_cubic_ops": dense_ops}
 
 
-def discover_similarity_blocks(
-    chain: FiniteFieldOperatorChain,
-    *,
-    max_candidates: int = 32,
-) -> CertifiedSimilarityDecomposition:
-    r"""Discover and independently certify a common invariant block-diagonal basis over $\mathbb{F}_p$."""
-    n = chain.dimension
-    p = chain.modulus
+PolyFp = tuple[int, ...]
 
-    # Solve C * A_r - A_r * C == 0 (mod p) simultaneously across all factors A_r
+
+def _poly_trim(a: Sequence[int], p: int) -> PolyFp:
+    arr = [int(c) % p for c in a]
+    while arr and arr[-1] == 0:
+        arr.pop()
+    return tuple(arr)
+
+
+def _poly_monic(a: PolyFp, p: int) -> PolyFp:
+    a = _poly_trim(a, p)
+    if not a:
+        return ()
+    inv_lead = pow(a[-1], -1, p)
+    return tuple((c * inv_lead) % p for c in a)
+
+
+def _poly_sub(a: PolyFp, b: PolyFp, p: int) -> PolyFp:
+    m = max(len(a), len(b))
+    return _poly_trim([(a[i] if i < len(a) else 0) - (b[i] if i < len(b) else 0) for i in range(m)], p)
+
+
+def _poly_add(a: PolyFp, b: PolyFp, p: int) -> PolyFp:
+    m = max(len(a), len(b))
+    return _poly_trim([(a[i] if i < len(a) else 0) + (b[i] if i < len(b) else 0) for i in range(m)], p)
+
+
+def _poly_mul(a: PolyFp, b: PolyFp, p: int) -> PolyFp:
+    if not a or not b:
+        return ()
+    out = [0] * (len(a) + len(b) - 1)
+    for i, ca in enumerate(a):
+        if ca:
+            for j, cb in enumerate(b):
+                out[i + j] = (out[i + j] + ca * cb) % p
+    return _poly_trim(out, p)
+
+
+def _poly_divmod(a: PolyFp, b: PolyFp, p: int) -> tuple[PolyFp, PolyFp]:
+    a = _poly_trim(a, p)
+    b = _poly_trim(b, p)
+    if not b:
+        raise ZeroDivisionError("Polynomial division by zero over F_p.")
+    if len(a) < len(b):
+        return (), a
+    rem = list(a)
+    deg_b = len(b) - 1
+    inv_b = pow(b[-1], -1, p)
+    quot = [0] * (len(a) - deg_b)
+    for shift in range(len(a) - deg_b - 1, -1, -1):
+        lead = rem[shift + deg_b] % p
+        if lead != 0:
+            q_coeff = (lead * inv_b) % p
+            quot[shift] = q_coeff
+            for j, cb in enumerate(b):
+                rem[shift + j] = (rem[shift + j] - q_coeff * cb) % p
+    return _poly_trim(quot, p), _poly_trim(rem, p)
+
+
+def _poly_gcd(a: PolyFp, b: PolyFp, p: int) -> PolyFp:
+    x, y = _poly_trim(a, p), _poly_trim(b, p)
+    while y:
+        _, r = _poly_divmod(x, y, p)
+        x, y = y, r
+    return _poly_monic(x, p)
+
+
+def _poly_powmod(base: PolyFp, exp: int, mod_poly: PolyFp, p: int) -> PolyFp:
+    acc: PolyFp = (1,)
+    _, cur = _poly_divmod(base, mod_poly, p)
+    k = exp
+    while k > 0:
+        if k & 1:
+            _, acc = _poly_divmod(_poly_mul(acc, cur, p), mod_poly, p)
+        _, cur = _poly_divmod(_poly_mul(cur, cur, p), mod_poly, p)
+        k >>= 1
+    return acc
+
+
+def _equal_degree_split_fp(g: PolyFp, d: int, p: int) -> list[PolyFp]:
+    g = _poly_monic(g, p)
+    deg_g = len(g) - 1
+    if deg_g <= 0:
+        return []
+    if deg_g == d:
+        return [g]
+
+    for trial in range(1, 256):
+        digest = hashlib.sha256(f"vld.cz.{p}.{d}.{deg_g}.{trial}".encode("utf-8")).digest()
+        a_poly = _poly_trim([int.from_bytes(digest[(2 * i) % 30 : (2 * i) % 30 + 2], "little") % p for i in range(deg_g)], p)
+        if len(a_poly) <= 1:
+            a_poly = _poly_trim([trial % p, 1] + [0] * max(0, (trial % deg_g) - 1) + ([1] if trial > 1 else []), p)
+        _, a_mod = _poly_divmod(a_poly, g, p)
+        if not a_mod:
+            continue
+        g0 = _poly_gcd(a_mod, g, p)
+        if 0 < len(g0) - 1 < deg_g:
+            q0, _ = _poly_divmod(g, g0, p)
+            return _equal_degree_split_fp(g0, d, p) + _equal_degree_split_fp(q0, d, p)
+
+        if p == 2:
+            tr: PolyFp = ()
+            cur = a_mod
+            for _ in range(d):
+                tr = _poly_add(tr, cur, 2)
+                _, cur = _poly_divmod(_poly_mul(cur, cur, 2), g, 2)
+            factor = _poly_gcd(tr, g, 2)
+        else:
+            half_exp = (pow(p, d) - 1) // 2
+            u = _poly_sub(_poly_powmod(a_mod, half_exp, g, p), (1,), p)
+            factor = _poly_gcd(u, g, p)
+
+        if 0 < len(factor) - 1 < deg_g:
+            quot, _ = _poly_divmod(g, factor, p)
+            return _equal_degree_split_fp(factor, d, p) + _equal_degree_split_fp(quot, d, p)
+
+    raise ObserverOrbitError("Cantor-Zassenhaus equal-degree split exceeded deterministic budget.")
+
+
+def _factor_squarefree_fp(h: PolyFp, p: int) -> list[PolyFp]:
+    h = _poly_monic(h, p)
+    if len(h) <= 1:
+        return []
+    factors: list[PolyFp] = []
+    cur_h = h
+    _, w = _poly_divmod((0, 1), cur_h, p)
+    d = 1
+    while len(cur_h) - 1 >= 2 * d:
+        w = _poly_powmod(w, p, cur_h, p)
+        gd = _poly_gcd(_poly_sub(w, (0, 1), p), cur_h, p)
+        if len(gd) > 1:
+            factors.extend(_equal_degree_split_fp(gd, d, p))
+            cur_h, _ = _poly_divmod(cur_h, gd, p)
+            cur_h = _poly_monic(cur_h, p)
+            if len(cur_h) <= 1:
+                break
+            _, w = _poly_divmod(w, cur_h, p)
+        d += 1
+    if len(cur_h) > 1:
+        factors.append(_poly_monic(cur_h, p))
+    factors.sort(key=lambda f: (len(f), f))
+    return factors
+
+
+def _factor_poly_fp(poly: PolyFp, p: int) -> list[tuple[PolyFp, int]]:
+    r"""Complete monic prime-power factorization $f(x) = \prod_j f_j(x)^{e_j}$ in $\mathbb{F}_p[x]$."""
+    poly = _poly_monic(poly, p)
+    if len(poly) <= 1:
+        return []
+    deriv = _poly_trim([(i * poly[i]) % p for i in range(1, len(poly))], p)
+    if not deriv:
+        # Characteristic p root: poly(x) = root_poly(x^p) = (root_poly(x))^p over F_p!
+        root_poly = _poly_trim([poly[k] for k in range(0, len(poly), p)], p)
+        return [(irred, mult * p) for irred, mult in _factor_poly_fp(root_poly, p)]
+    g = _poly_gcd(poly, deriv, p)
+    if len(g) <= 1:
+        return [(irred, 1) for irred in _factor_squarefree_fp(poly, p)]
+    q, _ = _poly_divmod(poly, g, p)
+    counts: dict[PolyFp, int] = {}
+    for irred, mult in _factor_poly_fp(g, p):
+        counts[irred] = counts.get(irred, 0) + mult
+    for irred, mult in _factor_poly_fp(q, p):
+        counts[irred] = counts.get(irred, 0) + mult
+    return sorted(counts.items(), key=lambda kv: (len(kv[0]), kv[0]))
+
+
+def _minimal_poly_fp(mat: MatrixFp, p: int) -> PolyFp:
+    r"""Exact monic minimal polynomial $m_C(x) \in \mathbb{F}_p[x]$ of $C \in \mathbb{F}_p^{n \times n}$."""
+    n = len(mat)
+    cur: MatrixFp = tuple(tuple(1 if i == j else 0 for j in range(n)) for i in range(n))
+    powers_flat: list[tuple[int, ...]] = []
+    for deg in range(n + 1):
+        flat = tuple(cur[i][j] for i in range(n) for j in range(n))
+        powers_flat.append(flat)
+        if deg >= 1:
+            # Solve sum_{k=0}^{deg-1} c_k * C^k == C^{deg} via augmented RREF
+            rows = [
+                [powers_flat[k][idx] for k in range(deg)] + [powers_flat[deg][idx]]
+                for idx in range(n * n)
+            ]
+            reduced, pivots = _rref_fp(rows, deg + 1, p)
+            if deg not in pivots:
+                alpha = [0] * deg
+                for r_i, p_col in enumerate(pivots):
+                    alpha[p_col] = reduced[r_i][deg] % p
+                return _poly_trim([(-a) % p for a in alpha] + [1], p)
+        cur = _mat_mul_fp(cur, mat, p)
+    raise ObserverOrbitError("Minimal polynomial computation failed to close at degree n.")
+
+
+def _eval_poly_matrix_fp(poly: PolyFp, mat: MatrixFp, p: int) -> MatrixFp:
+    n = len(mat)
+    if not poly:
+        return tuple(tuple(0 for _ in range(n)) for _ in range(n))
+    acc: MatrixFp = tuple(tuple(poly[-1] if i == j else 0 for j in range(n)) for i in range(n))
+    for coeff in reversed(poly[:-1]):
+        prod = _mat_mul_fp(acc, mat, p)
+        acc = tuple(
+            tuple((prod[i][j] + (coeff if i == j else 0)) % p for j in range(n))
+            for i in range(n)
+        )
+    return acc
+
+
+def _commutant_basis_fp(factors: Sequence[MatrixFp], n: int, p: int) -> list[MatrixFp]:
     equations: list[list[int]] = []
-    for a in chain.factors:
+    for a in factors:
         for i in range(n):
             for j in range(n):
                 row = [0] * (n * n)
@@ -417,117 +613,193 @@ def discover_similarity_blocks(
                     row[i * n + k] = (row[i * n + k] + a[k][j]) % p
                     row[k * n + j] = (row[k * n + j] - a[i][k]) % p
                 equations.append(row)
-
     comm_vecs = _nullspace_fp(equations, n * n, p)
-    comm_mats: list[MatrixFp] = [
-        tuple(tuple(vec[i * n : (i + 1) * n]) for i in range(n))
-        for vec in comm_vecs
-    ]
-    if len(comm_mats) <= 1:
-        raise ObserverOrbitError("Commutant is 1-dimensional (scalars only); no split similarity blocks exist over F_p.")
+    return [tuple(tuple(vec[i * n : (i + 1) * n]) for i in range(n)) for vec in comm_vecs]
 
-    # Deterministic candidate weights: basis vectors first, then small deterministic combinations
-    candidates: list[MatrixFp] = list(comm_mats)
+
+def _split_factors_once_fp(
+    factors: Sequence[MatrixFp],
+    n: int,
+    p: int,
+    *,
+    max_candidates: int = 32,
+) -> tuple[MatrixFp, list[int], list[list[MatrixFp]]] | None:
+    r"""Split $A_1, \dots, A_m \in \mathbb{F}_p^{n \times n}$ via primary generalized kernels $\ker(f_j(C)^{e_j})$."""
+    if n < 2:
+        return None
+    comm_mats = _commutant_basis_fp(factors, n, p)
     k_dim = len(comm_mats)
+    if k_dim <= 1:
+        return None
+
+    candidates: list[MatrixFp] = list(comm_mats)
     for t in range(1, max_candidates):
-        weights = [((t * (idx + 3) + 1) % p) for idx in range(k_dim)]
+        h = hashlib.sha256(f"vld.comm.comb.{p}.{n}.{k_dim}.{t}".encode("utf-8")).digest()
+        weights = [(int.from_bytes(h[(2 * idx) % 30 : (2 * idx) % 30 + 2], "little") + t * (idx + 3) + 1) % p for idx in range(k_dim)]
         cand = tuple(
             tuple(sum(weights[b] * comm_mats[b][i][j] for b in range(k_dim)) % p for j in range(n))
             for i in range(n)
         )
         candidates.append(cand)
 
-    # Limit eigenvalue scan for large primes to witnessed diagonal entries + small residues + deterministic probes;
-    # evaluate candidates to select the certified split minimizing cubic complexity sum(d_j^3)!
-    best_decomp: CertifiedSimilarityDecomposition | None = None
-    best_score: tuple[int, int] | None = None  # (sum(d_j^3), -num_blocks)
+    best_res: tuple[MatrixFp, list[int], list[list[MatrixFp]]] | None = None
+    best_score: tuple[int, int] | None = None
 
     for cand in candidates[:max_candidates]:
-        eig_candidates: set[int] = set(range(min(p, 257)))
-        for i in range(n):
-            eig_candidates.add(cand[i][i] % p)
-        eig_spaces: list[tuple[int, tuple[tuple[int, ...], ...]]] = []
-        total_dim = 0
-        for lam in sorted(eig_candidates):
-            shifted = [[(cand[r][c] - (lam if r == c else 0)) % p for c in range(n)] for r in range(n)]
-            eb = _nullspace_fp(shifted, n, p)
-            if eb:
-                eig_spaces.append((lam, eb))
-                total_dim += len(eb)
-                if total_dim == n:
-                    break
+        min_poly = _minimal_poly_fp(cand, p)
+        if len(min_poly) <= 2:
+            continue  # scalar multiple of I_n
+        prime_powers = _factor_poly_fp(min_poly, p)
+        if len(prime_powers) < 2:
+            continue
 
-        if total_dim == n and len(eig_spaces) >= 2:
-            cols: list[tuple[int, ...]] = []
-            block_sizes: list[int] = []
-            for _lam, eb in eig_spaces:
-                block_sizes.append(len(eb))
-                cols.extend(eb)
-            cand_score = (sum(sz**3 for sz in block_sizes), -len(block_sizes))
-            if best_score is not None and cand_score >= best_score:
-                continue
+        cols: list[tuple[int, ...]] = []
+        block_sizes: list[int] = []
+        for irred, mult in prime_powers:
+            pk_poly: PolyFp = (1,)
+            for _ in range(mult):
+                pk_poly = _poly_mul(pk_poly, irred, p)
+            eval_m = _eval_poly_matrix_fp(pk_poly, cand, p)
+            eb = _nullspace_fp([list(r) for r in eval_m], n, p)
+            if not eb:
+                break
+            block_sizes.append(len(eb))
+            cols.extend(eb)
 
-            # Basis P has eigenvectors as columns!
-            basis: MatrixFp = tuple(tuple(cols[col_i][row_i] for col_i in range(n)) for row_i in range(n))
-            inv_basis = _invert_matrix_fp(basis, p)
+        if sum(block_sizes) != n or len(block_sizes) < 2:
+            continue
 
-            ranges: list[tuple[int, int]] = []
-            cur = 0
-            for sz in block_sizes:
-                ranges.append((cur, cur + sz))
-                cur += sz
+        cand_score = (sum(sz**3 for sz in block_sizes), -len(block_sizes))
+        if best_score is not None and cand_score >= best_score:
+            continue
 
-            # Extract local factors and verify zero off-diagonal entries!
-            sim_factors = [_mat_mul_fp(_mat_mul_fp(inv_basis, f, p), basis, p) for f in chain.factors]
-            valid_split = True
-            for sim in sim_factors:
-                for b_a, (s_a, e_a) in enumerate(ranges):
-                    for b_b, (s_b, e_b) in enumerate(ranges):
-                        if b_a != b_b and any(sim[r][c] != 0 for r in range(s_a, e_a) for c in range(s_b, e_b)):
-                            valid_split = False
-                            break
-                    if not valid_split:
+        basis: MatrixFp = tuple(tuple(cols[col_i][row_i] for col_i in range(n)) for row_i in range(n))
+        inv_basis = _invert_matrix_fp(basis, p)
+
+        ranges: list[tuple[int, int]] = []
+        cur = 0
+        for sz in block_sizes:
+            ranges.append((cur, cur + sz))
+            cur += sz
+
+        sim_factors = [_mat_mul_fp(_mat_mul_fp(inv_basis, f, p), basis, p) for f in factors]
+        valid_split = True
+        for sim in sim_factors:
+            for b_a, (s_a, e_a) in enumerate(ranges):
+                for b_b, (s_b, e_b) in enumerate(ranges):
+                    if b_a != b_b and any(sim[r][c] != 0 for r in range(s_a, e_a) for c in range(s_b, e_b)):
+                        valid_split = False
                         break
                 if not valid_split:
                     break
+            if not valid_split:
+                break
 
-            if valid_split:
-                blk_factors = tuple(
-                    tuple(
-                        tuple(tuple(sim[r][c] for c in range(s_a, e_a)) for r in range(s_a, e_a))
-                        for sim in sim_factors
-                    )
-                    for (s_a, e_a) in ranges
-                )
-                cert_digest = domain_digest(
-                    "vld.similarity-blocks.v1",
-                    {
-                        "basis": [list(r) for r in basis],
-                        "block_sizes": block_sizes,
-                        "commutant_dimension": k_dim,
-                        "dimension": n,
-                        "modulus": p,
-                    },
-                )
-                decomp = CertifiedSimilarityDecomposition(
-                    chain=chain,
-                    commutant_dimension=k_dim,
-                    basis=basis,
-                    basis_inverse=inv_basis,
-                    block_sizes=tuple(block_sizes),
-                    block_factors=blk_factors,
-                    certificate_digest=cert_digest,
-                )
-                decomp.verify_independently()
-                best_decomp = decomp
-                best_score = cand_score
-                if len(block_sizes) >= k_dim or len(block_sizes) == n:
-                    break
+        if valid_split:
+            sub_factors = [
+                [tuple(tuple(sim[r][c] for c in range(s_a, e_a)) for r in range(s_a, e_a)) for sim in sim_factors]
+                for (s_a, e_a) in ranges
+            ]
+            best_res = (basis, block_sizes, sub_factors)
+            best_score = cand_score
+            if len(block_sizes) >= k_dim or len(block_sizes) == n:
+                break
 
-    if best_decomp is not None:
-        return best_decomp
+    return best_res
 
-    raise ObserverOrbitError("No split semisimple invariant-subspace witness found within candidate budget.")
+
+def _decompose_blocks_recursive_fp(
+    factors: Sequence[MatrixFp],
+    n: int,
+    p: int,
+    *,
+    max_candidates: int = 32,
+) -> tuple[MatrixFp, list[int]] | None:
+    split = _split_factors_once_fp(factors, n, p, max_candidates=max_candidates)
+    if split is None:
+        return None
+    basis_top, top_sizes, sub_factors_by_blk = split
+    refined_blocks_p: list[MatrixFp] = []
+    final_sizes: list[int] = []
+    for sz, blk_f in zip(top_sizes, sub_factors_by_blk):
+        sub_rec = _decompose_blocks_recursive_fp(blk_f, sz, p, max_candidates=max_candidates) if sz >= 2 else None
+        if sub_rec is None:
+            refined_blocks_p.append(tuple(tuple(1 if i == j else 0 for j in range(sz)) for i in range(sz)))
+            final_sizes.append(sz)
+        else:
+            sub_p, sub_szs = sub_rec
+            refined_blocks_p.append(sub_p)
+            final_sizes.extend(sub_szs)
+
+    # Assemble block-diagonal refinement matrix R and compose P_total = basis_top * R
+    r_mat = [[0] * n for _ in range(n)]
+    off = 0
+    for blk_p in refined_blocks_p:
+        bsz = len(blk_p)
+        for i in range(bsz):
+            for j in range(bsz):
+                r_mat[off + i][off + j] = blk_p[i][j]
+        off += bsz
+    r_tup: MatrixFp = tuple(tuple(row) for row in r_mat)
+    return _mat_mul_fp(basis_top, r_tup, p), final_sizes
+
+
+def discover_similarity_blocks(
+    chain: FiniteFieldOperatorChain,
+    *,
+    max_candidates: int = 32,
+) -> CertifiedSimilarityDecomposition:
+    r"""Discover and independently certify a common invariant block-diagonal basis over $\mathbb{F}_p$.
+
+    Uses exact commutant RREF + complete $\mathbb{F}_p[x]$ minimal-polynomial factorization
+    (Square-Free + Distinct-Degree $x^{p^d} \bmod f$ + Cantor-Zassenhaus) + Primary Generalized
+    Kernel Decomposition $\mathbb{F}_p^n = \bigoplus_j \ker(f_j(C)^{e_j})$ + recursive sub-block
+    refinement, working across arbitrary primes $p$ and higher-degree $\mathbb{F}_{p^d}$ blocks.
+    """
+    n = chain.dimension
+    p = chain.modulus
+    comm_mats = _commutant_basis_fp(chain.factors, n, p)
+    k_dim = len(comm_mats)
+    if k_dim <= 1:
+        raise ObserverOrbitError("Commutant is 1-dimensional (scalars only); no split similarity blocks exist over F_p.")
+
+    rec = _decompose_blocks_recursive_fp(chain.factors, n, p, max_candidates=max_candidates)
+    if rec is None:
+        raise ObserverOrbitError("Commutant admits no split primary invariant subspaces over F_p.")
+
+    basis, block_sizes = rec
+    inv_basis = _invert_matrix_fp(basis, p)
+    ranges: list[tuple[int, int]] = []
+    cur = 0
+    for sz in block_sizes:
+        ranges.append((cur, cur + sz))
+        cur += sz
+    sim_factors = [_mat_mul_fp(_mat_mul_fp(inv_basis, f, p), basis, p) for f in chain.factors]
+    blk_factors = tuple(
+        tuple(tuple(tuple(sim[r][c] for c in range(s_a, e_a)) for r in range(s_a, e_a)) for sim in sim_factors)
+        for (s_a, e_a) in ranges
+    )
+    cert_digest = domain_digest(
+        "vld.similarity-blocks.v1",
+        {
+            "basis": [list(r) for r in basis],
+            "block_sizes": block_sizes,
+            "commutant_dimension": k_dim,
+            "dimension": n,
+            "modulus": p,
+        },
+    )
+    decomp = CertifiedSimilarityDecomposition(
+        chain=chain,
+        commutant_dimension=k_dim,
+        basis=basis,
+        basis_inverse=inv_basis,
+        block_sizes=tuple(block_sizes),
+        block_factors=blk_factors,
+        certificate_digest=cert_digest,
+    )
+    decomp.verify_independently()
+    return decomp
 
 
 # ============================================================================

@@ -447,13 +447,16 @@ class ContinuousVirtualSystem:
             if ev.operation == "continuous.seal_stage" and ev.payload.get("slot_token_digest") == token_digest:
                 env_m = PagedByteManifest.from_dict(ev.payload["envelope_manifest"])
                 env_doc = parse_strict_json(self.store.read_bytes(env_m))
-                return CrossGroundContinuityReceipt.from_dict(env_doc["continuity_receipt"])
+                sealed_rcpt = CrossGroundContinuityReceipt.from_dict(env_doc["continuity_receipt"])
+                if not self.quorum.verify_certificate(sealed_rcpt.quorum_certificate):
+                    raise ContinuousSystemError("Persisted continuity_receipt failed QuorumCommitCertificate verification.")
+                return sealed_rcpt
         for ev in reversed(events):
             if ev.operation == "continuous.pre_stage" and ev.payload.get("slot_token_digest") == token_digest:
                 pre_m = PagedByteManifest.from_dict(ev.payload["pre_manifest"])
                 pre = parse_strict_json(self.store.read_bytes(pre_m))["pre_stage"]
                 sc = pre["stage_cost"]
-                return CrossGroundContinuityReceipt(
+                rebuilt = CrossGroundContinuityReceipt(
                     pipeline_id=str(pre["pipeline_id"]),
                     stage_index=int(pre["stage_index"]),
                     stage_id=str(pre["stage_id"]),
@@ -476,6 +479,10 @@ class ContinuousVirtualSystem:
                         verification_ops=float(sc["verification_ops"]),
                     ),
                 )
+                # Anchor the reconstructed continuity receipt into the journal so subsequent host
+                # replacements observe an immutable continuity_digest!
+                self._save_slot_envelope(token_digest, rebuilt)
+                return rebuilt
         raise ContinuousSystemError(f"Could not resolve M1 envelope for quorum slot digest {token_digest}.")
 
 

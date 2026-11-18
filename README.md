@@ -72,7 +72,7 @@ Virtual-Layer-Dynamics/
 │   ├── agents/                     # ProofGround hypergraph, ReceiverHypervisor, InLayerModelAgent & ContinuousLayerBuilderAgent
 │   ├── continuous.py               # Quorum-fenced, crash-resumable ContinuousVirtualSystem across Grounds, hosts & paths
 │   └── cli.py                      # `vld` CLI (`info`, `verify`, `navigate`, `benchmark`, `glance`, `continuous`, `serve`)
-└── tests/                          # 94 invariant, differential, frontier-LLM, OS, mTLS, crash-recovery & hygiene tests
+└── tests/                          # 95 invariant, differential, frontier-LLM, OS, mTLS, crash-recovery & hygiene tests
 ```
 
 ---

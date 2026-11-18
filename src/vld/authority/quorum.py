@@ -580,6 +580,14 @@ class QuorumLineageCoordinator:
             self._sync_from_ledger_unlocked()
             return self._sealed_by_slot.get(slot)
 
+    def verify_certificate(self, cert: QuorumCommitCertificate) -> bool:
+        """Verify membership identity and strict-majority voter HMAC signatures on `cert`."""
+        return (
+            cert.membership.lineage_id == self.membership.lineage_id
+            and cert.membership.membership_digest == self.membership.membership_digest
+            and cert.verify_signatures(self._secrets)
+        )
+
     def max_observed_term(self, *, active_member_ids: Sequence[str] | None = None) -> int:
         """Query the highest promised/voted term across a strict majority $2q > N$ of reachable members."""
         targets = self._unique_targets(active_member_ids)

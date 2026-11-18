@@ -252,28 +252,33 @@ class ComputationalFabricRouter:
                 tuple(sorted(blockers or {FabricBlockerCode.NO_HOST}, key=lambda b: b.value)),
             )
 
-        # Multi-metric Dijkstra from origin_peer_id
+        # Multi-metric constrained label-setting search from origin_peer_id
         zero_vec = tuple(0 for _ in metric_order)
-        pq: list[tuple[tuple[int, ...], int, tuple[str, ...]]] = [(zero_vec, 0, (self.origin_peer_id,))]
-        best_peer_cost: dict[str, tuple[int, ...]] = {self.origin_peer_id: zero_vec}
         ceil_map = dict(ceilings or {})
-        found_witnesses: list[tuple[tuple[int, ...], str, FabricRouteWitness]] = []
+        ceil_indices = tuple(idx for idx, (m_name, _u) in enumerate(metric_order) if m_name in ceil_map)
+
+        def _dominates(v1: tuple[int, ...], h1: int, v2: tuple[int, ...], h2: int) -> bool:
+            return v1 <= v2 and h1 <= h2 and all(v1[i] <= v2[i] for i in ceil_indices)
+
+        pq: list[tuple[tuple[int, ...], int, tuple[str, ...]]] = [(zero_vec, 0, (self.origin_peer_id,))]
+        peer_labels: dict[str, list[tuple[tuple[int, ...], int]]] = {self.origin_peer_id: [(zero_vec, 0)]}
+        best_witness_by_host: dict[tuple[str, str], tuple[tuple[int, ...], FabricRouteWitness]] = {}
         saw_hop_limit = False
         saw_ceiling_limit = False
 
         while pq:
             path_vec, hops, peer_path = heapq.heappop(pq)
             cur_peer = peer_path[-1]
-            if cur_peer in best_peer_cost and path_vec > best_peer_cost[cur_peer]:
+            if any(
+                (lv, lh) != (path_vec, hops) and _dominates(lv, lh, path_vec, hops)
+                for lv, lh in peer_labels.get(cur_peer, ())
+            ):
                 continue
 
             for adv in eligible_by_peer.get(cur_peer, ()):
                 host_vec = _extract_metric_tuple(adv.local_metrics, metric_order)
                 tot_vec = tuple(a + b for a, b in zip(path_vec, host_vec))
-                exceeds = any(
-                    m_name in ceil_map and tot_vec[idx] > ceil_map[m_name]
-                    for idx, (m_name, _u) in enumerate(metric_order)
-                )
+                exceeds = any(tot_vec[idx] > ceil_map[metric_order[idx][0]] for idx in ceil_indices)
                 if exceeds:
                     saw_ceiling_limit = True
                     continue
@@ -290,18 +295,16 @@ class ComputationalFabricRouter:
                         "target_peer": adv.peer_id,
                     },
                 )
-                found_witnesses.append(
-                    (
-                        tot_vec,
-                        adv.host_id,
-                        FabricRouteWitness(
-                            peer_path=peer_path,
-                            target_host=adv,
-                            total_metrics=tot_metrics,
-                            witness_digest=wdigest,
-                        ),
-                    )
+                witness = FabricRouteWitness(
+                    peer_path=peer_path,
+                    target_host=adv,
+                    total_metrics=tot_metrics,
+                    witness_digest=wdigest,
                 )
+                h_key = (adv.peer_id, adv.host_id)
+                prev_w = best_witness_by_host.get(h_key)
+                if prev_w is None or (tot_vec, peer_path) < (prev_w[0], prev_w[1].peer_path):
+                    best_witness_by_host[h_key] = (tot_vec, witness)
 
             if hops >= max_hops:
                 if self._adj.get(cur_peer):
@@ -314,22 +317,26 @@ class ComputationalFabricRouter:
                     continue
                 edge_vec = _extract_metric_tuple(link.metrics, metric_order)
                 nxt_vec = tuple(a + b for a, b in zip(path_vec, edge_vec))
-                if any(
-                    m_name in ceil_map and nxt_vec[idx] > ceil_map[m_name]
-                    for idx, (m_name, _u) in enumerate(metric_order)
-                ):
+                if any(nxt_vec[idx] > ceil_map[metric_order[idx][0]] for idx in ceil_indices):
                     saw_ceiling_limit = True
                     continue
-                prev_best = best_peer_cost.get(nxt)
-                if prev_best is None or nxt_vec < prev_best:
-                    best_peer_cost[nxt] = nxt_vec
-                    heapq.heappush(pq, (nxt_vec, hops + 1, (*peer_path, nxt)))
+                nxt_hops = hops + 1
+                existing = peer_labels.get(nxt, [])
+                if any(_dominates(lv, lh, nxt_vec, nxt_hops) for lv, lh in existing):
+                    continue
+                peer_labels[nxt] = [
+                    (lv, lh) for lv, lh in existing if not _dominates(nxt_vec, nxt_hops, lv, lh)
+                ] + [(nxt_vec, nxt_hops)]
+                heapq.heappush(pq, (nxt_vec, nxt_hops, (*peer_path, nxt)))
 
-        if found_witnesses:
-            found_witnesses.sort(key=lambda it: (it[0], it[2].peer_path, it[1]))
+        if best_witness_by_host:
+            ordered = sorted(
+                best_witness_by_host.values(),
+                key=lambda it: (it[0], it[1].peer_path, it[1].target_host.host_id),
+            )
             return FabricResolutionResult(
                 FabricResolutionStatus.FOUND,
-                tuple(it[2] for it in found_witnesses),
+                tuple(it[1] for it in ordered),
                 (),
             )
 
@@ -549,7 +556,10 @@ class TensorCutWorkerNode:
             seq_len = int(body["seq_len"])
             d_in_req = int(body["d_in"])
             act_bytes = bytes.fromhex(str(body["activations_f32_hex"]))
+            act_dg = hashlib.sha256(act_bytes).hexdigest()
             x_flat = decode_f32_le(act_bytes)
+            if len(x_flat) != seq_len * d_in_req:
+                raise FabricRoutingError("Activation element count disagrees with seq_len * d_in.")
             x_2d = [x_flat[t * d_in_req : (t + 1) * d_in_req] for t in range(seq_len)]
 
             d_in, d_out, _pff, wg, wu, wd = _unpack_swiglu_shard(self.store.read_bytes(shard_m))
@@ -566,6 +576,7 @@ class TensorCutWorkerNode:
             out_hex = encode_f32_le([v for row in partial_2d for v in row]).hex()
             out_dg = hashlib.sha256(bytes.fromhex(out_hex)).hexdigest()
             rcpt_body = {
+                "activation_sha256": act_dg,
                 "assignment_epoch": claim.assignment_epoch,
                 "claim_id": claim.claim_id,
                 "cut_id": claim.cut_id,
@@ -759,6 +770,7 @@ class PartitionedTensorCutCoordinator:
         d_out = len(self._b_out)
         p_count = len(self._shard_manifests)
         act_bytes = encode_f32_le([float(v) for row in inputs_2d for v in row])
+        act_sha256 = hashlib.sha256(act_bytes).hexdigest()
         act_hex = act_bytes.hex()
 
         partials: list[list[list[float]]] = []
@@ -847,16 +859,28 @@ class PartitionedTensorCutCoordinator:
 
             rcpt = resp["receipt"]
             self.verify_receipt_epoch(rcpt)
-            w_dns = self._active_routes[k].target_host.tls_dns
+            expected_adv = self._active_routes[k].target_host
+            w_dns = expected_adv.tls_dns
             w_sec = self._worker_secrets[w_dns]
             rcpt_body = {key: val for key, val in rcpt.items() if key != "worker_mac"}
             exp_mac = hmac.new(w_sec, canonical_bytes(rcpt_body), hashlib.sha256).hexdigest()
             if not hmac.compare_digest(str(rcpt["worker_mac"]), exp_mac):
                 raise FabricRoutingError(f"Forged worker receipt MAC on partition {k}.")
+            if (
+                str(rcpt.get("cut_id")) != self.cut_id
+                or int(rcpt.get("partition_index", -1)) != k
+                or str(rcpt.get("claim_id")) != claim_used.claim_id
+                or str(rcpt.get("peer_id")) != expected_adv.peer_id
+                or str(rcpt.get("host_id")) != expected_adv.host_id
+                or str(rcpt.get("shard_manifest_digest")) != shard_m.manifest_digest
+                or str(rcpt.get("activation_sha256")) != act_sha256
+            ):
+                raise FabricRoutingError(f"Worker receipt identity/input mismatch on partition {k}.")
 
             p_raw = bytes.fromhex(str(resp["partial_f32_hex"]))
-            if hashlib.sha256(p_raw).hexdigest() != str(resp["partial_sha256"]):
-                raise FabricRoutingError(f"Corrupted partial bytes on partition {k}.")
+            actual_p_sha = hashlib.sha256(p_raw).hexdigest()
+            if actual_p_sha != str(resp["partial_sha256"]) or actual_p_sha != str(rcpt.get("partial_sha256")):
+                raise FabricRoutingError(f"Corrupted or unauthenticated partial bytes on partition {k}.")
             warm_wire_bytes += len(act_bytes) + len(p_raw)
             p_vals = decode_f32_le(p_raw)
             partials.append([p_vals[t * d_out : (t + 1) * d_out] for t in range(seq_len)])

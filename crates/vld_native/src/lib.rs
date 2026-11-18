@@ -277,11 +277,13 @@ pub unsafe extern "C" fn vld_sinkhorn_birkhoff_f32(
         }
         for j in 0..hc {
             let z0 = (m_row[j] as f64) * s0 + (base[j] as f64);
-            let sig0 = 1.0_f64 / (1.0_f64 + (-z0).exp());
+            let ez0 = (-z0.abs()).exp();
+            let sig0 = if z0 >= 0.0 { 1.0_f64 / (1.0_f64 + ez0) } else { ez0 / (1.0_f64 + ez0) };
             pre_out[i * hc + j] = (sig0 + eps64) as f32;
 
             let z1 = (m_row[hc + j] as f64) * s1 + (base[hc + j] as f64);
-            let sig1 = 1.0_f64 / (1.0_f64 + (-z1).exp());
+            let ez1 = (-z1.abs()).exp();
+            let sig1 = if z1 >= 0.0 { 1.0_f64 / (1.0_f64 + ez1) } else { ez1 / (1.0_f64 + ez1) };
             post_out[i * hc + j] = (2.0_f64 * sig1) as f32;
         }
 
