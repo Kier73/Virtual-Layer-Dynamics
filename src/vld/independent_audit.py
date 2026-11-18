@@ -24,6 +24,105 @@ from typing import Any, Mapping, Sequence
 
 GENESIS_DIGEST = "0" * 64
 
+# Standalone RFC 8032 Ed25519 constants (zero external imports)
+_ED_P: int = (1 << 255) - 19
+_ED_L: int = (1 << 252) + 27742317777372353535851937790883648493
+_ED_D: int = (-121665 * pow(121666, _ED_P - 2, _ED_P)) % _ED_P
+_ED_2D: int = (2 * _ED_D) % _ED_P
+_ED_SQRT_M1: int = pow(2, (_ED_P - 1) // 4, _ED_P)
+
+
+def _ed_recover_x(y: int, sign: int) -> int:
+    if y < 0 or y >= _ED_P:
+        raise IndependentAuditError("Non-canonical Ed25519 y-coordinate.")
+    y2 = (y * y) % _ED_P
+    u = (y2 - 1) % _ED_P
+    v = (_ED_D * y2 + 1) % _ED_P
+    v3 = (v * v * v) % _ED_P
+    v7 = (v3 * v3 * v) % _ED_P
+    x = (u * v3 * pow((u * v7) % _ED_P, (_ED_P - 5) // 8, _ED_P)) % _ED_P
+    vx2 = (v * x * x) % _ED_P
+    if vx2 == u:
+        pass
+    elif vx2 == (_ED_P - u) % _ED_P:
+        x = (x * _ED_SQRT_M1) % _ED_P
+    else:
+        raise IndependentAuditError("Point not on Ed25519 curve.")
+    if x == 0 and sign == 1:
+        raise IndependentAuditError("Invalid negative zero x on Ed25519.")
+    if (x & 1) != sign:
+        x = _ED_P - x
+    return x
+
+
+_ED_BY: int = (4 * pow(5, _ED_P - 2, _ED_P)) % _ED_P
+_ED_BX: int = _ed_recover_x(_ED_BY, 0)
+_ED_BASE: tuple[int, int, int, int] = (_ED_BX, _ED_BY, 1, (_ED_BX * _ED_BY) % _ED_P)
+
+
+def _ed_add(p1: tuple[int, int, int, int], p2: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
+    x1, y1, z1, t1 = p1
+    x2, y2, z2, t2 = p2
+    a = ((y1 - x1) * (y2 - x2)) % _ED_P
+    b = ((y1 + x1) * (y2 + x2)) % _ED_P
+    c = (t1 * _ED_2D * t2) % _ED_P
+    d = (z1 * 2 * z2) % _ED_P
+    e = (b - a) % _ED_P
+    f = (d - c) % _ED_P
+    g = (d + c) % _ED_P
+    h = (b + a) % _ED_P
+    return ((e * f) % _ED_P, (g * h) % _ED_P, (f * g) % _ED_P, (e * h) % _ED_P)
+
+
+def _ed_mul(scalar: int, pt: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
+    res = (0, 1, 1, 0)
+    cur = pt
+    k = scalar
+    while k > 0:
+        if k & 1:
+            res = _ed_add(res, cur)
+        cur = _ed_add(cur, cur)
+        k >>= 1
+    return res
+
+
+def _ed_decode_strict(raw: bytes) -> tuple[int, int, int, int]:
+    if len(raw) != 32:
+        raise IndependentAuditError("Ed25519 point must be 32 bytes.")
+    val = int.from_bytes(raw, "little")
+    sign = (val >> 255) & 1
+    y = val & ((1 << 255) - 1)
+    x = _ed_recover_x(y, sign)
+    re_enc = (y | ((x & 1) << 255)).to_bytes(32, "little")
+    if re_enc != raw:
+        raise IndependentAuditError("Non-canonical Ed25519 point encoding.")
+    return (x, y, 1, (x * y) % _ED_P)
+
+
+def ed25519_verify_standalone(public_key_hex: str, message: bytes, signature_hex: str) -> bool:
+    """Zero-import RFC 8032 §5.1.7 cofactored Ed25519 public-key signature verifier."""
+    try:
+        if len(public_key_hex) != 64 or len(signature_hex) != 128:
+            return False
+        if any(c not in "0123456789abcdef" for c in public_key_hex + signature_hex):
+            return False
+        pub_b = bytes.fromhex(public_key_hex)
+        sig_b = bytes.fromhex(signature_hex)
+        r_enc = sig_b[:32]
+        s_int = int.from_bytes(sig_b[32:], "little")
+        if s_int >= _ED_L:
+            return False
+        a_pt = _ed_decode_strict(pub_b)
+        r_pt = _ed_decode_strict(r_enc)
+        k = int.from_bytes(hashlib.sha512(r_enc + pub_b + message).digest(), "little") % _ED_L
+        lhs = _ed_mul(8 * s_int, _ED_BASE)
+        rhs = _ed_add(_ed_mul(8, r_pt), _ed_mul(8 * k, a_pt))
+        return ((lhs[0] * rhs[2] - rhs[0] * lhs[2]) % _ED_P == 0) and (
+            (lhs[1] * rhs[2] - rhs[1] * lhs[2]) % _ED_P == 0
+        )
+    except Exception:
+        return False
+
 
 class IndependentAuditError(ValueError):
     """Raised when an artifact, receipt chain, quorum certificate, or neural capsule fails independent audit."""
@@ -108,8 +207,9 @@ def verify_quorum_certificate_standalone(
     *,
     member_ids: Sequence[str],
     member_secrets: Mapping[str, bytes] | None = None,
+    member_public_keys: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
-    r"""Independently verify a `vld.quorum-certificate.v1` dictionary ($2q > N$ strict majority + digests)."""
+    r"""Independently verify a `vld.quorum-certificate.v1` dictionary ($2q > N$ strict majority + HMAC or Ed25519)."""
     members_sorted = sorted(set(str(m) for m in member_ids))
     n_total = len(members_sorted)
     if n_total == 0 or len(members_sorted) != len(member_ids):
@@ -117,16 +217,43 @@ def verify_quorum_certificate_standalone(
     q_min = (n_total // 2) + 1
 
     prop = cert_dict["proposal"]
-    expected_mem_dg = independent_domain_digest(
-        "vld.quorum-membership.v1",
-        {
-            "lineage_id": str(prop["lineage_id"]),
-            "member_ids": members_sorted,
-        },
-    )
+    mem_doc = cert_dict.get("membership", {})
+    sig_scheme = str(mem_doc.get("signature_scheme", "hmac-sha256"))
+    if sig_scheme not in ("hmac-sha256", "ed25519-rfc8032"):
+        raise IndependentAuditError(f"Unsupported quorum signature_scheme {sig_scheme!r}.")
+
+    cert_pub_keys: dict[str, str] | None = None
+    if sig_scheme == "ed25519-rfc8032":
+        raw_pks = mem_doc.get("member_public_keys")
+        if not isinstance(raw_pks, Mapping) or sorted(str(k) for k in raw_pks.keys()) != members_sorted:
+            raise IndependentAuditError("Ed25519 quorum certificate missing complete member_public_keys.")
+        cert_pub_keys = {str(k): str(raw_pks[k]) for k in members_sorted}
+        if member_public_keys is not None:
+            pinned = {str(k): str(v) for k, v in member_public_keys.items()}
+            if pinned != cert_pub_keys:
+                raise IndependentAuditError("Certificate member_public_keys disagrees with pinned public keys.")
+        expected_mem_dg = independent_domain_digest(
+            "vld.quorum-membership.v1",
+            {
+                "lineage_id": str(prop["lineage_id"]),
+                "member_ids": members_sorted,
+                "member_public_keys": dict(sorted(cert_pub_keys.items())),
+                "signature_scheme": "ed25519-rfc8032",
+            },
+        )
+    else:
+        if member_public_keys is not None:
+            raise IndependentAuditError("Expected Ed25519 public-key quorum, but certificate uses hmac-sha256.")
+        expected_mem_dg = independent_domain_digest(
+            "vld.quorum-membership.v1",
+            {
+                "lineage_id": str(prop["lineage_id"]),
+                "member_ids": members_sorted,
+            },
+        )
+
     if prop["membership_digest"] != expected_mem_dg:
         raise IndependentAuditError("Quorum proposal membership_digest mismatch.")
-    mem_doc = cert_dict.get("membership", {})
     if list(mem_doc.get("member_ids", ())) != members_sorted or mem_doc.get("membership_digest") != expected_mem_dg:
         raise IndependentAuditError("Quorum certificate membership object mismatch.")
 
@@ -147,6 +274,7 @@ def verify_quorum_certificate_standalone(
 
     votes = list(cert_dict["votes"])
     seen_voters: set[str] = set()
+    normalized_votes: list[dict[str, Any]] = []
     for v in votes:
         vid = str(v["voter_id"])
         if vid not in members_sorted:
@@ -161,49 +289,71 @@ def verify_quorum_certificate_standalone(
         ):
             raise IndependentAuditError("Vote proposal/slot/term mismatch.")
         seen_voters.add(vid)
-        if member_secrets is not None:
-            if vid not in member_secrets:
-                raise IndependentAuditError(f"Missing verification secret for voter {vid!r}.")
-            msg = independent_canonical_bytes(
+        msg = independent_canonical_bytes(
+            {
+                "domain": "vld.quorum-vote.v1",
+                "lineage_id": str(v["lineage_id"]),
+                "proposal_digest": str(v["proposal_digest"]),
+                "slot": int(v["slot"]),
+                "term": int(v["term"]),
+                "voter_id": vid,
+            }
+        )
+        if sig_scheme == "ed25519-rfc8032":
+            assert cert_pub_keys is not None
+            if v.get("signature_scheme") != "ed25519-rfc8032" or "signature_hmac" in v:
+                raise IndependentAuditError(f"Vote from {vid!r} lacks ed25519-rfc8032 scheme.")
+            sig_ed = str(v.get("signature_ed25519", ""))
+            if not ed25519_verify_standalone(cert_pub_keys[vid], msg, sig_ed):
+                raise IndependentAuditError(f"Invalid Ed25519 signature for quorum voter {vid!r}.")
+            normalized_votes.append(
                 {
-                    "domain": "vld.quorum-vote.v1",
                     "lineage_id": str(v["lineage_id"]),
                     "proposal_digest": str(v["proposal_digest"]),
+                    "signature_ed25519": sig_ed,
+                    "signature_scheme": "ed25519-rfc8032",
                     "slot": int(v["slot"]),
                     "term": int(v["term"]),
                     "voter_id": vid,
                 }
             )
-            expected_sig = hmac.new(member_secrets[vid], msg, hashlib.sha256).hexdigest()
-            if not hmac.compare_digest(str(v["signature_hmac"]), expected_sig):
-                raise IndependentAuditError(f"Invalid HMAC vote signature for member {vid!r}.")
-
-    if 2 * len(seen_voters) <= n_total:
-        raise IndependentAuditError(f"Insufficient quorum votes: {len(seen_voters)}/{n_total} fails strict 2q > N.")
-
-    cert_body = {
-        "membership": {
-            "lineage_id": str(prop["lineage_id"]),
-            "member_ids": members_sorted,
-            "membership_digest": expected_mem_dg,
-            "quorum_size": q_min,
-        },
-        "proposal": {**prop_body, "proposal_digest": computed_prop_dg},
-        "schema": "vld.quorum-certificate.v1",
-        "votes": sorted(
-            [
+        else:
+            if member_secrets is not None:
+                if vid not in member_secrets:
+                    raise IndependentAuditError(f"Missing verification secret for voter {vid!r}.")
+                expected_sig = hmac.new(member_secrets[vid], msg, hashlib.sha256).hexdigest()
+                if not hmac.compare_digest(str(v["signature_hmac"]), expected_sig):
+                    raise IndependentAuditError(f"Invalid HMAC vote signature for member {vid!r}.")
+            normalized_votes.append(
                 {
                     "lineage_id": str(v["lineage_id"]),
                     "proposal_digest": str(v["proposal_digest"]),
                     "signature_hmac": str(v["signature_hmac"]),
                     "slot": int(v["slot"]),
                     "term": int(v["term"]),
-                    "voter_id": str(v["voter_id"]),
+                    "voter_id": vid,
                 }
-                for v in votes
-            ],
-            key=lambda item: item["voter_id"],
-        ),
+            )
+
+    if 2 * len(seen_voters) <= n_total:
+        raise IndependentAuditError(f"Insufficient quorum votes: {len(seen_voters)}/{n_total} fails strict 2q > N.")
+
+    mem_canon: dict[str, Any] = {
+        "lineage_id": str(prop["lineage_id"]),
+        "member_ids": members_sorted,
+        "membership_digest": expected_mem_dg,
+        "quorum_size": q_min,
+    }
+    if sig_scheme == "ed25519-rfc8032":
+        assert cert_pub_keys is not None
+        mem_canon["member_public_keys"] = dict(sorted(cert_pub_keys.items()))
+        mem_canon["signature_scheme"] = "ed25519-rfc8032"
+
+    cert_body = {
+        "membership": mem_canon,
+        "proposal": {**prop_body, "proposal_digest": computed_prop_dg},
+        "schema": "vld.quorum-certificate.v1",
+        "votes": sorted(normalized_votes, key=lambda item: item["voter_id"]),
     }
     computed_cert_dg = independent_domain_digest("vld.quorum-certificate.v1", cert_body)
     if cert_dict.get("certificate_digest") != computed_cert_dg:
@@ -212,6 +362,7 @@ def verify_quorum_certificate_standalone(
         "certificate_digest": computed_cert_dg,
         "proposal_digest": computed_prop_dg,
         "quorum_size": q_min,
+        "signature_scheme": sig_scheme,
         "slot": int(prop["slot"]),
         "term": int(prop["term"]),
         "votes_verified": len(seen_voters),
@@ -226,6 +377,7 @@ def verify_continuity_receipt_chain_standalone(
     expected_stages: Sequence[Mapping[str, str]] | None = None,
     quorum_member_ids: Sequence[str] | None = None,
     quorum_member_secrets: Mapping[str, bytes] | None = None,
+    quorum_member_public_keys: Mapping[str, str] | None = None,
     require_verified_tag: bool = False,
 ) -> dict[str, Any]:
     """Independently reconstruct and verify an entire `CrossGroundContinuityReceipt` chain from genesis."""
@@ -271,11 +423,17 @@ def verify_continuity_receipt_chain_standalone(
                 raise IndependentAuditError(f"Stage {idx}: representation contract mismatch.")
 
         q_cert = rcpt["quorum_certificate"]
-        if quorum_member_ids is not None:
+        if quorum_member_ids is not None or quorum_member_public_keys is not None:
+            m_ids = (
+                quorum_member_ids
+                if quorum_member_ids is not None
+                else sorted(str(k) for k in (quorum_member_public_keys or {}).keys())
+            )
             verify_quorum_certificate_standalone(
                 q_cert,
-                member_ids=quorum_member_ids,
+                member_ids=m_ids,
                 member_secrets=quorum_member_secrets,
+                member_public_keys=quorum_member_public_keys,
             )
 
         state_m = rcpt["state_manifest"]
@@ -488,14 +646,208 @@ def verify_transit_packet_receipts_standalone(packet_dict: Mapping[str, Any]) ->
     }
 
 
+def _affine_monoid_power_mod(a: int, b: int, n: int, m: int) -> tuple[int, int]:
+    r"""Compute $(a, b)^n \bmod m$ in $O(\log n)$ exact operations without requiring $\gcd(a-1, m)=1$."""
+    if m <= 0 or n < 0:
+        raise IndependentAuditError("Affine power requires m >= 1 and n >= 0.")
+    res_a, res_b = 1 % m, 0
+    cur_a, cur_b = a % m, b % m
+    k = n
+    while k > 0:
+        if k & 1:
+            res_a, res_b = (cur_a * res_a) % m, (cur_a * res_b + cur_b) % m
+        cur_a, cur_b = (cur_a * cur_a) % m, (cur_a * cur_b + cur_b) % m
+        k >>= 1
+    return res_a, res_b
+
+
+def _check_atomic_rewrite_rule(rule_id: str, lhs: Mapping[str, Any], rhs: Mapping[str, Any]) -> bool:
+    """Check one bidirectional algebraic/structural rewrite rule without trusting optimizer state."""
+    for left, right in ((lhs, rhs), (rhs, lhs)):
+        lop = str(left.get("op", ""))
+        rop = str(right.get("op", ""))
+        largs = list(left.get("args", ()))
+        rargs = list(right.get("args", ()))
+        lpar = dict(left.get("params", {}))
+        rpar = dict(right.get("params", {}))
+
+        if rule_id == "affine_fusion" and lop == "affine_mod" and rop in ("affine_mod", "closed_orbit_jump"):
+            if len(largs) == 1 and isinstance(largs[0], Mapping) and str(largs[0].get("op")) in ("affine_mod", "closed_orbit_jump"):
+                inner = largs[0]
+                in_args = list(inner.get("args", ()))
+                in_par = dict(inner.get("params", {}))
+                m = int(lpar.get("modulus", 0))
+                if (
+                    m >= 1
+                    and int(in_par.get("modulus", 0)) == m
+                    and int(rpar.get("modulus", 0)) == m
+                    and len(rargs) == 1
+                    and len(in_args) == 1
+                    and independent_canonical_bytes(in_args[0]) == independent_canonical_bytes(rargs[0])
+                ):
+                    a1, b1 = int(in_par["a"]) % m, int(in_par["b"]) % m
+                    a2, b2 = int(lpar["a"]) % m, int(lpar["b"]) % m
+                    if int(rpar["a"]) % m == (a2 * a1) % m and int(rpar["b"]) % m == (a2 * b1 + b2) % m:
+                        return True
+
+        elif rule_id == "affine_iter_collapse" and lop == "iterate_affine" and rop == "closed_orbit_jump":
+            m = int(lpar.get("modulus", 0))
+            n = int(lpar.get("steps", -1))
+            if (
+                m >= 1
+                and n >= 0
+                and int(rpar.get("modulus", 0)) == m
+                and len(largs) == 1
+                and len(rargs) == 1
+                and independent_canonical_bytes(largs[0]) == independent_canonical_bytes(rargs[0])
+            ):
+                an, bn = _affine_monoid_power_mod(int(lpar["a"]), int(lpar["b"]), n, m)
+                if int(rpar["a"]) % m == an and int(rpar["b"]) % m == bn:
+                    return True
+
+        elif rule_id == "affine_chain_collapse" and lop == "affine_chain" and rop == "closed_orbit_jump":
+            m = int(lpar.get("modulus", 0))
+            pairs = list(lpar.get("chain", ()))
+            if (
+                m >= 1
+                and pairs
+                and int(rpar.get("modulus", 0)) == m
+                and len(largs) == 1
+                and len(rargs) == 1
+                and independent_canonical_bytes(largs[0]) == independent_canonical_bytes(rargs[0])
+            ):
+                acc_a, acc_b = 1 % m, 0
+                for pair in pairs:
+                    pa, pb = int(pair[0]) % m, int(pair[1]) % m
+                    acc_a, acc_b = (pa * acc_a) % m, (pa * acc_b + pb) % m
+                if int(rpar["a"]) % m == acc_a and int(rpar["b"]) % m == acc_b:
+                    return True
+
+        elif rule_id == "vm_pullback_reduction" and lop == "buffer_reduce" and rop == "contravariant_pullback_reduce":
+            monoid = str(lpar.get("monoid", ""))
+            if (
+                monoid in ("sum", "xor", "min", "max")
+                and str(rpar.get("monoid", "")) == monoid
+                and len(largs) == 1
+                and isinstance(largs[0], Mapping)
+                and str(largs[0].get("op")) == "buffer_permute_patch"
+            ):
+                perm_node = largs[0]
+                p_args = list(perm_node.get("args", ()))
+                p_par = dict(perm_node.get("params", {}))
+                kind = str(p_par.get("kind", ""))
+                n_len = int(p_par.get("length", 0))
+                bijective_ok = False
+                if kind in ("reverse", "rotate") and n_len > 0:
+                    bijective_ok = True
+                elif kind == "transpose_2d" and n_len > 0:
+                    bijective_ok = int(p_par.get("rows", 0)) * int(p_par.get("cols", 0)) == n_len
+                if (
+                    bijective_ok
+                    and len(p_args) == 1
+                    and len(rargs) == 1
+                    and independent_canonical_bytes(p_args[0]) == independent_canonical_bytes(rargs[0])
+                    and str(rpar.get("kind", "")) == kind
+                    and int(rpar.get("length", 0)) == n_len
+                    and independent_canonical_bytes(p_par.get("patches", {}))
+                    == independent_canonical_bytes(rpar.get("patches", {}))
+                ):
+                    return True
+
+        elif rule_id == "online_flash_partition" and lop == "partitioned_softmax_attn" and rop == "online_flash_stream_attn":
+            if (
+                len(largs) == len(rargs)
+                and independent_canonical_bytes(largs) == independent_canonical_bytes(rargs)
+                and independent_canonical_bytes(lpar) == independent_canonical_bytes(rpar)
+                and int(lpar.get("num_shards", 0)) >= 1
+            ):
+                return True
+
+        elif rule_id == "internet_range_slice" and lop == "http_slice" and rop == "http_range_206":
+            off = int(lpar.get("offset", -1))
+            ln = int(lpar.get("length", 0))
+            if (
+                off >= 0
+                and ln > 0
+                and str(lpar.get("url", "")) != ""
+                and str(lpar.get("url")) == str(rpar.get("url"))
+                and int(rpar.get("offset", -1)) == off
+                and int(rpar.get("length", 0)) == ln
+                and largs == []
+                and rargs == []
+            ):
+                return True
+
+        elif rule_id.startswith("congruence:") and lop == rop and independent_canonical_bytes(lpar) == independent_canonical_bytes(rpar):
+            sub_rule = rule_id.split(":", 1)[1]
+            if len(largs) == len(rargs) and len(largs) >= 1:
+                diffs = [
+                    i
+                    for i in range(len(largs))
+                    if independent_canonical_bytes(largs[i]) != independent_canonical_bytes(rargs[i])
+                ]
+                if len(diffs) == 1:
+                    d_idx = diffs[0]
+                    if _check_atomic_rewrite_rule(sub_rule, largs[d_idx], rargs[d_idx]):
+                        return True
+    return False
+
+
+def verify_rewrite_proof_chain_standalone(
+    source_expr: Mapping[str, Any],
+    target_expr: Mapping[str, Any],
+    proof_steps: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Independently verify an e-graph equivalence rewrite proof without trusting the compiler."""
+    src_bytes = independent_canonical_bytes(source_expr)
+    tgt_bytes = independent_canonical_bytes(target_expr)
+    if not proof_steps:
+        if src_bytes != tgt_bytes:
+            raise IndependentAuditError("Empty rewrite proof for distinct expressions.")
+        return {"rules_verified": [], "status_clean": True, "steps_verified": 0, "status": "VERIFIED"}
+
+    cur_bytes = src_bytes
+    rules_used: list[str] = []
+    for idx, step in enumerate(proof_steps):
+        if int(step.get("step_index", -1)) != idx:
+            raise IndependentAuditError(f"Rewrite step {idx}: non-contiguous step_index.")
+        rule_id = str(step.get("rule_id", ""))
+        lhs = step.get("lhs_expr")
+        rhs = step.get("rhs_expr")
+        if not isinstance(lhs, Mapping) or not isinstance(rhs, Mapping):
+            raise IndependentAuditError(f"Rewrite step {idx}: lhs_expr/rhs_expr must be expression mappings.")
+        if independent_canonical_bytes(lhs) != cur_bytes:
+            raise IndependentAuditError(f"Rewrite step {idx}: lhs_expr does not match current chain expression.")
+        expected_step_dg = independent_domain_digest(
+            "vld.rewrite-proof-step.v1",
+            {"lhs_expr": lhs, "rhs_expr": rhs, "rule_id": rule_id, "step_index": idx},
+        )
+        if str(step.get("step_digest", "")) != expected_step_dg:
+            raise IndependentAuditError(f"Rewrite step {idx}: tampered step_digest.")
+        if not _check_atomic_rewrite_rule(rule_id, lhs, rhs):
+            raise IndependentAuditError(f"Rewrite step {idx}: unsound or invalid rewrite under rule {rule_id!r}.")
+        cur_bytes = independent_canonical_bytes(rhs)
+        rules_used.append(rule_id)
+
+    if cur_bytes != tgt_bytes:
+        raise IndependentAuditError("Final rewrite proof rhs_expr does not match target_expr.")
+    return {
+        "rules_verified": rules_used,
+        "status": "VERIFIED",
+        "steps_verified": len(proof_steps),
+    }
+
+
 __all__ = [
     "GENESIS_DIGEST",
     "IndependentAuditError",
+    "ed25519_verify_standalone",
     "independent_canonical_bytes",
     "independent_domain_digest",
     "independent_parse_strict_json",
     "verify_continuity_receipt_chain_standalone",
     "verify_quorum_certificate_standalone",
+    "verify_rewrite_proof_chain_standalone",
     "verify_snc_1d_capsule_standalone",
     "verify_transit_packet_receipts_standalone",
 ]
