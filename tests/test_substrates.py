@@ -527,3 +527,92 @@ def test_wasm_f32_f64_memory_grow_call_indirect_globals_and_conversions() -> Non
         lift_wasm_module(bad_imm)
 
 
+def test_wasm_single_rounding_i64_f32_block_underflow_leb128_imports_and_fuel_recursion() -> None:
+    """Verify IEEE-754 single-rounding i64->f32, block stack isolation, LEB128 bounds, Start/Import sections & fuel trap."""
+    from vld.substrates import WASM_MAGIC
+    from vld.substrates.lifting import _encode_s_leb128, _encode_u_leb128, _read_s_leb128, _read_u_leb128
+
+    def _sec(sid: int, payload: bytes) -> bytes:
+        return bytes([sid]) + _encode_u_leb128(len(payload)) + payload
+
+    # 1. Exact WASM 1.0 §5.2.2 LEB128: 5-byte relocatable s32(-1) succeeds; 6-byte overlong u32/s32 fails!
+    assert _read_s_leb128(b"\xff\xff\xff\xff\x7f", 0, 32) == (-1, 5)
+    with pytest.raises(LiftingError, match="Overlong"):
+        _read_u_leb128(b"\x80\x80\x80\x80\x80\x00", 0, 32)
+    with pytest.raises(LiftingError, match="Overlong"):
+        _read_s_leb128(b"\x80\x80\x80\x80\x80\x00", 0, 32)
+    with pytest.raises(LiftingError, match="unused"):
+        _read_s_leb128(b"\xff\xff\xff\xff\x0f", 0, 32)
+
+    # 2. Single-rounding i64 -> f32 (`0xB4` signed, `0xB5` unsigned): avoids i64 -> f64 -> f32 double rounding!
+    conv_u = b"\x00\x20\x00\xb5\xbc\x0b"
+    conv_s = b"\x00\x20\x00\xb4\xbc\x0b"
+    conv_wasm = (
+        WASM_MAGIC
+        + _sec(1, b"\x01\x60\x01\x7e\x01\x7f")
+        + _sec(3, b"\x02\x00\x00")
+        + _sec(7, b"\x02\x02cu\x00\x00\x02cs\x00\x01")
+        + _sec(10, b"\x02" + _encode_u_leb128(len(conv_u)) + conv_u + _encode_u_leb128(len(conv_s)) + conv_s)
+    )
+    conv_run = WasmRealizer(lift_wasm_module(conv_wasm))
+    above_mid = (1 << 59) + (1 << 35) + 1
+    exact_mid_even = (1 << 59) + (1 << 35)
+    assert conv_run.invoke("cu", (above_mid,)) == (0x5D000001,)
+    assert conv_run.invoke("cu", (exact_mid_even,)) == (0x5D000000,)
+    assert conv_run.invoke("cs", (-above_mid,)) == (0xDD000001,)
+
+    # 3. Empty valued block MUST trap on stack underflow rather than stealing outer stack operands!
+    steal_body = b"\x00\x41\x4d\x02\x7f\x0b\x0b"
+    steal_wasm = (
+        WASM_MAGIC
+        + _sec(1, b"\x01\x60\x00\x02\x7f\x7f")
+        + _sec(3, b"\x01\x00")
+        + _sec(7, b"\x01\x03dup\x00\x00")
+        + _sec(10, b"\x01" + _encode_u_leb128(len(steal_body)) + steal_body)
+    )
+    with pytest.raises(LiftingError, match="stack underflow"):
+        WasmRealizer(lift_wasm_module(steal_wasm)).invoke("dup")
+
+    # 4. Import section (sec_id=2) and unknown section (sec_id=12) MUST be refused; Start section (sec_id=8) executes!
+    imp_wasm = (
+        WASM_MAGIC
+        + _sec(1, b"\x01\x60\x00\x01\x7f")
+        + _sec(2, b"\x01\x03env\x03imp\x00\x00")
+        + _sec(3, b"\x01\x00")
+        + _sec(10, b"\x01\x04\x00\x41\x2a\x0b")
+    )
+    with pytest.raises(LiftingError, match="Import section"):
+        lift_wasm_module(imp_wasm)
+
+    start_init = b"\x00\x41\x2a\x24\x00\x0b"  # global.set 0 = 42
+    read_g = b"\x00\x23\x00\x0b"
+    start_wasm = (
+        WASM_MAGIC
+        + _sec(1, b"\x02\x60\x00\x00\x60\x00\x01\x7f")
+        + _sec(3, b"\x02\x00\x01")
+        + _sec(6, b"\x01\x7f\x01\x41\x00\x0b")
+        + _sec(7, b"\x01\x03get\x00\x01")
+        + _sec(8, b"\x00")
+        + _sec(10, b"\x02" + _encode_u_leb128(len(start_init)) + start_init + _encode_u_leb128(len(read_g)) + read_g)
+    )
+    assert WasmRealizer(lift_wasm_module(start_wasm)).invoke("get") == (42,)
+
+    # 5. Recursive call_indirect after memory.grow deterministically traps on max_fuel exhaustion!
+    rec_fn = b"\x00\x41\x01\x40\x00\x1a\x41\x00\x11\x00\x00\x0b"  # drop(memory.grow(1)); call_indirect(slot 0)
+    rec_wasm = (
+        WASM_MAGIC
+        + _sec(1, b"\x01\x60\x00\x00")
+        + _sec(3, b"\x01\x00")
+        + _sec(4, b"\x01\x70\x00\x01")
+        + _sec(5, b"\x01\x01\x01\x08")
+        + _sec(7, b"\x01\x04spin\x00\x00")
+        + _sec(9, b"\x01\x00\x41\x00\x0b\x01\x00")
+        + _sec(10, b"\x01" + _encode_u_leb128(len(rec_fn)) + rec_fn)
+    )
+    rec_runner = WasmRealizer(lift_wasm_module(rec_wasm), max_fuel=60)
+    with pytest.raises(LiftingError, match="fuel budget exhausted"):
+        rec_runner.invoke("spin")
+    assert len(rec_runner.memory) == 8 * 65_536
+
+
+

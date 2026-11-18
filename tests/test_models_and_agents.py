@@ -875,4 +875,156 @@ def test_high_dimensional_ridge_algebra_aks_attention_hf_tokenizer_and_lazy_safe
     assert NumericEngine.max_abs_diff(gen_lazy.last_step_logits, ref_logits) < 1e-4
 
 
+def test_hf_nonspecial_added_tokens_presigned_redirect_expiry_and_zero_hidden_capsule() -> None:
+    """Verify Qwen3 non-special added_tokens (`<think>`), multi-hop CDN redirect/expiry & 0-hidden ReLU capsules."""
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    import threading
+    from vld.canonical import domain_digest
+    from vld.models import (
+        HttpRangeSource,
+        HuggingFaceBPETokenizerGround,
+        compile_multivariate_hinge_relu,
+        evaluate_multivariate_capsule,
+        verify_multivariate_capsule,
+    )
+    from vld.models.artifacts import _BYTE_TO_UNICODE
+
+    # 1. Qwen3-style non-special (`<think>`, `</think>`) vs special (`<|im_start|>`) added_tokens + NFC + CRLF
+    vocab = {_BYTE_TO_UNICODE[b]: b for b in range(256)}
+    hf_cfg = {
+        "added_tokens": [
+            {"content": "<|im_start|>", "id": 256, "special": True},
+            {"content": "<|im_end|>", "id": 257, "special": True},
+            {"content": "<think>", "id": 258, "special": False},
+            {"content": "</think>", "id": 259, "special": False},
+        ],
+        "model": {"ignore_merges": False, "merges": [], "type": "BPE", "vocab": vocab},
+        "normalizer": {"type": "NFC"},
+        "pre_tokenizer": {"pattern": {"Regex": "\\p{N}"}},
+    }
+    tok = HuggingFaceBPETokenizerGround(hf_cfg, tokenizer_id="vld.test.qwen_think")
+    chat = "<|im_start|><think>e\u0301's \r\n\r\n  </think><|im_end|>"
+    ids_sp = tok.encode(chat, allow_special=True)
+    assert ids_sp[0] == 256 and ids_sp[1] == 258 and ids_sp[-2] == 259 and ids_sp[-1] == 257
+    # allow_special=False MUST still match non-special `<think>` (258) & `</think>` (259), while splitting `<|im_start|>`!
+    ids_nosp = tok.encode(chat, allow_special=False)
+    assert 256 not in ids_nosp and 257 not in ids_nosp and 258 in ids_nosp and 259 in ids_nosp
+    # skip_special_tokens=True MUST preserve `<think>...</think>` while stripping `<|im_start|>` / `<|im_end|>`!
+    assert tok.decode(ids_sp, skip_special_tokens=True) == "<think>\u00e9's \r\n\r\n  </think>"
+
+    # 2. HttpRangeSource: 2-hop redirect (`307 -> 302 -> 206`), cross-origin Auth stripping & `403` presigned URL expiry!
+    payload = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    cdn_state = {"calls": 0, "leaked_auth": False}
+
+    class _CdnHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802
+            if self.headers.get("Authorization"):
+                cdn_state["leaked_auth"] = True
+                self.send_response(400)
+                self.end_headers()
+                return
+            cdn_state["calls"] += 1
+            if self.path == "/expired-token":
+                self.send_response(403)
+                self.end_headers()
+                return
+            rng = self.headers.get("Range", "bytes=0-0")
+            s_str, e_str = rng.split("=")[1].split("-")
+            s_i, e_i = int(s_str), int(e_str)
+            chunk = payload[s_i : e_i + 1]
+            self.send_response(206)
+            self.send_header("Content-Range", f"bytes {s_i}-{s_i + len(chunk) - 1}/{len(payload)}")
+            self.send_header("Content-Length", str(len(chunk)))
+            self.end_headers()
+            self.wfile.write(chunk)
+
+        def log_message(self, *_args: object) -> None:
+            pass
+
+    cdn_srv = ThreadingHTTPServer(("127.0.0.1", 0), _CdnHandler)
+    cdn_port = cdn_srv.server_address[1]
+    origin_state = {"issues": 0}
+
+    class _OriginHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802
+            if self.headers.get("Authorization") != "Bearer secret-hf-token":
+                self.send_response(401)
+                self.end_headers()
+                return
+            if self.path == "/model.bin":
+                self.send_response(307)
+                self.send_header("Location", "/hop2")
+                self.end_headers()
+                return
+            origin_state["issues"] += 1
+            # First issued CDN token is good for initial read; we also test forced expired token recovery!
+            target_path = "/fresh-token" if origin_state["issues"] >= 2 else "/initial-token"
+            self.send_response(302)
+            self.send_header("Location", f"http://127.0.0.1:{cdn_port}{target_path}")
+            self.end_headers()
+
+        def log_message(self, *_args: object) -> None:
+            pass
+
+    origin_srv = ThreadingHTTPServer(("127.0.0.1", 0), _OriginHandler)
+    origin_port = origin_srv.server_address[1]
+    t_cdn = threading.Thread(target=cdn_srv.serve_forever, daemon=True)
+    t_org = threading.Thread(target=origin_srv.serve_forever, daemon=True)
+    t_cdn.start()
+    t_org.start()
+    try:
+        src = HttpRangeSource(
+            f"http://127.0.0.1:{origin_port}/model.bin",
+            headers={"Authorization": "Bearer secret-hf-token"},
+        )
+        assert src.total_size_bytes == len(payload)
+        assert src.read_range(10, 8) == b"ABCDEFGH"
+        assert cdn_state["leaked_auth"] is False
+        # Simulate presigned CDN URL expiring -> automatically re-resolves via Origin -> hop2 -> fresh CDN URL!
+        src._resolved_url = f"http://127.0.0.1:{cdn_port}/expired-token"
+        assert src.read_range(0, 10) == b"0123456789"
+        assert origin_state["issues"] >= 2 and cdn_state["leaked_auth"] is False
+        src.close()
+    finally:
+        origin_srv.shutdown()
+        cdn_srv.shutdown()
+        origin_srv.server_close()
+        cdn_srv.server_close()
+
+    # 3. Zero-hidden-unit constant ReLU capsule evaluates consistently + collinear offset counterexample!
+    spec0 = {"base_bias": ["7/2"], "base_linear": [["0", "0", "0"]], "hinges": [], "input_dim": 3}
+    body0 = {
+        "network": {
+            "hidden_activation": "relu",
+            "hidden_bias": [],
+            "hidden_weight": [],
+            "output_bias": ["7/2"],
+            "output_weight": [[]],
+        },
+        "schema": "vld.snc-multivariate-relu-capsule.v1",
+        "source_spec": spec0,
+        "source_spec_digest": domain_digest("vld.multivariate-hinge-spec.v1", spec0),
+    }
+    cap0 = {**body0, "capsule_digest": domain_digest("vld.snc-multivariate-relu-capsule.v1", body0)}
+    assert verify_multivariate_capsule(cap0)["status"] == "VERIFIED_WHOLE_DOMAIN"
+    assert evaluate_multivariate_capsule(cap0, [3, -5, 11]) == [Fraction(7, 2)]
+
+    col_cap = compile_multivariate_hinge_relu(
+        input_dim=8,
+        base_linear=[["0"] * 8],
+        base_bias=["0"],
+        hinges=[
+            {"normal": ["1", "1", "0", "0", "0", "0", "0", "0"], "offset": "-2", "weights": ["1"]},
+            {"normal": ["1", "1", "0", "0", "0", "0", "0", "0"], "offset": "-3", "weights": ["-1"]},
+        ],
+    )
+    bad_col = json.loads(json.dumps(col_cap))
+    bad_col["network"]["hidden_bias"][-2] = "-2001/1000"
+    bad_col_body = {k: v for k, v in bad_col.items() if k != "capsule_digest"}
+    bad_col["capsule_digest"] = domain_digest("vld.snc-multivariate-relu-capsule.v1", bad_col_body)
+    with pytest.raises(ProceduralModelError, match="rational witness"):
+        verify_multivariate_capsule(bad_col)
+
+
+
 

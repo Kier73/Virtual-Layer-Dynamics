@@ -522,7 +522,13 @@ def evaluate_multivariate_capsule(
     b1 = [_parse_canonical_rational(v) for v in net["hidden_bias"]]
     w2 = [[_parse_canonical_rational(v) for v in row] for row in net["output_weight"]]
     b2 = [_parse_canonical_rational(v) for v in net["output_bias"]]
-    if not w1 or len(qx) != len(w1[0]):
+    spec_obj = capsule.get("source_spec")
+    expected_dim = (
+        int(spec_obj["input_dim"])
+        if isinstance(spec_obj, Mapping) and isinstance(spec_obj.get("input_dim"), int) and not isinstance(spec_obj.get("input_dim"), bool)
+        else (len(w1[0]) if w1 else -1)
+    )
+    if expected_dim < 1 or len(qx) != expected_dim or any(len(row) != expected_dim for row in w1):
         raise ProceduralModelError("Input vector length disagrees with multivariate capsule input_dim.")
 
     hidden = [
@@ -740,19 +746,22 @@ def verify_multivariate_capsule(
     if isinstance(raw_d, bool) or not isinstance(raw_d, int) or not (1 <= raw_d <= 256):
         raise ProceduralModelError("Untrusted multivariate capsule input_dim must be an integer in [1, 256].")
     d = raw_d
-    a_spec = [[_parse_canonical_rational(v) for v in row] for row in spec["base_linear"]]
-    c_spec = [_parse_canonical_rational(v) for v in spec["base_bias"]]
-    m_out = len(c_spec)
-    if m_out < 1 or len(a_spec) != m_out or any(len(row) != d for row in a_spec):
-        raise ProceduralModelError("Invalid base_linear / base_bias dimensions in multivariate capsule spec.")
-    hinges_spec = [
-        (
-            tuple(_parse_canonical_rational(v) for v in h["normal"]),
-            _parse_canonical_rational(v) if isinstance((v := h["offset"]), str) else _parse_canonical_rational(v),
-            tuple(_parse_canonical_rational(v) for v in h["weights"]),
-        )
-        for h in spec["hinges"]
-    ]
+    try:
+        a_spec = [[_parse_canonical_rational(v) for v in row] for row in spec["base_linear"]]
+        c_spec = [_parse_canonical_rational(v) for v in spec["base_bias"]]
+        m_out = len(c_spec)
+        if m_out < 1 or len(a_spec) != m_out or any(len(row) != d for row in a_spec):
+            raise ProceduralModelError("Invalid base_linear / base_bias dimensions in multivariate capsule spec.")
+        hinges_spec = [
+            (
+                tuple(_parse_canonical_rational(v) for v in h["normal"]),
+                _parse_canonical_rational(v) if isinstance((v := h["offset"]), str) else _parse_canonical_rational(v),
+                tuple(_parse_canonical_rational(v) for v in h["weights"]),
+            )
+            for h in spec["hinges"]
+        ]
+    except (KeyError, TypeError) as exc:
+        raise ProceduralModelError(f"Malformed multivariate capsule source_spec structure: {exc}") from exc
     for n_vec_h, _beta_h, gamma_h in hinges_spec:
         if len(n_vec_h) != d or len(gamma_h) != m_out or all(v == 0 for v in n_vec_h):
             raise ProceduralModelError("Invalid hinge normal or output weight dimensions in multivariate capsule spec.")
@@ -760,10 +769,13 @@ def verify_multivariate_capsule(
     net = data["network"]
     if net.get("hidden_activation") != "relu":
         raise ProceduralModelError("Only exact ReLU hidden activation is verifiable over Q^d.")
-    w1 = [tuple(_parse_canonical_rational(v) for v in row) for row in net["hidden_weight"]]
-    b1 = [_parse_canonical_rational(v) for v in net["hidden_bias"]]
-    w2 = [[_parse_canonical_rational(v) for v in row] for row in net["output_weight"]]
-    b2 = [_parse_canonical_rational(v) for v in net["output_bias"]]
+    try:
+        w1 = [tuple(_parse_canonical_rational(v) for v in row) for row in net["hidden_weight"]]
+        b1 = [_parse_canonical_rational(v) for v in net["hidden_bias"]]
+        w2 = [[_parse_canonical_rational(v) for v in row] for row in net["output_weight"]]
+        b2 = [_parse_canonical_rational(v) for v in net["output_bias"]]
+    except (KeyError, TypeError) as exc:
+        raise ProceduralModelError(f"Malformed multivariate capsule network structure: {exc}") from exc
     if len(w1) != len(b1) or any(len(row) != d for row in w1) or len(w2) != m_out or any(len(r) != len(w1) for r in w2):
         raise ProceduralModelError("Invalid multivariate network dimensions.")
 

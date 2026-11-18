@@ -1026,27 +1026,38 @@ class HuggingFaceBPETokenizerGround:
             merge_ranks.setdefault(pair, rank)
         self._merge_ranks = merge_ranks
 
-        special_map: dict[str, int] = {}
+        added_all_map: dict[str, int] = {}
+        added_nonspecial_map: dict[str, int] = {}
+        added_id_to_token: dict[int, str] = {}
         special_ids: dict[int, str] = {}
         for item in raw_config.get("added_tokens", ()):
             if not isinstance(item, Mapping):
                 continue
             tid = int(item["id"])
             content = str(item["content"])
-            special_map[content] = tid
-            special_ids[tid] = content
-        self._special_map = special_map
+            is_special = bool(item.get("special", False))
+            added_all_map[content] = tid
+            added_id_to_token[tid] = content
+            if is_special:
+                special_ids[tid] = content
+            else:
+                added_nonspecial_map[content] = tid
+        self._added_all_map = added_all_map
+        self._added_nonspecial_map = added_nonspecial_map
+        self._added_id_to_token = added_id_to_token
         self._special_ids = special_ids
-        # Sort special tokens longest-first for deterministic greedy matching
-        self._special_tokens_sorted = tuple(sorted(special_map.keys(), key=lambda s: (-len(s), s)))
-        self.vocab_size = max(max(self._id_to_token.keys(), default=-1), max(special_ids.keys(), default=-1)) + 1
+        # Sort added tokens longest-first for deterministic greedy matching
+        self._added_all_sorted = tuple(sorted(added_all_map.keys(), key=lambda s: (-len(s), s)))
+        self._added_nonspecial_sorted = tuple(sorted(added_nonspecial_map.keys(), key=lambda s: (-len(s), s)))
+        self.vocab_size = max(max(self._id_to_token.keys(), default=-1), max(added_id_to_token.keys(), default=-1)) + 1
         self._bpe_cache: dict[str, tuple[int, ...]] = {}
         self.source_sha256 = source_sha256 or domain_digest(
             "vld.hf-tokenizer-config.v1",
             {
+                "added_count": len(added_all_map),
                 "merges_count": len(merge_ranks),
                 "norm": self._norm_form,
-                "special_count": len(special_map),
+                "special_count": len(special_ids),
                 "tokenizer_id": tokenizer_id,
                 "vocab_count": len(self._vocab),
             },
@@ -1146,7 +1157,9 @@ class HuggingFaceBPETokenizerGround:
         except UnicodeEncodeError as exc:
             raise ModelArtifactError(f"Non-UTF8 string rejected: {exc}") from exc
 
-        if not allow_special or not self._special_tokens_sorted:
+        active_sorted = self._added_all_sorted if allow_special else self._added_nonspecial_sorted
+        active_map = self._added_all_map if allow_special else self._added_nonspecial_map
+        if not active_sorted:
             return tuple(self._encode_ordinary_span(text))
 
         out: list[int] = []
@@ -1155,7 +1168,7 @@ class HuggingFaceBPETokenizerGround:
         while pos < n:
             best_idx = -1
             best_tok = ""
-            for st in self._special_tokens_sorted:
+            for st in active_sorted:
                 idx = text.find(st, pos)
                 if idx != -1 and (best_idx == -1 or idx < best_idx):
                     best_idx = idx
@@ -1167,7 +1180,7 @@ class HuggingFaceBPETokenizerGround:
                 break
             if best_idx > pos:
                 out.extend(self._encode_ordinary_span(text[pos:best_idx]))
-            out.append(self._special_map[best_tok])
+            out.append(active_map[best_tok])
             pos = best_idx + len(best_tok)
         return tuple(out)
 
@@ -1183,10 +1196,10 @@ class HuggingFaceBPETokenizerGround:
         for tid in token_ids:
             if isinstance(tid, bool) or not isinstance(tid, int):
                 raise ModelArtifactError(f"Invalid token ID {tid!r}.")
-            if tid in self._special_ids:
+            if tid in self._added_id_to_token:
                 _flush_bytes()
-                if not skip_special_tokens:
-                    parts.append(self._special_ids[tid])
+                if not (skip_special_tokens and tid in self._special_ids):
+                    parts.append(self._added_id_to_token[tid])
             elif tid in self._id_to_token:
                 tok_str = self._id_to_token[tid]
                 for ch in tok_str:
@@ -1242,6 +1255,8 @@ class HttpRangeSource:
         if not url.startswith(("http://", "https://")):
             raise ModelArtifactError(f"HttpRangeSource requires an http(s) URL, got {url!r}.")
         self.url = url
+        origin_parts = urllib.parse.urlsplit(self.url)
+        self._origin_key = (origin_parts.scheme.lower(), origin_parts.netloc.lower())
         self._resolved_url: str | None = None
         self._conn: http.client.HTTPConnection | None = None
         self._conn_host_key: tuple[str, str, int] | None = None
@@ -1269,24 +1284,46 @@ class HttpRangeSource:
         assert self._total_size is not None
         return self._total_size
 
+    def _headers_for_target(self, scheme: str, netloc: str, range_hdr: str) -> dict[str, str]:
+        same_origin = (scheme.lower(), netloc.lower()) == self._origin_key
+        out = {
+            k: v
+            for k, v in self._headers.items()
+            if same_origin or k.lower() != "authorization"
+        }
+        out["Host"] = netloc
+        out["Range"] = range_hdr
+        return out
+
     def _probe_size(self) -> None:
-        req = urllib.request.Request(self.url, headers={**self._headers, "Range": "bytes=0-7"})
-        with urllib.request.urlopen(req, timeout=self._timeout) as resp:
-            body = resp.read()
-            with self._lock:
-                self._resolved_url = resp.url
+        with self._lock:
+            target = self.url
+            for _ in range(6):
+                status, body, loc, resp_headers = self._fetch_via_keepalive(target, "bytes=0-7", return_headers=True)
+                if status in (301, 302, 303, 307, 308) and loc:
+                    target = urllib.parse.urljoin(target, loc)
+                    continue
+                self._resolved_url = target
                 self.requests_made += 1
                 self.bytes_transferred += len(body)
-                cr = resp.headers.get("Content-Range", "")
+                cr = resp_headers.get("content-range", "")
                 if "/" in cr:
                     self._total_size = int(cr.split("/")[-1].strip())
-                elif resp.status == 200:
-                    cl = resp.headers.get("Content-Length")
+                    return
+                if status == 200:
+                    cl = resp_headers.get("content-length")
                     self._total_size = int(cl) if cl is not None else len(body)
-                else:
-                    raise ModelArtifactError(f"Server did not advertise Content-Range total size for {self.url!r}.")
+                    return
+                raise ModelArtifactError(f"Server did not advertise Content-Range total size for {self.url!r} (HTTP {status}).")
+            raise ModelArtifactError(f"Too many HTTP redirects probing {self.url!r}.")
 
-    def _fetch_via_keepalive(self, target_url: str, range_hdr: str) -> tuple[int, bytes, str | None]:
+    def _fetch_via_keepalive(
+        self,
+        target_url: str,
+        range_hdr: str,
+        *,
+        return_headers: bool = False,
+    ) -> Any:
         parts = urllib.parse.urlsplit(target_url)
         scheme = parts.scheme.lower()
         host = parts.hostname or ""
@@ -1306,11 +1343,25 @@ class HttpRangeSource:
             )
             self._conn_host_key = key
 
-        self._conn.request("GET", path_q, headers={**self._headers, "Host": parts.netloc, "Range": range_hdr})
+        req_headers = self._headers_for_target(scheme, parts.netloc, range_hdr)
+        self._conn.request("GET", path_q, headers=req_headers)
         resp = self._conn.getresponse()
         loc = resp.getheader("Location")
+        hdrs = {k.lower(): v for k, v in resp.getheaders()} if return_headers else None
         data = resp.read()
+        if return_headers:
+            return resp.status, data, loc, hdrs
         return resp.status, data, loc
+
+    def _follow_redirects_keepalive(self, initial_url: str, range_hdr: str, *, max_hops: int = 5) -> tuple[int, bytes, str]:
+        cur = initial_url
+        for _ in range(max_hops + 1):
+            status, data, loc = self._fetch_via_keepalive(cur, range_hdr)
+            if status in (301, 302, 303, 307, 308) and loc:
+                cur = urllib.parse.urljoin(cur, loc)
+                continue
+            return status, data, cur
+        raise ModelArtifactError(f"Too many HTTP redirects ({max_hops}) fetching {self.url!r}.")
 
     def read_range(self, offset: int, length: int) -> bytes:
         _strict_nonneg_int(offset, "offset")
@@ -1323,26 +1374,20 @@ class HttpRangeSource:
         for attempt in range(self._max_retries):
             try:
                 with self._lock:
+                    had_cached_redirect = self._resolved_url is not None and self._resolved_url != self.url
                     target = self._resolved_url or self.url
-                    status, data, loc = self._fetch_via_keepalive(target, range_hdr)
-                    if status in (301, 302, 303, 307, 308) and loc:
-                        resolved = urllib.parse.urljoin(target, loc)
-                        self._resolved_url = resolved
-                        status, data, _ = self._fetch_via_keepalive(resolved, range_hdr)
-                    elif status in (401, 403) and self._resolved_url is not None:
-                        # Presigned CDN URL expired -> re-resolve from origin URL
+                    status, data, final_url = self._follow_redirects_keepalive(target, range_hdr)
+                    if status in (400, 401, 403) and had_cached_redirect:
+                        # Presigned CDN URL expired -> re-resolve from origin URL with cross-origin auth isolation
                         self._resolved_url = None
                         self.close()
-                        req = urllib.request.Request(self.url, headers={**self._headers, "Range": range_hdr})
-                        with urllib.request.urlopen(req, timeout=self._timeout) as uresp:
-                            self._resolved_url = uresp.url
-                            status = uresp.status
-                            data = uresp.read()
+                        status, data, final_url = self._follow_redirects_keepalive(self.url, range_hdr)
                     if status not in (200, 206):
                         raise ModelArtifactError(f"HTTP status {status} on Range {range_hdr} for {self.url!r}.")
+                    self._resolved_url = final_url
                     self.requests_made += 1
                     self.bytes_transferred += len(data)
-                    if status == 200 and offset > 0:
+                    if status == 200 and (offset > 0 or len(data) > length):
                         data = data[offset : offset + length]
                     if len(data) != length:
                         raise ModelArtifactError(
@@ -1378,6 +1423,7 @@ class LazySafetensorsWeightGround:
         self._shard_sources = dict(shard_sources)
         self._tensor_to_shard = dict(tensor_to_shard)
         self.cache_store = cache_store
+        self._lock = threading.RLock()
         self._observed_shards: dict[str, SafetensorsShardObservation] = {}
         self._cached_manifests: dict[str, PagedByteManifest] = {}
         self.tensors_materialized = 0
@@ -1395,15 +1441,16 @@ class LazySafetensorsWeightGround:
         )
 
     def observe_shard(self, shard_name: str) -> SafetensorsShardObservation:
-        obs = self._observed_shards.get(shard_name)
-        if obs is not None:
+        with self._lock:
+            obs = self._observed_shards.get(shard_name)
+            if obs is not None:
+                return obs
+            if shard_name not in self._shard_sources:
+                raise ModelArtifactError(f"Unknown Safetensors shard {shard_name!r}.")
+            reader_fn, size_fn = self._shard_sources[shard_name]
+            obs = observe_safetensors_header(reader_fn, size_fn(), shard_name=shard_name)
+            self._observed_shards[shard_name] = obs
             return obs
-        if shard_name not in self._shard_sources:
-            raise ModelArtifactError(f"Unknown Safetensors shard {shard_name!r}.")
-        reader_fn, size_fn = self._shard_sources[shard_name]
-        obs = observe_safetensors_header(reader_fn, size_fn(), shard_name=shard_name)
-        self._observed_shards[shard_name] = obs
-        return obs
 
     def _locate_tensor(self, name: str) -> tuple[str, SafetensorsShardObservation, int, int]:
         t = self.space.tensor(name)
@@ -1430,17 +1477,18 @@ class LazySafetensorsWeightGround:
         remote_range_fetcher: Callable[[str, int, int], bytes] | None = None,
     ) -> bytes:
         _ = (store, remote_range_fetcher)
-        if self.cache_store is not None and name in self._cached_manifests:
-            return self.cache_store.read_bytes(self._cached_manifests[name])
-        shard_name, _obs, abs_off, byte_len = self._locate_tensor(name)
-        reader_fn, _ = self._shard_sources[shard_name]
-        raw = reader_fn(abs_off, byte_len)
-        if len(raw) != byte_len:
-            raise ModelArtifactError(f"Short Safetensors range read for {name!r}.")
-        self.tensors_materialized += 1
-        if self.cache_store is not None:
-            self._cached_manifests[name] = self.cache_store.put_bytes(raw)
-        return raw
+        with self._lock:
+            if self.cache_store is not None and name in self._cached_manifests:
+                return self.cache_store.read_bytes(self._cached_manifests[name])
+            shard_name, _obs, abs_off, byte_len = self._locate_tensor(name)
+            reader_fn, _ = self._shard_sources[shard_name]
+            raw = reader_fn(abs_off, byte_len)
+            if len(raw) != byte_len:
+                raise ModelArtifactError(f"Short Safetensors range read for {name!r}.")
+            self.tensors_materialized += 1
+            if self.cache_store is not None:
+                self._cached_manifests[name] = self.cache_store.put_bytes(raw)
+            return raw
 
     def read_tensor_slice_bytes(
         self,
@@ -1459,12 +1507,18 @@ class LazySafetensorsWeightGround:
             raise ModelArtifactError(f"Slice [{byte_offset}, {byte_offset + byte_length}) exceeds {name!r} byte_size {t.byte_size}.")
         if byte_length == 0:
             return b""
-        if self.cache_store is not None and name in self._cached_manifests:
-            return self.cache_store.read_range(self._cached_manifests[name], byte_offset, byte_length)
-        shard_name, _obs, abs_off, _ = self._locate_tensor(name)
-        reader_fn, _ = self._shard_sources[shard_name]
-        self.slice_reads_executed += 1
-        return reader_fn(abs_off + byte_offset, byte_length)
+        with self._lock:
+            if self.cache_store is not None and name in self._cached_manifests:
+                return self.cache_store.read_range(self._cached_manifests[name], byte_offset, byte_length)
+            shard_name, _obs, abs_off, _ = self._locate_tensor(name)
+            reader_fn, _ = self._shard_sources[shard_name]
+            raw = reader_fn(abs_off + byte_offset, byte_length)
+            if len(raw) != byte_length:
+                raise ModelArtifactError(
+                    f"Short Safetensors slice read for {name!r}: expected {byte_length} bytes, got {len(raw)}."
+                )
+            self.slice_reads_executed += 1
+            return raw
 
     def prefetch_tensors_coalesced(
         self,
@@ -1476,50 +1530,59 @@ class LazySafetensorsWeightGround:
         """Coalesce nearby tensor extents per shard into bounded streaming HTTP `206` spans into `cache_store`."""
         if self.cache_store is None:
             raise ModelArtifactError("prefetch_tensors_coalesced requires a configured M1 cache_store.")
-        by_shard: dict[str, list[tuple[int, int, str]]] = {}
-        for name in tensor_names:
-            if name in self._cached_manifests:
-                continue
-            sname, _obs, abs_off, blen = self._locate_tensor(name)
-            by_shard.setdefault(sname, []).append((abs_off, blen, name))
+        with self._lock:
+            by_shard: dict[str, list[tuple[int, int, str]]] = {}
+            for name in tensor_names:
+                if name in self._cached_manifests:
+                    continue
+                sname, _obs, abs_off, blen = self._locate_tensor(name)
+                by_shard.setdefault(sname, []).append((abs_off, blen, name))
 
-        spans_fetched = 0
-        for sname, items in sorted(by_shard.items()):
-            items.sort(key=lambda t: t[0])
-            reader_fn, _ = self._shard_sources[sname]
-            i = 0
-            while i < len(items):
-                span_start = items[i][0]
-                span_end = items[i][0] + items[i][1]
-                group = [items[i]]
-                j = i + 1
-                while j < len(items):
-                    nxt_start, nxt_len, _ = items[j]
-                    if nxt_start - span_end <= max_gap_bytes and (nxt_start + nxt_len - span_start) <= max_span_bytes:
-                        span_end = max(span_end, nxt_start + nxt_len)
-                        group.append(items[j])
-                        j += 1
-                    else:
-                        break
-                span_buf = memoryview(reader_fn(span_start, span_end - span_start))
-                spans_fetched += 1
-                for t_off, t_len, t_name in group:
-                    rel = t_off - span_start
-                    self._cached_manifests[t_name] = self.cache_store.put_bytes(bytes(span_buf[rel : rel + t_len]))
-                    self.tensors_materialized += 1
-                i = j
-        return spans_fetched
+            spans_fetched = 0
+            for sname, items in sorted(by_shard.items()):
+                items.sort(key=lambda t: t[0])
+                reader_fn, _ = self._shard_sources[sname]
+                i = 0
+                while i < len(items):
+                    span_start = items[i][0]
+                    span_end = items[i][0] + items[i][1]
+                    group = [items[i]]
+                    j = i + 1
+                    while j < len(items):
+                        nxt_start, nxt_len, _ = items[j]
+                        if nxt_start - span_end <= max_gap_bytes and (nxt_start + nxt_len - span_start) <= max_span_bytes:
+                            span_end = max(span_end, nxt_start + nxt_len)
+                            group.append(items[j])
+                            j += 1
+                        else:
+                            break
+                    expected_span_len = span_end - span_start
+                    raw_span = reader_fn(span_start, expected_span_len)
+                    if len(raw_span) != expected_span_len:
+                        raise ModelArtifactError(
+                            f"Short coalesced Safetensors span read on {sname!r}: expected {expected_span_len}, got {len(raw_span)}."
+                        )
+                    span_buf = memoryview(raw_span)
+                    spans_fetched += 1
+                    for t_off, t_len, t_name in group:
+                        rel = t_off - span_start
+                        self._cached_manifests[t_name] = self.cache_store.put_bytes(bytes(span_buf[rel : rel + t_len]))
+                        self.tensors_materialized += 1
+                    i = j
+            return spans_fetched
 
     def export_cached_manifests(self) -> dict[str, dict[str, Any]]:
-        return {k: m.to_dict() for k, m in sorted(self._cached_manifests.items())}
+        with self._lock:
+            return {k: m.to_dict() for k, m in sorted(self._cached_manifests.items())}
 
     def load_cached_manifests(self, manifests_by_name: Mapping[str, PagedByteManifest | Mapping[str, Any]]) -> None:
-        for name, m_raw in manifests_by_name.items():
-            t = self.space.tensor(name)
-            m = m_raw if isinstance(m_raw, PagedByteManifest) else PagedByteManifest.from_dict(m_raw)
-            if m.size_bytes != t.byte_size:
-                raise ModelArtifactError(f"Cached manifest byte_size mismatch for {name!r}.")
-            self._cached_manifests[name] = m
+        with self._lock:
+            for name, m_raw in manifests_by_name.items():
+                t = self.space.tensor(name)
+                m = m_raw if isinstance(m_raw, PagedByteManifest) else PagedByteManifest.from_dict(m_raw)
+                if m.size_bytes != t.byte_size:
+                    raise ModelArtifactError(f"Cached manifest byte_size mismatch for {name!r}.")
+                self._cached_manifests[name] = m
 
     @classmethod
     def from_local_checkpoint(
@@ -1558,8 +1621,14 @@ class LazySafetensorsWeightGround:
         idx_file = target / "model.safetensors.index.json"
         if idx_file.is_file():
             idx_raw = idx_file.read_bytes()
-            wmap = json.loads(idx_raw.decode("utf-8"))["weight_map"]
+            wmap = json.loads(idx_raw.decode("utf-8")).get("weight_map", {})
+            missing = [tname for tname in sorted(declared_names) if tname not in wmap]
+            if missing:
+                raise ModelArtifactError(f"Declared tensors missing from {idx_file}: {missing[:5]}")
             shard_names = sorted({str(s) for k, s in wmap.items() if k in declared_names})
+            for sn in shard_names:
+                if not (target / sn).is_file():
+                    raise ModelArtifactError(f"Referenced Safetensors shard {target / sn} does not exist.")
             return cls(
                 space=space,
                 source_pin=f"dir://{target.name}:{hashlib.sha256(idx_raw).hexdigest()}",

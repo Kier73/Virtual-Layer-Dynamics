@@ -626,16 +626,42 @@ class AffineKernelAttentionGround:
         body = {k: v for k, v in data.items() if k != "snapshot_digest"}
         if data.get("snapshot_digest") != domain_digest("vld.aks-snapshot.v1", body):
             raise ModelOrbitError("AffineKernelAttentionGround snapshot_digest mismatch.")
-        inst = cls(modulus_p=int(data["modulus_p"]), key_dim=int(data["key_dim"]), value_dim=int(data["value_dim"]))
+        raw_p = data.get("modulus_p")
+        raw_kd = data.get("key_dim")
+        raw_vd = data.get("value_dim")
+        raw_pl = data.get("prefix_length")
+        if any(isinstance(x, bool) or not isinstance(x, int) for x in (raw_p, raw_kd, raw_vd, raw_pl)) or int(raw_pl) < 0:  # type: ignore[arg-type]
+            raise ModelOrbitError("Corrupted integer metadata in AffineKernelAttentionGround snapshot.")
+        inst = cls(modulus_p=int(raw_p), key_dim=int(raw_kd), value_dim=int(raw_vd))  # type: ignore[arg-type]
         if data.get("ground_fingerprint") != inst.ground_fingerprint:
             raise ModelOrbitError("AffineKernelAttentionGround fingerprint mismatch.")
         if expected_head is not None and data.get("head_digest") != expected_head:
             raise ModelOrbitError("Restored AKS snapshot disagrees with trusted expected_head.")
-        s_mat = [[int(v) % inst.modulus_p for v in row] for row in data["state_s"]]
-        z_vec = [int(v) % inst.modulus_p for v in data["state_z"]]
-        if len(s_mat) != inst.key_dim + 1 or any(len(r) != inst.value_dim for r in s_mat) or len(z_vec) != inst.key_dim + 1:
-            raise ModelOrbitError("Corrupted AKS state tensor dimensions.")
-        inst.prefix_length = int(data["prefix_length"])
+        try:
+            s_mat = [
+                [
+                    v
+                    for v in row
+                    if not isinstance(v, bool) and isinstance(v, int) and 0 <= v < inst.modulus_p
+                ]
+                for row in data["state_s"]
+            ]
+            z_vec = [
+                v
+                for v in data["state_z"]
+                if not isinstance(v, bool) and isinstance(v, int) and 0 <= v < inst.modulus_p
+            ]
+        except (KeyError, TypeError) as exc:
+            raise ModelOrbitError(f"Corrupted AKS state tensors: {exc}") from exc
+        if (
+            len(s_mat) != inst.key_dim + 1
+            or any(len(r) != inst.value_dim for r in s_mat)
+            or any(len(r) != len(orig_r) for r, orig_r in zip(s_mat, data["state_s"]))
+            or len(z_vec) != inst.key_dim + 1
+            or len(z_vec) != len(data["state_z"])
+        ):
+            raise ModelOrbitError("Corrupted AKS state tensor dimensions or out-of-field residues.")
+        inst.prefix_length = int(raw_pl)  # type: ignore[arg-type]
         inst.head_digest = str(data["head_digest"])
         inst._state_s = s_mat
         inst._state_z = z_vec

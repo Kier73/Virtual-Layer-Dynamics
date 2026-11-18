@@ -19,6 +19,7 @@ pins to defeat rollback and substituted-root attacks.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -157,6 +158,10 @@ def execute_room_on_realizer(intention: Mapping[str, Any], realizer: str) -> int
         return int(val)
 
     if realizer == "subprocess-rehomed":
+        pkg_src_root = str(Path(__file__).resolve().parents[2])
+        sub_env = dict(os.environ)
+        existing_pp = sub_env.get("PYTHONPATH", "")
+        sub_env["PYTHONPATH"] = f"{pkg_src_root}{os.pathsep}{existing_pp}" if existing_pp else pkg_src_root
         intent_digest = domain_digest("vld.room-intention.v1", dict(intention))
         with tempfile.TemporaryDirectory() as td:
             state_file = Path(td) / "room_rehome.json"
@@ -174,7 +179,7 @@ doc = {{**body, "state_digest": domain_digest("vld.room-rehome-state.v1", body)}
 Path({str(state_file)!r}).write_bytes(canonical_bytes(doc))
 os._exit(95)
 """
-            p1 = subprocess.run([sys.executable, "-c", code_kill], capture_output=True, text=True)
+            p1 = subprocess.run([sys.executable, "-c", code_kill], env=sub_env, capture_output=True, text=True)
             if p1.returncode != 95:
                 raise RoomError(f"Expected simulated hard-kill exit 95, got {p1.returncode}: {p1.stderr}")
 
@@ -195,7 +200,7 @@ law = AffineOrbitLaw({a}, {c}, {m})
 final_v = law.navigate(int(st["mid"]), {n} - done).value
 print(json.dumps({{"value": final_v}}))
 """
-            p2 = subprocess.run([sys.executable, "-c", code_resume], capture_output=True, text=True, check=True)
+            p2 = subprocess.run([sys.executable, "-c", code_resume], env=sub_env, capture_output=True, text=True, check=True)
             return int(parse_strict_json(p2.stdout.strip())["value"])
 
     raise RoomError(f"Unsupported room realizer {realizer!r}.")
