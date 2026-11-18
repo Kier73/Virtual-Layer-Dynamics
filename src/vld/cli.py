@@ -25,10 +25,15 @@ from vld.accel import (
     hc_split_sinkhorn,
 )
 from vld.agents import (
+    DirectedSubagentDevelopmentLoop,
     HypervisorRefusalError,
     InLayerModelAgent,
     ReceiverHypervisor,
+    SubagentEngineeringTask,
+    SubagentProposalOption,
+    build_compact_hosted_subagent_fixture,
     create_default_exploration_grant,
+    create_subagent_grant,
 )
 from vld.arbitration import (
     ContinuousArbitrationService,
@@ -42,6 +47,7 @@ from vld.arbitration import (
 from vld.authority import (
     CausalOrder,
     CrossSchedulerComparisonError,
+    Ed25519KeyPair,
     QuorumAuthorityMember,
     QuorumEquivocationError,
     QuorumLineageCoordinator,
@@ -50,8 +56,18 @@ from vld.authority import (
     RollbackDetectedError,
     TemporalCoordinate,
     VectorClock,
+    verify_ed25519_hex,
 )
 from vld.canonical import canonical_bytes, canonical_json, domain_digest, parse_strict_json
+from vld.compiler import (
+    AuthorityPolicy,
+    EffectLedger,
+    EffectSemantics,
+    IntentExpr,
+    IntentionSpec,
+    IntentionToRealizationCompiler,
+    ObservationContract,
+)
 from vld.continuous import (
     ContinuousStageSpec,
     ContinuousSystemError,
@@ -86,7 +102,10 @@ from vld.ground import (
     propose_modular_progression,
 )
 from vld.independent_audit import (
+    ed25519_verify_standalone,
     verify_continuity_receipt_chain_standalone,
+    verify_precision_decision_bundle_standalone,
+    verify_sheaf_consistency_bundle_standalone,
     verify_snc_1d_capsule_standalone,
     verify_transit_packet_receipts_standalone,
 )
@@ -752,6 +771,96 @@ def run_self_verification() -> dict[str, Any]:
     assert "w.nested" in a_rep.selected_workers and len(a_rep.pipeline_result.final_continuity_digest) == 64
     checks["phase9_fluid_transit_arbitration_and_independent_audit"] = 18
 
+    # Phase 10: RFC 8032 Ed25519, Intention-to-Realization Compiler, Sheaf H^1, Precision Cert, CKA, Git v2 & Subagents
+    from vld.models import (
+        CenteredGramRelationalSketch,
+        ErrorEnclosureCertificate,
+        LayerErrorStep,
+        certify_logit_margin_invariance,
+        compare_relational_sketches,
+    )
+    from vld.navigation import CellularSheaf
+    from vld.substrates import GitPackGraphGround, GitSmartHTTPFixtureServer
+
+    p10_kp = Ed25519KeyPair.from_seed(
+        "vld.verify.ed", bytes.fromhex("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")
+    )
+    p10_sig = p10_kp.sign_hex(b"")
+    assert verify_ed25519_hex(p10_kp.public_key_hex, b"", p10_sig)
+    assert ed25519_verify_standalone(p10_kp.public_key_hex, b"", p10_sig)
+
+    p10_comp = IntentionToRealizationCompiler(effect_ledger=EffectLedger(HashChainedJournal()))
+    p10_expr = IntentExpr.iterate_affine(IntentExpr.var("x"), a=5, b=13, steps=10**9 + 3, modulus=256)
+    p10_plan = p10_comp.compile(
+        IntentionSpec("verify.intent", p10_expr, ObservationContract("int_vector"), AuthorityPolicy("verify.lin"))
+    )
+    p10_ir = p10_comp.verify_interchangeable_realizations(p10_plan, {"x": [7, 29]})
+    assert p10_ir["status"] == "INTERCHANGEABLE_VERIFIED" and len(p10_ir["backends_verified"]) == 3
+
+    p10_sheaf = CellularSheaf("verify.sheaf", field="Fp", modulus=97)
+    for sv in ("u0", "u1", "u2"):
+        p10_sheaf.add_observer(sv, 1)
+    p10_sheaf.add_restriction_edge("e01", source_observer="u0", target_observer="u1", source_map=[[1]], target_map=[[1]], offset=[4])
+    p10_sheaf.add_restriction_edge("e12", source_observer="u1", target_observer="u2", source_map=[[1]], target_map=[[1]], offset=[9])
+    p10_sheaf.add_restriction_edge("e20", source_observer="u2", target_observer="u0", source_map=[[1]], target_map=[[1]], offset=[5])
+    p10_sr = p10_sheaf.solve_global_section()
+    assert not p10_sr.consistent and verify_sheaf_consistency_bundle_standalone(p10_sr.to_bundle_dict())["status"] == "VERIFIED"
+
+    p10_enc = ErrorEnclosureCertificate.propagate(
+        "verify.prec", [LayerErrorStep("l0", Fraction("98/100"), Fraction("1/2000"))], initial_error_radius=Fraction("1/5000")
+    )
+    p10_pv = certify_logit_margin_invariance([4.0, 1.0], p10_enc, head_max_row_l2=Fraction(1))
+    assert p10_pv.certified_invariant and verify_precision_decision_bundle_standalone(p10_pv.to_bundle_dict())["status"] == "VERIFIED"
+
+    p10_ska = CenteredGramRelationalSketch.from_hidden_states("ma", [[1.0, 0.2], [-0.3, 0.9], [0.5, -0.7], [-0.8, -0.2]])
+    p10_skb = CenteredGramRelationalSketch.from_hidden_states("mb", [[1.0, 0.2, 0.0], [-0.3, 0.9, 0.0], [0.5, -0.7, 0.0], [-0.8, -0.2, 0.0]])
+    assert abs(compare_relational_sketches(p10_ska, p10_skb).linear_cka - 1.0) < 1e-9
+
+    with GitSmartHTTPFixtureServer(mode="delta") as git_srv:
+        git_g = GitPackGraphGround(git_srv.base_url)
+        git_refs = git_g.observe_refs()
+        git_cert = git_g.qualify_graph_delta_operator(
+            base_oid=git_refs["refs/tags/v0.1"], target_oid=git_refs["refs/heads/main"]
+        )
+        assert git_cert.delta_pack_bytes < git_cert.full_closure_pack_bytes
+
+    p10_hyp = ReceiverHypervisor("verify.subagent.hyp")
+    p10_hyp.register_agent(create_subagent_grant("sa.0"))
+    p10_sa = build_compact_hosted_subagent_fixture("sa.0", p10_hyp)
+    p10_task = SubagentEngineeringTask(
+        "verify.sa.task",
+        "orbit_identifiability",
+        "Choose certified df>=1 progression over 3-sample decoy.",
+        (
+            SubagentProposalOption(
+                "opt.certified",
+                "certify_orbit",
+                "certify 6-sample progression",
+                Fraction(3),
+                Fraction(1),
+                Fraction(9, 10),
+                Fraction(1),
+                "pat.good",
+                lambda: {"admitted": True},
+            ),
+            SubagentProposalOption(
+                "opt.decoy",
+                "decoy_3sample",
+                "accept 3-sample unwrapped",
+                Fraction(0),
+                Fraction(0),
+                Fraction(1, 10),
+                Fraction(0),
+                "pat.decoy",
+                lambda: (_ for _ in ()).throw(ValueError("underdetermined_decoy")),
+            ),
+        ),
+    )
+    p10_loop = DirectedSubagentDevelopmentLoop("verify.loop", [p10_sa])
+    p10_ev = p10_loop.run_development_rounds([[p10_task], [p10_task]])
+    assert p10_ev.final_acceptance_rate == 1.0 and p10_ev.standalone_audit["status"] == "VERIFIED"
+    checks["phase10_compiler_asymmetric_sheaf_precision_git_and_subagents"] = 16
+
     return {
         "accelerators": {
             "native_rust_cdll": get_native_accelerator().available,
@@ -798,6 +907,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     arb_cmd.add_argument("--cycles", type=int, default=2, help="Number of arbitration cycles to execute (default: 2).")
     arb_cmd.add_argument("--interval-sec", type=float, default=0.0, help="Pause between cycles in seconds for continuous service mode.")
 
+    comp_cmd = sub.add_parser("compile", help="Compile & verify interchangeable realizations via ProofProducingEGraph + Ed25519 quorum.")
+    comp_cmd.add_argument("--horizon", type=int, default=10**12 + 7, help="Target affine iteration horizon.")
+    comp_cmd.add_argument("--seed", type=int, default=19, help="Input state seed in [0, 256).")
+
+    sa_cmd = sub.add_parser("subagent", help="Run a multi-round directed VLD-hosted model subagent calibration & upgrade loop.")
+    sa_cmd.add_argument("--rounds", type=int, default=2, help="Number of closed-loop subagent improvement rounds.")
+
     serve = sub.add_parser("serve", help="Host a live HTTP/1.1 Information-Flow Vantage Node.")
     serve.add_argument("--host", type=str, default="127.0.0.1", help="Bind address (default: 127.0.0.1).")
     serve.add_argument("--port", type=int, default=8730, help="Bind port (default: 8730).")
@@ -829,7 +945,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "vld.agents (ProofGround hypergraph, ReceiverHypervisor ARBITRATE_MODEL/CAS, InLayerModelAgent & ContinuousLayerBuilderAgent)",
                 "vld.continuous (quorum-fenced crash-resumable ContinuousVirtualSystem with genesis/spec binding, independent verifiers & physical telemetry)",
                 "vld.arbitration (multi-source model arbitration, recursive InLayerMetaArbitratorModel, ContinuousArbitrationService & IdeaLedger)",
-                "vld.independent_audit (standalone zero-import cryptographic & mathematical receipt/capsule verifier)",
+                "vld.compiler (IntentionToRealizationCompiler, ProofProducingEGraph with standalone rewrite checker & EffectLedger)",
+                "vld.independent_audit (standalone zero-import verifier for Ed25519/HMAC receipts, rewrite proofs, sheaf H^1, precision & SNC)",
             ],
             "package": "virtual-layer-dynamics",
             "repository": "https://github.com/Kier73/Virtual-Layer-Dynamics",
@@ -926,6 +1043,82 @@ def main(argv: Sequence[str] | None = None) -> int:
             "status": "PASS",
         }
         print(json.dumps(summary, indent=2, sort_keys=True))
+        return 0
+
+    if args.command == "compile":
+        if args.horizon < 0:
+            parser.error("--horizon must be non-negative.")
+        comp = IntentionToRealizationCompiler()
+        ex = IntentExpr.iterate_affine(IntentExpr.var("x"), a=5, b=13, steps=args.horizon, modulus=256)
+        plan = comp.compile(IntentionSpec("cli.orbit", ex, ObservationContract("int_vector"), AuthorityPolicy("cli.lin")))
+        rep = comp.verify_interchangeable_realizations(plan, {"x": [args.seed % 256]})
+        print(
+            json.dumps(
+                {
+                    "admitted_observation": rep["admitted_observation"],
+                    "backends_verified": rep["backends_verified"],
+                    "candidate_count": rep["candidate_count"],
+                    "intention_fingerprint": rep["intention_fingerprint"],
+                    "pareto_selected": rep["pareto_selected"],
+                    "status": rep["status"],
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if args.command == "subagent":
+        if args.rounds <= 0:
+            parser.error("--rounds must be positive.")
+        hyp = ReceiverHypervisor("cli.subagent.hypervisor")
+        hyp.register_agent(create_subagent_grant("subagent.alpha"))
+        sa = build_compact_hosted_subagent_fixture("subagent.alpha", hyp)
+        task = SubagentEngineeringTask(
+            "cli.shortcut_vs_decoy",
+            "orbit_certification",
+            "Select identifiable >=4-sample law and reject 3-sample unwrapped decoy.",
+            (
+                SubagentProposalOption(
+                    "prop.certified_law",
+                    "certify_orbit_shortcut",
+                    "probe 6 points and certify progression",
+                    Fraction(3),
+                    Fraction(1),
+                    Fraction(95, 100),
+                    Fraction(1),
+                    "sig.certified",
+                    lambda: {"admitted": True, "shortcut_horizon": 10**12},
+                ),
+                SubagentProposalOption(
+                    "prop.decoy_3pt",
+                    "accept_unwrapped_decoy",
+                    "accept 3 points without wrap",
+                    Fraction(0),
+                    Fraction(0),
+                    Fraction(1, 10),
+                    Fraction(0),
+                    "sig.decoy3",
+                    lambda: (_ for _ in ()).throw(ValueError("refused_df_zero_decoy")),
+                ),
+            ),
+        )
+        loop = DirectedSubagentDevelopmentLoop("cli.loop", [sa])
+        ev = loop.run_development_rounds([[task] for _ in range(args.rounds)])
+        print(
+            json.dumps(
+                {
+                    "continuity_digest": ev.continuity_digest,
+                    "final_acceptance_rate": ev.final_acceptance_rate,
+                    "initial_acceptance_rate": ev.initial_acceptance_rate,
+                    "quorum_public_keys": dict(ev.quorum_public_keys),
+                    "standalone_audit": dict(ev.standalone_audit),
+                    "subagent_ids": list(ev.subagent_ids),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
         return 0
 
     if args.command == "navigate":

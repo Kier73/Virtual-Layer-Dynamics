@@ -249,14 +249,21 @@ class TransformerLayerRealizer:
         store: PagedObjectStore | None = None,
         remote_range_fetcher: Callable[[str, int, int], bytes] | None = None,
         engine: NumericEngine | None = None,
+        cache_decoded_weights: bool = False,
     ) -> None:
         self.arch = arch
         self.snapshot = snapshot
         self.store = store
         self.remote_range_fetcher = remote_range_fetcher
         self.engine = engine if engine is not None else NumericEngine("auto")
+        self.cache_decoded_weights = bool(cache_decoded_weights)
+        self._decoded_nd_cache: dict[str, Any] = {}
+        self._decoded_py_cache: dict[str, Any] = {}
 
     def _load_tensor(self, name: str, loaded_log: list[str]) -> Any:
+        if self.cache_decoded_weights and name in self._decoded_py_cache:
+            loaded_log.append(name)
+            return self._decoded_py_cache[name]
         t_space = self.snapshot.space.tensor(name)
         raw = self.snapshot.read_tensor_bytes(
             name,
@@ -264,9 +271,15 @@ class TransformerLayerRealizer:
             remote_range_fetcher=self.remote_range_fetcher,
         )
         loaded_log.append(name)
-        return decode_shaped_tensor(raw, t_space.dtype, t_space.shape, use_numpy=self.engine.uses_numpy)
+        dec = decode_shaped_tensor(raw, t_space.dtype, t_space.shape, use_numpy=self.engine.uses_numpy)
+        if self.cache_decoded_weights:
+            self._decoded_py_cache[name] = dec
+        return dec
 
     def _load_tensor_nd(self, name: str, loaded_log: list[str]) -> Any:
+        if self.cache_decoded_weights and name in self._decoded_nd_cache:
+            loaded_log.append(name)
+            return self._decoded_nd_cache[name]
         t_space = self.snapshot.space.tensor(name)
         raw = self.snapshot.read_tensor_bytes(
             name,
@@ -275,9 +288,13 @@ class TransformerLayerRealizer:
         )
         loaded_log.append(name)
         try:
-            return decode_tensor_ndarray(raw, t_space.dtype, t_space.shape)
+            arr = decode_tensor_ndarray(raw, t_space.dtype, t_space.shape)
         except ValueError as exc:
             raise RealizerError(str(exc)) from exc
+        if self.cache_decoded_weights:
+            arr.setflags(write=False)
+            self._decoded_nd_cache[name] = arr
+        return arr
 
     def embed_tokens(self, token_ids: Sequence[int]) -> list[list[float]]:
         for tid in token_ids:
