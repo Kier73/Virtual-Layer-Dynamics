@@ -182,8 +182,8 @@ class HashChainedJournal:
             acquired = False
             try:
                 if os.name == "nt":
-                    if os.fstat(fd).st_size == 0:
-                        os.write(fd, b"\x00")
+                    # Win32 LockFile locks virtual byte range [0, 1) directly on a 0-byte file;
+                    # never write before locking (writing byte 0 without the lock races with a peer's mandatory byte lock!).
                     deadline = time.monotonic() + self._lock_timeout_s
                     delay = 0.001
                     while True:
