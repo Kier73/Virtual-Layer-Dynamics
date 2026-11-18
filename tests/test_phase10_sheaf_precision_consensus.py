@@ -221,3 +221,26 @@ def test_cross_model_relational_consensus_orthogonal_invariance_and_cone_control
     rep_jl = compare_relational_sketches(jl_256, jl_384, num_permutations=24)
     assert rep_jl.linear_cka > 0.75
     assert rep_jl.exceeds_permutation_null is True
+
+    # 4. Cross-statement pooled trajectories across variable BPE token lengths (eliminating RoPE position drift!)
+    stmt_factors = [[math.cos(0.8 * m + 0.5 * k) for k in range(5)] for m in range(8)]
+    # Model A splits statement m into (3 + m % 4) tokens in d=32; Model B splits into (5 + (2*m) % 5) tokens in d=48!
+    trajs_a = [
+        [
+            [sum(stmt_factors[m][k] * math.sin((k + 1) * (j + 1) * 0.21) for k in range(5)) + 2.0 * tok_i * (1 if j == 0 else 0) for j in range(32)]
+            for tok_i in range(3 + (m % 4))
+        ]
+        for m in range(8)
+    ]
+    trajs_b = [
+        [
+            [sum(stmt_factors[m][k] * math.sin((k + 1) * (j + 1) * 0.21) for k in range(5)) + 2.0 * tok_i * (1 if j == 1 else 0) for j in range(32)] + [0.0] * 16
+            for tok_i in range(5 + ((2 * m) % 5))
+        ]
+        for m in range(8)
+    ]
+    pool_a = CenteredGramRelationalSketch.from_pooled_trajectories("pool.a", trajs_a)
+    pool_b = CenteredGramRelationalSketch.from_pooled_trajectories("pool.b", trajs_b)
+    rep_pool = compare_relational_sketches(pool_a, pool_b, num_permutations=24)
+    assert rep_pool.linear_cka > 0.85
+    assert rep_pool.exceeds_permutation_null is True

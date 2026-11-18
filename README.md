@@ -43,6 +43,7 @@ For an $n$-step trajectory or $M \times N$ operator evaluation, Virtual Layer Dy
 - [**Research State & Lineage**](docs/RESEARCH_STATE_AND_LINEAGE.md) — Audited status of all four predecessor codebases, peer-audit verification & hardening record, live 7-model Hugging Face `206` & local execution measurements, and strict epistemic boundaries.
 - [**Master Development Plan**](docs/DEVELOPMENT_PLAN.md) — Phased architecture and gate-driven engineering roadmap (`Phase 0` through `Phase 9`).
 - [**Emergent Idea & Horizon Ledger**](docs/IDEA_LEDGER.md) — Living equational ledger of verified laws, negative controls, homomorphic latent consensus, sheaf-cohomological observer obstructions, and open multi-domain frontiers.
+- [**Examination & Research Direction B**](docs/EXAMINATION_AND_RESEARCH_DIRECTION_B.md) — Active operational examination (`v0.7.0`, `VRU-001`, `CMC-001`) and companion autopoietic research direction (`Compile_t ⊣ Discover_t`, residual-driven M1 LoRA subagents, extensible e-graph synthesis, syndrome-decoded observer sheaves, and speculative frontier realization).
 
 ---
 
@@ -56,7 +57,8 @@ Virtual-Layer-Dynamics/
 │   ├── MATHEMATICAL_FOUNDATIONS.md
 │   ├── RESEARCH_STATE_AND_LINEAGE.md
 │   ├── DEVELOPMENT_PLAN.md
-│   └── IDEA_LEDGER.md
+│   ├── IDEA_LEDGER.md
+│   └── EXAMINATION_AND_RESEARCH_DIRECTION_B.md
 ├── src/vld/
 │   ├── canonical.py                # Deterministic JSON & domain-separated SHA-256 addressing
 │   ├── triad.py                    # Kleene K_3 guards, Myhill-Nerode quotient & erasure entropy
