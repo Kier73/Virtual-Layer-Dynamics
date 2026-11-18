@@ -27,10 +27,17 @@ from pathlib import Path
 import re
 from typing import Any, Mapping, Sequence
 
+from vld.authority.asymmetric import (
+    AsymmetricAuthorityError,
+    Ed25519KeyPair,
+    ed25519_validate_public_key_hex,
+    verify_ed25519_hex,
+)
 from vld.canonical import canonical_bytes, domain_digest
 from vld.journal import GENESIS_PREV_DIGEST, HashChainedJournal
 
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
+_HEX128_RE = re.compile(r"[0-9a-f]{128}\Z")
 
 
 class QuorumError(ValueError):
@@ -59,6 +66,7 @@ class QuorumMembership:
 
     lineage_id: str
     member_ids: tuple[str, ...]
+    member_public_keys: Mapping[str, str] | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.lineage_id, str) or not self.lineage_id.strip():
@@ -71,6 +79,24 @@ class QuorumMembership:
         if len(set(cleaned)) != len(cleaned):
             raise QuorumError("QuorumMembership member_ids must be unique.")
         object.__setattr__(self, "member_ids", cleaned)
+        if self.member_public_keys is not None:
+            if not isinstance(self.member_public_keys, Mapping):
+                raise QuorumError("member_public_keys must be a mapping from member_id to 64-hex Ed25519 public key.")
+            pk_clean: dict[str, str] = {}
+            if set(str(k) for k in self.member_public_keys.keys()) != set(cleaned):
+                raise QuorumError("member_public_keys keys must exactly match member_ids.")
+            for mid in cleaned:
+                pk_hex = self.member_public_keys[mid]
+                try:
+                    ed25519_validate_public_key_hex(pk_hex)
+                except AsymmetricAuthorityError as exc:
+                    raise QuorumError(f"Invalid Ed25519 public key for member {mid!r}: {exc}") from exc
+                pk_clean[mid] = pk_hex
+            object.__setattr__(self, "member_public_keys", pk_clean)
+
+    @property
+    def signature_scheme(self) -> str:
+        return "ed25519-rfc8032" if self.member_public_keys is not None else "hmac-sha256"
 
     @property
     def size(self) -> int:
@@ -82,18 +108,32 @@ class QuorumMembership:
 
     @property
     def membership_digest(self) -> str:
+        if self.member_public_keys is None:
+            return domain_digest(
+                "vld.quorum-membership.v1",
+                {"lineage_id": self.lineage_id, "member_ids": list(self.member_ids)},
+            )
         return domain_digest(
             "vld.quorum-membership.v1",
-            {"lineage_id": self.lineage_id, "member_ids": list(self.member_ids)},
+            {
+                "lineage_id": self.lineage_id,
+                "member_ids": list(self.member_ids),
+                "member_public_keys": dict(sorted(self.member_public_keys.items())),
+                "signature_scheme": "ed25519-rfc8032",
+            },
         )
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        base: dict[str, Any] = {
             "lineage_id": self.lineage_id,
             "member_ids": list(self.member_ids),
             "membership_digest": self.membership_digest,
             "quorum_size": self.quorum_size,
         }
+        if self.member_public_keys is not None:
+            base["member_public_keys"] = dict(sorted(self.member_public_keys.items()))
+            base["signature_scheme"] = "ed25519-rfc8032"
+        return base
 
 
 @dataclass(frozen=True, slots=True)
@@ -178,22 +218,34 @@ class QuorumProposal:
 
 @dataclass(frozen=True, slots=True)
 class QuorumVote:
-    """Cryptographically authenticated member vote over one `QuorumProposal`."""
+    """Cryptographically authenticated member vote over one `QuorumProposal` (`hmac-sha256` or `ed25519-rfc8032`)."""
 
     proposal_digest: str
     lineage_id: str
     slot: int
     term: int
     voter_id: str
-    signature_hmac: str
+    signature_hmac: str = ""
+    signature_ed25519: str = ""
+    signature_scheme: str = "hmac-sha256"
 
     def __post_init__(self) -> None:
         if not isinstance(self.proposal_digest, str) or _SHA256_RE.fullmatch(self.proposal_digest) is None:
             raise QuorumError("proposal_digest must be a 64-char SHA-256 hex digest.")
-        if not isinstance(self.signature_hmac, str) or _SHA256_RE.fullmatch(self.signature_hmac) is None:
-            raise QuorumError("signature_hmac must be a 64-char HMAC-SHA256 hex digest.")
         if not isinstance(self.voter_id, str) or not self.voter_id.strip():
             raise QuorumError("voter_id must be non-empty.")
+        if self.signature_scheme == "hmac-sha256":
+            if not isinstance(self.signature_hmac, str) or _SHA256_RE.fullmatch(self.signature_hmac) is None:
+                raise QuorumError("signature_hmac must be a 64-char HMAC-SHA256 hex digest.")
+            if self.signature_ed25519:
+                raise QuorumError("signature_ed25519 must be empty when signature_scheme is hmac-sha256.")
+        elif self.signature_scheme == "ed25519-rfc8032":
+            if not isinstance(self.signature_ed25519, str) or _HEX128_RE.fullmatch(self.signature_ed25519) is None:
+                raise QuorumError("signature_ed25519 must be a 128-char RFC 8032 Ed25519 hex signature.")
+            if self.signature_hmac:
+                raise QuorumError("signature_hmac must be empty when signature_scheme is ed25519-rfc8032.")
+        else:
+            raise QuorumError(f"Unsupported QuorumVote signature_scheme {self.signature_scheme!r}.")
 
     @staticmethod
     def signing_bytes(proposal_digest: str, lineage_id: str, slot: int, term: int, voter_id: str) -> bytes:
@@ -209,6 +261,8 @@ class QuorumVote:
         )
 
     def verify_signature(self, secret: bytes) -> bool:
+        if self.signature_scheme != "hmac-sha256":
+            return False
         expected = hmac.new(
             secret,
             self.signing_bytes(self.proposal_digest, self.lineage_id, self.slot, self.term, self.voter_id),
@@ -216,7 +270,23 @@ class QuorumVote:
         ).hexdigest()
         return hmac.compare_digest(self.signature_hmac, expected)
 
+    def verify_public_key(self, public_key_hex: str) -> bool:
+        if self.signature_scheme != "ed25519-rfc8032":
+            return False
+        msg = self.signing_bytes(self.proposal_digest, self.lineage_id, self.slot, self.term, self.voter_id)
+        return verify_ed25519_hex(public_key_hex, msg, self.signature_ed25519)
+
     def to_dict(self) -> dict[str, Any]:
+        if self.signature_scheme == "ed25519-rfc8032":
+            return {
+                "lineage_id": self.lineage_id,
+                "proposal_digest": self.proposal_digest,
+                "signature_ed25519": self.signature_ed25519,
+                "signature_scheme": "ed25519-rfc8032",
+                "slot": self.slot,
+                "term": self.term,
+                "voter_id": self.voter_id,
+            }
         return {
             "lineage_id": self.lineage_id,
             "proposal_digest": self.proposal_digest,
@@ -228,8 +298,31 @@ class QuorumVote:
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> QuorumVote:
+        if not isinstance(data, Mapping):
+            raise QuorumError("Invalid QuorumVote fields.")
+        if data.get("signature_scheme") == "ed25519-rfc8032":
+            req_ed = {
+                "lineage_id",
+                "proposal_digest",
+                "signature_ed25519",
+                "signature_scheme",
+                "slot",
+                "term",
+                "voter_id",
+            }
+            if set(data.keys()) != req_ed:
+                raise QuorumError("Invalid Ed25519 QuorumVote fields.")
+            return cls(
+                proposal_digest=data["proposal_digest"],
+                lineage_id=data["lineage_id"],
+                slot=data["slot"],
+                term=data["term"],
+                voter_id=data["voter_id"],
+                signature_ed25519=data["signature_ed25519"],
+                signature_scheme="ed25519-rfc8032",
+            )
         req = {"lineage_id", "proposal_digest", "signature_hmac", "slot", "term", "voter_id"}
-        if not isinstance(data, Mapping) or set(data.keys()) != req:
+        if set(data.keys()) != req:
             raise QuorumError("Invalid QuorumVote fields.")
         return cls(
             proposal_digest=data["proposal_digest"],
@@ -258,16 +351,22 @@ class QuorumAuthorityMember:
     def __init__(
         self,
         member_id: str,
-        secret: bytes,
+        secret: bytes | None = None,
         *,
+        signing_key: Ed25519KeyPair | None = None,
         journal_path: str | Path | None = None,
     ) -> None:
         if not isinstance(member_id, str) or not member_id.strip():
             raise QuorumError("member_id must be non-empty.")
-        if not isinstance(secret, bytes) or len(secret) < 16:
+        if (secret is None) == (signing_key is None):
+            raise QuorumError("Supply exactly one of `secret` (HMAC bytes) or `signing_key` (Ed25519KeyPair).")
+        if secret is not None and (not isinstance(secret, bytes) or len(secret) < 16):
             raise QuorumError("Authority member secret must be bytes of length >= 16.")
+        if signing_key is not None and not isinstance(signing_key, Ed25519KeyPair):
+            raise QuorumError("signing_key must be an Ed25519KeyPair.")
         self.member_id = member_id
         self._secret = secret
+        self._signing_key = signing_key
         self.journal = HashChainedJournal(journal_path)
         self._highest_term: dict[str, int] = {}
         self._term_owners: dict[tuple[str, int], str] = {}
@@ -275,6 +374,21 @@ class QuorumAuthorityMember:
         self._highest_accepted: dict[tuple[str, int], AcceptedSlotRecord] = {}
         with self.journal.exclusive_guard():
             self._replay_journal_unlocked()
+
+    @classmethod
+    def from_ed25519_keypair(
+        cls,
+        member_id: str,
+        keypair: Ed25519KeyPair,
+        *,
+        journal_path: str | Path | None = None,
+    ) -> QuorumAuthorityMember:
+        """Create an asymmetric public-key quorum voter whose private seed never leaves this member."""
+        return cls(member_id, secret=None, signing_key=keypair, journal_path=journal_path)
+
+    @property
+    def public_key_hex(self) -> str | None:
+        return None if self._signing_key is None else self._signing_key.public_key_hex
 
     def _replay_journal_unlocked(self) -> None:
         self.journal.verify()
@@ -423,17 +537,26 @@ class QuorumAuthorityMember:
                         operation_id=proposal.operation_id,
                     )
 
-        sig = hmac.new(
-            self._secret,
-            QuorumVote.signing_bytes(
-                proposal.proposal_digest,
-                proposal.lineage_id,
-                proposal.slot,
-                proposal.term,
-                self.member_id,
-            ),
-            hashlib.sha256,
-        ).hexdigest()
+        msg_bytes = QuorumVote.signing_bytes(
+            proposal.proposal_digest,
+            proposal.lineage_id,
+            proposal.slot,
+            proposal.term,
+            self.member_id,
+        )
+        if self._signing_key is not None:
+            sig_ed = self._signing_key.sign_hex(msg_bytes)
+            return QuorumVote(
+                proposal_digest=proposal.proposal_digest,
+                lineage_id=proposal.lineage_id,
+                slot=proposal.slot,
+                term=proposal.term,
+                voter_id=self.member_id,
+                signature_ed25519=sig_ed,
+                signature_scheme="ed25519-rfc8032",
+            )
+        assert self._secret is not None
+        sig = hmac.new(self._secret, msg_bytes, hashlib.sha256).hexdigest()
         return QuorumVote(
             proposal_digest=proposal.proposal_digest,
             lineage_id=proposal.lineage_id,
@@ -463,9 +586,14 @@ class QuorumCommitCertificate:
         if len(set(voter_ids)) != len(voter_ids):
             raise QuorumError("Duplicate voter_id in QuorumCommitCertificate.")
         allowed = set(self.membership.member_ids)
+        exp_scheme = self.membership.signature_scheme
         for v in sorted_votes:
             if v.voter_id not in allowed:
                 raise QuorumError(f"Outsider voter {v.voter_id!r} not in QuorumMembership.")
+            if v.signature_scheme != exp_scheme:
+                raise QuorumError(
+                    f"Vote signature_scheme {v.signature_scheme!r} disagrees with membership {exp_scheme!r}."
+                )
             if (
                 v.proposal_digest != self.proposal.proposal_digest
                 or v.lineage_id != self.proposal.lineage_id
@@ -491,7 +619,26 @@ class QuorumCommitCertificate:
             "votes": [v.to_dict() for v in self.votes],
         }
 
-    def verify_signatures(self, member_secrets: Mapping[str, bytes]) -> bool:
+    def verify_signatures(
+        self,
+        member_secrets: Mapping[str, bytes] | None = None,
+        *,
+        member_public_keys: Mapping[str, str] | None = None,
+    ) -> bool:
+        if self.membership.signature_scheme == "ed25519-rfc8032":
+            pub_map = self.membership.member_public_keys
+            if pub_map is None:
+                return False
+            if member_public_keys is not None and dict(member_public_keys) != dict(pub_map):
+                return False
+            valid_ed = 0
+            for v in self.votes:
+                pk_hex = pub_map.get(v.voter_id)
+                if pk_hex is not None and v.verify_public_key(pk_hex):
+                    valid_ed += 1
+            return valid_ed >= self.membership.quorum_size
+        if member_secrets is None:
+            return False
         valid = 0
         for v in self.votes:
             sec = member_secrets.get(v.voter_id)
@@ -508,7 +655,12 @@ class QuorumCommitCertificate:
         if not isinstance(data, Mapping) or set(data.keys()) != req or data["schema"] != "vld.quorum-certificate.v1":
             raise QuorumError("Invalid QuorumCommitCertificate payload.")
         m_raw = data["membership"]
-        membership = QuorumMembership(lineage_id=m_raw["lineage_id"], member_ids=tuple(m_raw["member_ids"]))
+        pub_keys = m_raw.get("member_public_keys")
+        membership = QuorumMembership(
+            lineage_id=m_raw["lineage_id"],
+            member_ids=tuple(m_raw["member_ids"]),
+            member_public_keys=dict(pub_keys) if isinstance(pub_keys, Mapping) else None,
+        )
         proposal = QuorumProposal.from_dict(data["proposal"])
         votes = tuple(QuorumVote.from_dict(v) for v in data["votes"])
         return cls(
@@ -526,18 +678,28 @@ class QuorumLineageCoordinator:
         self,
         membership: QuorumMembership,
         members: Sequence[QuorumAuthorityMember],
-        member_secrets: Mapping[str, bytes],
+        member_secrets: Mapping[str, bytes] | None = None,
         *,
         ledger_path: str | Path | None = None,
     ) -> None:
         self.membership = membership
         self._members = {m.member_id: m for m in members}
-        self._secrets = dict(member_secrets)
+        self._secrets: dict[str, bytes] = dict(member_secrets) if member_secrets is not None else {}
+        if self.membership.signature_scheme == "hmac-sha256" and not self._secrets and members:
+            raise QuorumError("HMAC quorum requires member_secrets; use QuorumMembership(..., member_public_keys=...) for Ed25519.")
         self.ledger = HashChainedJournal(ledger_path)
         self._sealed_by_slot: dict[int, QuorumCommitCertificate] = {}
         self._locked_by_slot: dict[int, AcceptedSlotRecord] = {}
         with self.ledger.exclusive_guard():
             self._sync_from_ledger_unlocked()
+
+    def _verify_vote_against_membership(self, mid: str, vote: QuorumVote) -> bool:
+        if self.membership.signature_scheme == "ed25519-rfc8032":
+            pub_map = self.membership.member_public_keys or {}
+            pk_hex = pub_map.get(mid)
+            return pk_hex is not None and vote.verify_public_key(pk_hex)
+        sec = self._secrets.get(mid)
+        return sec is not None and vote.verify_signature(sec)
 
     def _unique_targets(self, active_member_ids: Sequence[str] | None) -> tuple[str, ...]:
         if active_member_ids is None:
@@ -761,8 +923,7 @@ class QuorumLineageCoordinator:
                     stale_err = exc
                     last_err = exc
                     continue
-                sec = self._secrets.get(mid)
-                if sec is None or not v.verify_signature(sec):
+                if not self._verify_vote_against_membership(mid, v):
                     raise QuorumError(f"Invalid signature returned by member {mid!r}.")
                 votes.append(v)
 

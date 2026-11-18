@@ -2,6 +2,19 @@ r"""Phase 3 — Receiver Authority, Quorum Sessions & Portable Provenance (`vld.
 
 from __future__ import annotations
 
+from vld.authority.asymmetric import (
+    AsymmetricAuthorityError,
+    ED25519_PKCS8_PREFIX,
+    ED25519_SPKI_PREFIX,
+    Ed25519KeyPair,
+    build_ed25519_quorum_identities,
+    ed25519_derive_public_key,
+    ed25519_sign,
+    ed25519_validate_public_key_hex,
+    ed25519_verify,
+    extract_public_key_map,
+    verify_ed25519_hex,
+)
 from vld.authority.quorum import (
     QuorumAuthorityMember,
     QuorumCommitCertificate,
@@ -39,10 +52,14 @@ from vld.authority.temporal import (
 )
 
 __all__ = [
+    "AsymmetricAuthorityError",
     "CausalOrder",
     "ClockBridgeReceipt",
     "ComputationalSession",
     "CrossSchedulerComparisonError",
+    "ED25519_PKCS8_PREFIX",
+    "ED25519_SPKI_PREFIX",
+    "Ed25519KeyPair",
     "EncounterEnvelope",
     "InterpretationEnvelope",
     "QuorumAuthorityMember",
@@ -64,8 +81,15 @@ __all__ = [
     "TemporalError",
     "VectorClock",
     "VirtualProcessor",
+    "build_ed25519_quorum_identities",
     "decode_temporal_f64",
     "decode_temporal_int",
+    "ed25519_derive_public_key",
+    "ed25519_sign",
+    "ed25519_validate_public_key_hex",
+    "ed25519_verify",
     "encode_temporal_f64",
     "encode_temporal_int",
+    "extract_public_key_map",
+    "verify_ed25519_hex",
 ]
