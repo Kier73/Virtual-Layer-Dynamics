@@ -14,7 +14,7 @@ from typing import Any
 
 import pytest
 
-from vld.accel import NumericEngine, encode_bf16_le
+from vld.accel import NumericEngine, encode_bf16_le, has_numpy
 from vld.agents import (
     AgentCapability,
     CapabilityGrant,
@@ -487,9 +487,9 @@ def test_multi_family_llama_qwen2_and_glm4_realizers_vs_fp64_oracle() -> None:
         oracle_logits = IndependentReferenceOracle.forward_full_sequence(arch, raw_map, toks)
 
         for mode in ("numpy", "stdlib"):
-            eng = NumericEngine(mode)
-            if mode == "numpy" and not eng.uses_numpy:
+            if mode == "numpy" and not has_numpy():
                 continue
+            eng = NumericEngine(mode)
             realizer = TransformerLayerRealizer(arch, snap_local, store=st, engine=eng)
             # Test prefill (first 3 tokens) + decode step (4th token with KV cache!)
             h_pre = realizer.embed_tokens(toks[:3])

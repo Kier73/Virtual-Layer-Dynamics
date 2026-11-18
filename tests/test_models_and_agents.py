@@ -714,11 +714,16 @@ def test_high_hinge_multivariate_arrangement_scalability_and_chamber_budget() ->
         verify_multivariate_capsule(bad_cap)
 
     # Large-magnitude RMSNorm float32 squaring overflow safety (2e19^2 overflows binary32 without float64 mean_sq!)
-    eng_np = NumericEngine("numpy")
+    from vld.accel import has_numpy
+
     eng_py = NumericEngine("stdlib")
     large_row = [[2.0e19, -2.0e19, 1.0e19, -1.0e19]]
     w_ones = [1.0, 1.0, 1.0, 1.0]
-    assert NumericEngine.max_abs_diff(eng_np.rms_norm_2d(large_row, w_ones, 1e-6), eng_py.rms_norm_2d(large_row, w_ones, 1e-6)) < 1e-5
+    out_py = eng_py.rms_norm_2d(large_row, w_ones, 1e-6)
+    assert all(math.isfinite(v) and abs(v) > 0.5 for v in out_py[0])
+    if has_numpy():
+        eng_np = NumericEngine("numpy")
+        assert NumericEngine.max_abs_diff(eng_np.rms_norm_2d(large_row, w_ones, 1e-6), out_py) < 1e-5
 
 
 def test_high_dimensional_ridge_algebra_aks_attention_hf_tokenizer_and_lazy_safetensors() -> None:
