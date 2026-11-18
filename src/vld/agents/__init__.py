@@ -29,6 +29,19 @@ from vld.agents.proof import (
     ProofObligation,
     VerifiedKernelReceipt,
 )
+from vld.agents.subagents import (
+    DirectedSubagentDevelopmentLoop,
+    HostedModelSubagent,
+    ScoredProposalRecord,
+    SubagentCalibrationMemory,
+    SubagentEngineeringTask,
+    SubagentError,
+    SubagentEvolutionReport,
+    SubagentProposalOption,
+    SubagentRoundOutcome,
+    build_compact_hosted_subagent_fixture,
+    create_subagent_grant,
+)
 
 __all__ = [
     "AgentCapability",
@@ -36,6 +49,8 @@ __all__ = [
     "CASConflictError",
     "CapabilityGrant",
     "ContinuousLayerBuilderAgent",
+    "DirectedSubagentDevelopmentLoop",
+    "HostedModelSubagent",
     "HypervisorRefusalError",
     "InLayerModelAgent",
     "InstalledLayerUpgrade",
@@ -47,7 +62,16 @@ __all__ = [
     "ProofHyperTransition",
     "ProofObligation",
     "ReceiverHypervisor",
+    "ScoredProposalRecord",
+    "SubagentCalibrationMemory",
+    "SubagentEngineeringTask",
+    "SubagentError",
+    "SubagentEvolutionReport",
+    "SubagentProposalOption",
+    "SubagentRoundOutcome",
     "VerifiedKernelReceipt",
+    "build_compact_hosted_subagent_fixture",
     "create_default_builder_grant",
     "create_default_exploration_grant",
+    "create_subagent_grant",
 ]

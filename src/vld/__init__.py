@@ -1,6 +1,6 @@
 r"""Virtual Layer Dynamics (`vld`) — Consolidated Computational Ground Architecture.
 
-Active consolidated package layers (`v0.6.0` — Phases 0 through 9 Complete & Hardened):
+Active consolidated package layers (`v0.7.0` — Phases 0 through 10 Complete & Hardened):
   - `vld.canonical`: Deterministic JSON & domain-separated SHA-256 addressing
   - `vld.triad`: Kleene $\mathcal{K}_3$ guards, epistemic tags, Myhill-Nerode quotient & erasure bits
   - `vld.ground`: `VirtualGroundSpec`, reversible `ByteLens`, dual-derivation `AffineOrbitLaw` & Pareto costs
@@ -29,7 +29,10 @@ Active consolidated package layers (`v0.6.0` — Phases 0 through 9 Complete & H
     representations, hosts, and physical paths (`GGE-001..007`)
   - `vld.arbitration`: Multi-source Virtual-Layer model arbitration (`DeepSeek`, `GLM`, `Qwen`, `Llama`/`SmolLM`,
     HTTP & procedural), recursive `InLayerMetaArbitratorModel`, `ContinuousArbitrationService`, and `IdeaLedger`
-  - `vld.independent_audit`: Standalone zero-import cryptographic & mathematical verifier for receipts & capsules
+  - `vld.compiler`: `IntentionToRealizationCompiler`, congruence-closed `ProofProducingEGraph` with standalone
+    rewrite proof verification, interchangeable multi-backend Pareto realization, and `EffectLedger`
+  - `vld.independent_audit`: Standalone zero-import cryptographic & mathematical verifier for Ed25519/HMAC receipts,
+    rewrite proofs, cellular sheaf $H^1$ obstructions, precision certificates, and neural capsules
 """
 
 from __future__ import annotations
@@ -77,7 +80,7 @@ from vld.triad import (
     require_determinate_branch,
 )
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"
 
 __all__ = [
     "ActionInformationSummary",

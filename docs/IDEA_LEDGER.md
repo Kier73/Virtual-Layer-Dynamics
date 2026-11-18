@@ -11,7 +11,7 @@ This living document records architectural needs, mathematical obstructions, neg
   A crash-recovery coordinator that validates only internal hash-chain continuity (`prev_continuity_digest`) without re-anchoring to the caller's requested input $x_0$ and stage sequence $(\mathcal{G}_0, \dots, \mathcal{G}_{m-1})$ admits **cross-computation replay**:
   $$H_{\text{chain}}(R_0, \dots, R_{k-1}) = \text{valid} \quad \not\implies \quad (R_0, \dots, R_{k-1}) \models (x_0', \mathcal{G}_0', \dots, \mathcal{G}_{m-1}').$$
 - **Resolution Implemented (`src/vld/continuous.py`, `src/vld/independent_audit.py`):**
-  Recovery at quorum high-water $hw \le m$ now enforces the 7-part inductive identity:
+  Recovery at quorum high-water $hw \le m$ enforces the 7-part inductive identity:
   $$g_0 = H_{\text{genesis}}(\text{pipeline\_id}, x_0), \quad \forall k < hw:\; R_k.\text{source\_fp} = g_k \;\land\; R_k.\text{target\_fp} = \mathcal{G}_k.\text{fp} \;\land\; R_k.\text{repr} = (\mathcal{G}_k.\text{in}, \mathcal{G}_k.\text{out}),$$
   paired with mandatory independent stage verifiers (`verify_fn`) and standalone zero-import verification (`verify_continuity_receipt_chain_standalone`).
 
@@ -41,46 +41,51 @@ This living document records architectural needs, mathematical obstructions, neg
 ## 4. [Verified] Bounded-Depth Self-Hosted Model Arbitration (`IDEA-004`)
 
 - **Origin:** `vld.arbitration.InLayerMetaArbitratorModel` + `AgentCapability.ARBITRATE_MODEL` (`v0.6.0`).
-- **Problem & Safety Invariant:**
-  Once models run inside the Virtual Layer and arbitrate other models running inside the Virtual Layer, unconstrained delegation creates two failure modes: self-confirming loops ($M_a \to M_a$) and unbounded budget/spawn amplification ($d \to \infty$).
 - **Enforced Hypervisor Law:**
   $$\operatorname{Admit}(M_a \xrightarrow{\text{arb}} M_b, d, c) \iff \mathtt{ARBITRATE\_MODEL} \in K_{M_a} \;\land\; M_a \neq M_b \;\land\; 1 \le d \le d_{\max}(M_a) \;\land\; c \le B_{\text{rem}}(M_a),$$
   where $M_a$'s utility ranking $U(c, s, b, h)$ is itself a whole-domain-verified $\mathbb{Q}^4$ multivariate ReLU capsule admitted into `ReceiverHypervisor`.
 
 ---
 
-## 5. [Hypothesis] Homomorphic Johnson-Lindenstrauss Cross-Model Latent Consensus (`IDEA-005`)
+## 5. [Verified Algebra & Empirical Boundary] Double-Centered Token-Gram & Sparse JL Cross-Model Relational Consensus (`IDEA-005`)
 
-- **Motivation:** Different frontier architectures (`DeepSeek-V4.1` $d=4096, m=4$, `GLM-5.3` $d=5120$, `GLM-Z1` $d=4096$, `Qwen3-0.6B` $d=1024$) have incompatible hidden dimensions and token vocabularies, forcing consensus to wait until full vocabulary decoding (`~152k` logits).
-- **Proposed Equation:**
-  Equip each model Ground $M_i$ with a shared seed-pinned sparse Rademacher sketch $\Pi_i \in \{-\tfrac{1}{\sqrt{r}}, 0, +\tfrac{1}{\sqrt{r}}\}^{r \times d_i}$ ($r = 128 \ll d_i$) mapping normalized pre-head states onto a common unit sphere $\mathbb{S}^{r-1}$, comparing relational Gram matrices across token positions $t, t'$:
-  $$G^{(M_i)}_{t, t'} = \langle \hat{h}^{(M_i)}_t, \hat{h}^{(M_i)}_{t'} \rangle \approx \langle \Pi_i \hat{h}^{(M_i)}_t, \Pi_i \hat{h}^{(M_i)}_{t'} \rangle, \qquad \Delta_{\text{rel}}(M_i, M_j) = \|G^{(M_i)} - G^{(M_j)}\|_F.$$
-  Because $G^{(M_i)} \in \mathbb{R}^{T \times T}$ is basis-invariant and dimension-independent, structural divergence between heterogeneous models can be detected mid-network in $O(T^2)$ bytes without transmitting hidden states or logits!
-- **Next Falsifiable Test:** Measure correlation between layer-wise Gram divergence $\Delta_{\text{rel}}(M_i, M_j)$ and downstream token disagreement across `Qwen3-0.6B`, `SmolLM2-135M`, `DeepSeek-R1-Distill-1.5B`, and `GLM-Z1-9B`.
+- **Implementation (`src/vld/models/consensus.py`, `In-Formation-Space` `CMC-001`):**
+  Transformer hidden states concentrate in a narrow positive cone ($\langle \hat{h}_t, \hat{h}_{t'} \rangle > 0$), inflating naive uncentered Gram similarity even between unrelated inputs. Double-centering $\bar{G} = H_T G H_T$ ($H_T = I_T - \tfrac{1}{T}\mathbf{1}\mathbf{1}^\top$) over exact or Achlioptas sparse JL projections $\Pi_i \in \{-\sqrt{3/r}, 0, +\sqrt{3/r}\}^{r \times d_i}$ yields orthogonal-basis-invariant **Linear CKA** across distinct dimensions $d_i \neq d_j$:
+  $$\operatorname{CKA}(M_i, M_j) = \frac{\langle \bar{G}^{(M_i)}, \bar{G}^{(M_j)} \rangle_F}{\|\bar{G}^{(M_i)}\|_F \, \|\bar{G}^{(M_j)}\|_F}, \qquad \Delta_{\text{rel}}(M_i, M_j) = \left\| \frac{\bar{G}^{(M_i)}}{\|\bar{G}^{(M_i)}\|_F} - \frac{\bar{G}^{(M_j)}}{\|\bar{G}^{(M_j)}\|_F} \right\|_F.$$
+- **Calibrated Epistemic Boundary:** Exact orthogonal invariance ($\operatorname{CKA}(H Q_1, H Q_2) = 1$) and permutation-null rejection of positive-cone anisotropy are proven; across genuinely distinct pretrained model families (`Qwen3-0.6B`, `SmolLM2-135M`, `DeepSeek-R1-Distill-1.5B`), relational CKA separates shared token geometry from token-shuffled nulls (`CMC-001`) when token spans are aligned, while differing BPE subword segmentations remain an explicit alignment precondition.
 
 ---
 
-## 6. [Hypothesis] Sheaf-Cohomological Obstruction Witness for Non-Gluable Observer Loops (`IDEA-006`)
+## 6. [Verified] Cellular Sheaf $H^1$ Fredholm Obstruction Witness for Non-Gluable Observer Loops (`IDEA-006`)
 
-- **Motivation:** Extending `CrossObserverCongruenceGate` (`vld.navigation`) and `In-Formation-Space` `CGS-001..010` (`Contextual Ground Sections`) to cyclic communication topologies $G = (V, E)$.
-- **Governing Equation:**
-  Let $\mathcal{F}$ be a cellular sheaf of local Virtual Grounds $\mathcal{F}(v)$ with affine edge restriction maps $\rho_{v \to e}: \mathcal{F}(v) \to \mathcal{F}(e)$ over $\mathbb{F}_p$ or $\mathbb{Q}$. A global consistent virtual state exists iff the coboundary $\delta^0 x = s_{\text{obs}}$ is solvable, i.e., iff the cycle holonomy / first cohomology class vanishes:
-  $$[\omega] \in H^1(G; \mathcal{F}) = \ker \delta^1 / \operatorname{im} \delta^0 = 0.$$
-  When $[\omega] \neq 0$ (e.g., clock drift loops or contradictory observer calibrations), the minimal non-zero cocycle support localizes the *exact faulty edge set* without trusting any single observer!
-- **Next Falsifiable Test:** Implement exact $\mathbb{F}_p$ / $\mathbb{Q}$ sheaf coboundary RREF in `vld.navigation` to emit constructive 1-cocycle obstruction certificates whenever distributed observers cannot be globally glued.
-
----
-
-## 7. [Hypothesis] Spectral Error Certificates Across Mixed `FP4`/`FP8`/Sinkhorn Depth (`IDEA-007`)
-
-- **Motivation:** `DeepSeek-V4.1` composes `F8_E4M3` (`UE8M0` scales), `MXFP4` (`E2M1` experts), and 20-step regularized Birkhoff-Sinkhorn `mHC` across 40+ layers.
-- **Proposed Bound:**
-  Track per-layer Lipschitz / column-$L_1$ contraction constants $\kappa_\ell = \|C^{(\ell)}\|_1 < 1$ alongside quantization perturbation radii $\varepsilon_\ell^{\text{FP4}}$ in transit so a cross-host `ModelOrbitCheckpoint` carries a rigorous deterministic interval enclosure:
-  $$\|\tilde{H}^{(L)} - H^{(L)}_{\text{exact}}\| \le \sum_{\ell=0}^{L-1} \left(\prod_{j=\ell+1}^{L-1} L_j\right) \varepsilon_\ell^{\text{quant}},$$
-  automatically escalating precision (fetching `BF16`/`FP8` fallback or refining active experts) *only* on tokens whose logit margin $\Delta z_{(1),(2)}$ falls inside the certified error ball!
+- **Implementation (`src/vld/navigation/sheaf.py`, `src/vld/independent_audit.py`):**
+  Over exact $\mathbb{Q}$ and $\mathbb{F}_p$, `CellularSheaf.solve_global_section()` runs Gauss-Jordan RREF on the augmented 0-coboundary $\bigl[\delta^0 \mid I_{N_1} \mid c\bigr]$:
+  - When $[c] = 0 \in H^1(G; \mathcal{F})$, constructs an exact global section $x^* \in \bigoplus_{v \in V}\mathcal{F}(v)$ satisfying $R_{v \to e} x^*_v - R_{u \to e} x^*_u = c_e$.
+  - When $[c] \neq 0 \in H^1(G; \mathcal{F})$, emits a sparse dual 1-cocycle witness $y \in \mathbb{K}^{N_1}$ verified in $O(N_1)$ arithmetic by `verify_sheaf_consistency_bundle_standalone` without trusting RREF:
+    $$(\delta^0)^\top y = \mathbf{0} \;\land\; \langle y, c \rangle = \omega_{\text{holonomy}} \neq 0,$$
+    pinpointing minimal inconsistent observer cycles (`conflicting_edge_ids = supp(y)`).
 
 ---
 
-## 8. [Open Frontier] Multi-Domain Federated Continuity Across Independent Physical Failure Domains (`IDEA-008`)
+## 7. [Verified] Proof-Carrying Rational Error Enclosures & Selective Logit-Margin Escalation (`IDEA-007`)
 
-- **Epistemic Boundary:** `PMC-001` (`In-Formation-Space/experiments/pretrained-model-crash-continuity`) now proves pinned 28-layer `Qwen/Qwen3-0.6B` execution beginning in an isolated process (`env.alpha.host`), surviving sudden `os._exit(73)` loss, streaming M1 pages over X.509 v3 mTLS (`MTLSPeerServer`) into an isolated replacement process (`env.beta.host`, rotated quorum `("q1", "q2")`), resuming with zero replayed layers, and matching PyTorch `FP32` logits while recording dual algebraic + physical telemetry, alongside `build_mtls_fabric_worker` in `vld.arbitration`. Extending this across *geographically separated physical hosts* (distinct ASNs, power/clock domains, and WAN links as explored in `IHP-005`/`IHP-006`) remains the next physical multi-host milestone.
+- **Implementation (`src/vld/models/precision_cert.py`, `src/vld/independent_audit.py`):**
+  Propagates exact upward-rounded rational bounds $\varepsilon^{(\ell+1)} = L_\ell \varepsilon^{(\ell)} + \eta_\ell \in \mathbb{Q}_{\ge 0}$ across quantized (`FP4`/`FP8`) and Sinkhorn `mHC` ($\|C^{(\ell)}\|_1 < 1$) stages, certifying top-1 token invariance via pairwise row-difference Cauchy-Schwarz:
+  $$\forall v \neq v_1:\; (\tilde{z}_{v_1} - \tilde{z}_v) - \|w_{v_1} - w_v\|_2 \varepsilon^{(L)} - 2\eta_{\text{head}} > 0 \implies \arg\max_v z_v^{\text{exact}} = v_1.$$
+  `CertifiedPrecisionEscalator` skips high-precision weight fetches on `CERTIFIED_LOW_PRECISION` tokens and escalates selectively on ambiguous margins.
+
+---
+
+## 8. [Verified Asymmetric Upgrade & Open WAN Frontier] Public-Key Federated Continuity (`IDEA-008` & `IDEA-009`)
+
+- **Asymmetric Trust Upgrade (`src/vld/authority/asymmetric.py`, `src/vld/compiler.py`, `VRU-001`):**
+  Closes the shared-secret evidence disclosure limitation noted in Peer Examination A by introducing pure-stdlib **RFC 8032 Ed25519** public-key quorum signatures (`signature_scheme="ed25519-rfc8032"`), cross-verified between Python `vld.independent_audit` and Node.js `node:crypto` with **zero private seeds** inside published receipt bundles, alongside the **Intention-to-Realization Compiler** (`ProofProducingEGraph` + standalone rewrite proof checker + `EffectLedger`).
+- **Remaining Physical Frontier:** Operating `VRU-001` across geographically distinct autonomous systems (multi-ASN power/clock/storage failure domains) without shared host kernels.
+
+---
+
+## 9. [Verified] Native Internet Git Merkle-DAG Operators & Directed Hosted-Model Subagent Co-Evolution (`IDEA-010`)
+
+- **Implementation (`src/vld/substrates/git_grounds.py`, `src/vld/agents/subagents.py`):**
+  1. **Git Wire Protocol v2 as Remote Set-Difference Computer:** `GitPackGraphGround` executes `ls-refs` and `fetch` (`want w` / `have h`) over HTTPS against unmodified Git Smart HTTP servers (including live GitHub), proving remote graph-difference computation $\operatorname{Reachable}(w) \setminus \operatorname{Reachable}(h)$ (`465 -> 15` objects, `34.3x` byte reduction on live `Virtual-Layer-Dynamics`) with full local `PACK` v2 + `OFS_DELTA`/`REF_DELTA` SHA-1 Merkle reconstruction and `ignore_have` bypass refusal.
+  2. **Closed-Loop Hosted Subagents:** `HostedModelSubagent` & `DirectedSubagentDevelopmentLoop` evaluate engineering proposals via M1-KV-forked teacher-forced Transformer log-likelihoods $\bar{\ell}_{\mathcal{M}}(a_k \mid D_t(\mathcal{H}_{<t}), \tau)$ paired with `ReceiverHypervisor`-verified $\mathbb{Q}^4$ calibration capsules $U_{\text{cal}}^{(t)}$, turning deterministic counterexample refusals into measurable multi-round subagent improvement.

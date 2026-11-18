@@ -46,7 +46,7 @@ For an $n$-step trajectory or $M \times N$ operator evaluation, Virtual Layer Dy
 
 ---
 
-## Consolidated Repository Layout (`v0.6.0` — Phases 0 through 9 Complete, Hardened & Live-Verified)
+## Consolidated Repository Layout (`v0.7.0` — Phases 0 through 10 Complete, Hardened & Live-Verified)
 
 ```text
 Virtual-Layer-Dynamics/
@@ -62,21 +62,22 @@ Virtual-Layer-Dynamics/
 │   ├── triad.py                    # Kleene K_3 guards, Myhill-Nerode quotient & erasure entropy
 │   ├── ground.py                   # VirtualGroundSpec, ByteLens, dual-derivation AffineOrbitLaw, Pareto cost
 │   ├── journal.py                  # Multi-process hash-chained receipt journal & idempotency fencing
-│   ├── independent_audit.py        # Standalone zero-import cryptographic & mathematical receipt/capsule auditor
+│   ├── compiler.py                 # Intention-to-Realization Compiler, ProofProducingEGraph & EffectLedger
+│   ├── independent_audit.py        # Standalone zero-import Ed25519/HMAC, rewrite, sheaf, precision & SNC auditor
 │   ├── signal/                     # Signal8, ModularRing & ExactRational backends, footprints, base-8 compiler
 │   ├── memory/                     # M1 PagedObjectStore (+ retention GC G15), 5-rung Law Certifier, 2-adic inverses
 │   ├── inquiry/                    # Greedy, beam & exact minimax probe planners + HypothesisRevisionLedger
-│   ├── authority/                  # Scheduler-scoped clocks (G13), 2q>N quorum M3 sessions & VirtualProcessor
-│   ├── navigation/                 # Lazy NavigableComputationDAG, ComposedGroundNavigator, F_p commutant blocks & congruence
+│   ├── authority/                  # RFC 8032 Ed25519 public-key & HMAC quorums (2q>N), clocks (G13) & VirtualProcessor
+│   ├── navigation/                 # Lazy DAG, ComposedGroundNavigator, F_p commutant blocks & CellularSheaf H^1
 │   ├── accel/                      # StructuralLinearOperator, FP8/UE8M0/FP4 codecs, Birkhoff Sinkhorn mHC, NumPy + Rust CDLL
 │   ├── fabric/                     # VantageEnvelope, ReliableChannel, 0600-key mTLS mesh, FabricRouter & 4-cut SwiGLU
-│   ├── substrates/                 # HeadlessOS POSIX ABI, Fluid In-Transit CPU/GPU/VM lifting, ELF64/WASM, SIMT, Path & ROOM
-│   ├── models/                     # DeepSeek-V4.1, GLM-5.3, DeepSeek-R1/Qwen2, GLM-Z1/GLM4, Qwen3, Llama/SmolLM2 & SNC/PNF
-│   ├── agents/                     # ProofGround hypergraph, ReceiverHypervisor (ARBITRATE_MODEL), InLayerModelAgent & Builder
+│   ├── substrates/                 # HeadlessOS, Fluid In-Transit, Git Wire Protocol v2 Graph Ground, ELF/WASM, Path & ROOM
+│   ├── models/                     # Frontier/local LLMs, Proof-Carrying Precision Certs, Centered-Gram CKA & SNC/PNF
+│   ├── agents/                     # ProofGround, ReceiverHypervisor, HostedModelSubagent & ContinuousLayerBuilderAgent
 │   ├── continuous.py               # Genesis/spec-bound ContinuousVirtualSystem with mandatory independent verifiers & telemetry
-│   ├── arbitration.py              # Multi-source model arbitration, recursive InLayerMetaArbitratorModel, service & IdeaLedger
-│   └── cli.py                      # `vld` CLI (`info`, `verify`, `navigate`, `benchmark`, `glance`, `continuous`, `arbitrate`, `serve`)
-└── tests/                          # 102 invariant, differential, frontier-LLM, fluid-transit, arbitration, audit & hygiene tests
+│   ├── arbitration.py              # Ed25519-quorum multi-source model arbitration, nested MetaArbitrator & IdeaLedger
+│   └── cli.py                      # `vld` CLI (`info`, `verify`, `compile`, `subagent`, `navigate`, `benchmark`, `glance`, `continuous`, `arbitrate`, `serve`)
+└── tests/                          # 115 invariant, compiler, Ed25519, sheaf, precision, consensus, Git-v2, subagent & audit tests
 ```
 
 ---
@@ -89,6 +90,8 @@ Requires **Python 3.11+**. The core `vld` runtime requires zero third-party depe
 python -m pip install -e ".[dev]"
 python -m pytest -v
 python -m vld verify
+python -m vld compile --horizon 1000000000007 --seed 42
+python -m vld subagent --rounds 2
 python -m vld glance --profile deepseek-v4.1-flash
 python -m vld glance --profile glm-5.3-bf16
 python -m vld continuous

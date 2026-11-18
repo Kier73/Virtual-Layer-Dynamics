@@ -41,6 +41,7 @@ from vld.agents.hypervisor import (
     ReceiverHypervisor,
 )
 from vld.authority import (
+    Ed25519KeyPair,
     EncounterEnvelope,
     QuorumAuthorityMember,
     QuorumLineageCoordinator,
@@ -997,13 +998,26 @@ class ContinuousArbitrationService:
         for offset in range(num_cycles):
             cyc = start_cycle + offset
             task = tasks[cyc % len(tasks)]
-            q_mem = QuorumMembership(f"arb.lineage.{cyc}", ("q0", "q1", "q2"))
-            secs = {m: f"arb-qsec-{m}-0123456789abcdef".encode("utf-8") for m in q_mem.member_ids}
+            member_ids = ("q0", "q1", "q2")
+            kps: dict[str, Ed25519KeyPair] = {}
+            pub_keys: dict[str, str] = {}
+            for m in member_ids:
+                ks_path = self.state_dir / "keys" / f"{m}.ed25519"
+                if ks_path.is_file():
+                    kp = Ed25519KeyPair.load_private_keystore(ks_path)
+                else:
+                    kp = Ed25519KeyPair.generate(m)
+                    kp.save_private_keystore(ks_path)
+                kps[m] = kp
+                pub_keys[m] = kp.public_key_hex
+            q_mem = QuorumMembership(f"arb.lineage.{cyc}", member_ids, member_public_keys=pub_keys)
             nodes = [
-                QuorumAuthorityMember(m, secs[m], journal_path=self.state_dir / f"quorum_{cyc}_{m}.jsonl")
+                QuorumAuthorityMember.from_ed25519_keypair(
+                    m, kps[m], journal_path=self.state_dir / f"quorum_{cyc}_{m}.jsonl"
+                )
                 for m in q_mem.member_ids
             ]
-            quorum = QuorumLineageCoordinator(q_mem, nodes, secs)
+            quorum = QuorumLineageCoordinator(q_mem, nodes)
 
             rep = self.meta_arbitrator.arbitrate_and_execute(
                 task,
@@ -1047,6 +1061,8 @@ class ContinuousArbitrationService:
                             "final_state": dict(rep.pipeline_result.final_state),
                             "measured_wall_ms": round(rep.pipeline_result.measured_wall_ms, 4),
                             "model_cost": rep.pipeline_result.total_cost.to_dict(),
+                            "quorum_public_keys": pub_keys,
+                            "quorum_signature_scheme": "ed25519-rfc8032",
                             "selected_workers": list(rep.selected_workers),
                             "task_id": task.task_id,
                         }
