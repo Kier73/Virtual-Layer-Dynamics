@@ -838,6 +838,220 @@ def verify_rewrite_proof_chain_standalone(
     }
 
 
+def verify_sheaf_consistency_bundle_standalone(bundle: Mapping[str, Any]) -> dict[str, Any]:
+    r"""Independently verify a `vld.sheaf-consistency-bundle.v1` global section OR Fredholm 1-cocycle obstruction."""
+    if bundle.get("schema") != "vld.sheaf-consistency-bundle.v1":
+        raise IndependentAuditError("Invalid sheaf consistency bundle schema.")
+    sheaf = bundle["sheaf"]
+    field = str(bundle["field"])
+    mod = None if bundle["modulus"] is None else int(bundle["modulus"])
+    consistent = bool(bundle["consistent"])
+
+    expected_rep_dg = independent_domain_digest(
+        "vld.sheaf-consistency-report.v1",
+        {
+            "coboundary_rank": int(bundle["coboundary_rank"]),
+            "consistent": consistent,
+            "field": field,
+            "global_section": bundle["global_section"],
+            "h0_dim": int(bundle["h0_dim"]),
+            "h1_dim": int(bundle["h1_dim"]),
+            "modulus": mod,
+            "obstruction": bundle["obstruction"],
+            "sheaf_id": str(bundle["sheaf_id"]),
+        },
+    )
+    if str(bundle.get("report_digest", "")) != expected_rep_dg:
+        raise IndependentAuditError("SheafConsistencyReport digest mismatch.")
+
+    observers = {str(k): int(v) for k, v in dict(sheaf["observers"]).items()}
+    edges = list(sheaf["edges"])
+
+    if consistent:
+        sec = bundle["global_section"]
+        if not isinstance(sec, Mapping) or set(sec.keys()) != set(observers.keys()):
+            raise IndependentAuditError("Global section missing observer assignments.")
+        for e in edges:
+            u = str(e["source_observer"])
+            v = str(e["target_observer"])
+            is_anc = bool(e["is_anchor"])
+            xu = list(sec[u])
+            xv = list(sec[v])
+            if len(xu) != observers[u] or len(xv) != observers[v]:
+                raise IndependentAuditError("Global section stalk dimension mismatch.")
+            for r in range(int(e["edge_dim"])):
+                s_row = e["source_map"][r]
+                t_row = e["target_map"][r]
+                if field == "Fp":
+                    assert mod is not None
+                    lhs = sum(int(t_row[j]) * int(xv[j]) for j in range(len(xv))) % mod
+                    if not is_anc:
+                        lhs = (lhs - sum(int(s_row[j]) * int(xu[j]) for j in range(len(xu)))) % mod
+                    if lhs != int(e["offset"][r]) % mod:
+                        raise IndependentAuditError(f"Global section violates edge {e['edge_id']!r} over F_{mod}.")
+                else:
+                    lhs_q = sum((Fraction(t_row[j]) * Fraction(xv[j]) for j in range(len(xv))), Fraction(0))
+                    if not is_anc:
+                        lhs_q -= sum((Fraction(s_row[j]) * Fraction(xu[j]) for j in range(len(xu))), Fraction(0))
+                    if lhs_q != Fraction(e["offset"][r]):
+                        raise IndependentAuditError(f"Global section violates edge {e['edge_id']!r} over Q.")
+        return {"consistent": True, "edges_verified": len(edges), "status": "VERIFIED"}
+
+    # Inconsistent case: verify Fredholm / 1-cocycle certificate (delta^0)^T y == 0 and <y, c> == holonomy != 0!
+    obs_w = bundle["obstruction"]
+    if not isinstance(obs_w, Mapping):
+        raise IndependentAuditError("Missing obstruction witness on inconsistent sheaf bundle.")
+    expected_w_dg = independent_domain_digest(
+        "vld.sheaf-obstruction-witness.v1",
+        {
+            "conflicting_edge_ids": list(obs_w["conflicting_edge_ids"]),
+            "dual_cocycle": list(obs_w["dual_cocycle"]),
+            "holonomy_residual": str(obs_w["holonomy_residual"]),
+        },
+    )
+    if str(obs_w.get("witness_digest", "")) != expected_w_dg:
+        raise IndependentAuditError("SheafObstructionWitness digest mismatch.")
+
+    y_raw = list(obs_w["dual_cocycle"])
+    total_e_dim = sum(int(e["edge_dim"]) for e in edges)
+    if len(y_raw) != total_e_dim:
+        raise IndependentAuditError("dual_cocycle length disagrees with total edge stalk dimension.")
+
+    if field == "Fp":
+        assert mod is not None
+        y_fp = [int(x) % mod for x in y_raw]
+        v_dual_fp = {obs: [0 for _ in range(dim)] for obs, dim in observers.items()}
+        hol_fp = 0
+        cursor = 0
+        supp_eids: list[str] = []
+        for e in edges:
+            edim = int(e["edge_dim"])
+            u = str(e["source_observer"])
+            v = str(e["target_observer"])
+            is_anc = bool(e["is_anchor"])
+            if any(y_fp[cursor + r] != 0 for r in range(edim)):
+                supp_eids.append(str(e["edge_id"]))
+            for r in range(edim):
+                yr = y_fp[cursor + r]
+                hol_fp = (hol_fp + yr * int(e["offset"][r])) % mod
+                if not is_anc:
+                    for j in range(observers[u]):
+                        v_dual_fp[u][j] = (v_dual_fp[u][j] - yr * int(e["source_map"][r][j])) % mod
+                for j in range(observers[v]):
+                    v_dual_fp[v][j] = (v_dual_fp[v][j] + yr * int(e["target_map"][r][j])) % mod
+            cursor += edim
+        if any(val != 0 for vec in v_dual_fp.values() for val in vec):
+            raise IndependentAuditError("Invalid 1-cocycle witness: (delta^0)^T y != 0.")
+        if hol_fp == 0 or hol_fp != int(obs_w["holonomy_residual"]) % mod:
+            raise IndependentAuditError("Invalid 1-cocycle witness: holonomy <y, c> is zero or mismatched.")
+        if supp_eids != list(obs_w["conflicting_edge_ids"]):
+            raise IndependentAuditError("conflicting_edge_ids disagrees with dual_cocycle support.")
+    else:
+        y_q = [Fraction(x) for x in y_raw]
+        v_dual_q = {obs: [Fraction(0) for _ in range(dim)] for obs, dim in observers.items()}
+        hol_q = Fraction(0)
+        cursor = 0
+        supp_eids_q: list[str] = []
+        for e in edges:
+            edim = int(e["edge_dim"])
+            u = str(e["source_observer"])
+            v = str(e["target_observer"])
+            is_anc = bool(e["is_anchor"])
+            if any(y_q[cursor + r] != 0 for r in range(edim)):
+                supp_eids_q.append(str(e["edge_id"]))
+            for r in range(edim):
+                yr_q = y_q[cursor + r]
+                hol_q += yr_q * Fraction(e["offset"][r])
+                if not is_anc:
+                    for j in range(observers[u]):
+                        v_dual_q[u][j] -= yr_q * Fraction(e["source_map"][r][j])
+                for j in range(observers[v]):
+                    v_dual_q[v][j] += yr_q * Fraction(e["target_map"][r][j])
+            cursor += edim
+        if any(val != 0 for vec in v_dual_q.values() for val in vec):
+            raise IndependentAuditError("Invalid rational 1-cocycle witness: (delta^0)^T y != 0.")
+        if hol_q == 0 or hol_q != Fraction(obs_w["holonomy_residual"]):
+            raise IndependentAuditError("Invalid rational 1-cocycle witness: holonomy <y, c> is zero or mismatched.")
+        if supp_eids_q != list(obs_w["conflicting_edge_ids"]):
+            raise IndependentAuditError("conflicting_edge_ids disagrees with rational dual_cocycle support.")
+
+    return {
+        "conflicting_edge_ids": list(obs_w["conflicting_edge_ids"]),
+        "consistent": False,
+        "status": "VERIFIED",
+    }
+
+
+def verify_precision_decision_bundle_standalone(bundle: Mapping[str, Any]) -> dict[str, Any]:
+    r"""Independently verify a `vld.certified-decision-bundle.v1` rational error recurrence & margin bound."""
+    if bundle.get("schema") != "vld.certified-decision-bundle.v1":
+        raise IndependentAuditError("Invalid precision decision bundle schema.")
+    enc = bundle["enclosure"]
+    if enc.get("schema") != "vld.error-enclosure-certificate.v1":
+        raise IndependentAuditError("Invalid enclosure schema.")
+
+    init_r = Fraction(enc["initial_error_radius"])
+    term_r = Fraction(enc["terminal_error_radius"])
+    steps = list(enc["steps"])
+    if init_r < 0:
+        raise IndependentAuditError("Negative initial_error_radius.")
+    cur_r = init_r
+    for idx, st in enumerate(steps):
+        lip = Fraction(st["lipschitz_upper"])
+        loc = Fraction(st["local_error_radius"])
+        if lip < 0 or loc < 0:
+            raise IndependentAuditError(f"Step {idx}: negative Lipschitz or local error.")
+        cur_r = lip * cur_r + loc
+    if term_r < cur_r:
+        raise IndependentAuditError("terminal_error_radius under-approximates propagated rational error.")
+
+    exp_enc_dg = independent_domain_digest(
+        "vld.error-enclosure-certificate.v1",
+        {
+            "initial_error_radius": str(enc["initial_error_radius"]),
+            "steps": steps,
+            "terminal_error_radius": str(enc["terminal_error_radius"]),
+            "trajectory_id": str(enc["trajectory_id"]),
+        },
+    )
+    if str(enc.get("certificate_digest", "")) != exp_enc_dg:
+        raise IndependentAuditError("ErrorEnclosureCertificate digest mismatch.")
+
+    obs_m = Fraction(bundle["observed_logit_margin"])
+    worst_p = Fraction(bundle["worst_case_logit_perturbation"])
+    cert_m = Fraction(bundle["certified_lower_margin"])
+    cert_inv = bool(bundle["certified_invariant"])
+    if obs_m - worst_p != cert_m:
+        raise IndependentAuditError("certified_lower_margin != observed_logit_margin - worst_case_logit_perturbation.")
+    if cert_inv != (cert_m > 0):
+        raise IndependentAuditError("certified_invariant flag disagrees with sign of certified_lower_margin.")
+
+    exp_v_dg = independent_domain_digest(
+        "vld.certified-decision-verdict.v1",
+        {
+            "certified_invariant": cert_inv,
+            "certified_lower_margin": str(bundle["certified_lower_margin"]),
+            "enclosure_digest": exp_enc_dg,
+            "head_max_row_l2_upper": str(bundle["head_max_row_l2_upper"]),
+            "head_rounding_eps": str(bundle["head_rounding_eps"]),
+            "observed_logit_margin": str(bundle["observed_logit_margin"]),
+            "runner_up_token": int(bundle["runner_up_token"]),
+            "selected_token": int(bundle["selected_token"]),
+            "trajectory_id": str(bundle["trajectory_id"]),
+            "worst_case_logit_perturbation": str(bundle["worst_case_logit_perturbation"]),
+        },
+    )
+    if str(bundle.get("verdict_digest", "")) != exp_v_dg:
+        raise IndependentAuditError("CertifiedDecisionVerdict digest mismatch.")
+
+    return {
+        "certified_invariant": cert_inv,
+        "propagated_error_radius": str(cur_r),
+        "selected_token": int(bundle["selected_token"]),
+        "status": "VERIFIED",
+    }
+
+
 __all__ = [
     "GENESIS_DIGEST",
     "IndependentAuditError",
@@ -846,8 +1060,10 @@ __all__ = [
     "independent_domain_digest",
     "independent_parse_strict_json",
     "verify_continuity_receipt_chain_standalone",
+    "verify_precision_decision_bundle_standalone",
     "verify_quorum_certificate_standalone",
     "verify_rewrite_proof_chain_standalone",
+    "verify_sheaf_consistency_bundle_standalone",
     "verify_snc_1d_capsule_standalone",
     "verify_transit_packet_receipts_standalone",
 ]
