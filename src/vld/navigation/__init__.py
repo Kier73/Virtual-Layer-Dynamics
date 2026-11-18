@@ -28,10 +28,18 @@ from vld.navigation.observer_orbit import (
     ObserverOrbitError,
     discover_similarity_blocks,
 )
+from vld.navigation.sheaf import (
+    CellularSheaf,
+    SheafConsistencyError,
+    SheafConsistencyReport,
+    SheafEdgeSpec,
+    SheafObstructionWitness,
+)
 
 __all__ = [
     "AttributedObserverReading",
     "BisimulationReport",
+    "CellularSheaf",
     "CertifiedSimilarityDecomposition",
     "CommittedNodeResult",
     "ComposedComponentSpec",
@@ -46,6 +54,10 @@ __all__ = [
     "IntervalGateReport",
     "NavigableComputationDAG",
     "ObserverOrbitError",
+    "SheafConsistencyError",
+    "SheafConsistencyReport",
+    "SheafEdgeSpec",
+    "SheafObstructionWitness",
     "SubgraphThunk",
     "analyze_dag_intervals",
     "check_strong_bisimulation",
