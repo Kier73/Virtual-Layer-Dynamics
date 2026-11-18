@@ -184,6 +184,38 @@ class CenteredGramRelationalSketch:
             wire_bytes_estimate=wire_est,
         )
 
+    @classmethod
+    def from_pooled_trajectories(
+        cls,
+        model_id: str,
+        statement_trajectories: Sequence[Sequence[Sequence[float]]],
+        *,
+        sketch_dim: int | None = None,
+        seed_tag: str = "shared-consensus",
+    ) -> CenteredGramRelationalSketch:
+        r"""Build a position-debiased $M \times M$ cross-statement Gram sketch across variable-length BPE sequences.
+
+        Eliminates both subword tokenization length mismatch ($T_m^{(A)} \neq T_m^{(B)}$) and universal
+        intra-sequence RoPE causal position drift $\mu_{\text{pos}}(t)$ discovered in `CMC-001`.
+        """
+        if len(statement_trajectories) < 2:
+            raise RelationalConsensusError("from_pooled_trajectories requires M >= 2 distinct statement trajectories.")
+        pooled: list[list[float]] = []
+        d_expected: int | None = None
+        for traj in statement_trajectories:
+            if not traj:
+                raise RelationalConsensusError("Empty token trajectory in statement_trajectories.")
+            d_cur = len(traj[0])
+            if d_cur <= 0 or any(len(tok_v) != d_cur for tok_v in traj):
+                raise RelationalConsensusError("Inconsistent hidden dimension inside statement trajectory.")
+            if d_expected is None:
+                d_expected = d_cur
+            elif d_cur != d_expected:
+                raise RelationalConsensusError("Inconsistent hidden dimension across statement_trajectories.")
+            inv_t = 1.0 / float(len(traj))
+            pooled.append([math.fsum(float(tok_v[j]) for tok_v in traj) * inv_t for j in range(d_cur)])
+        return cls.from_hidden_states(model_id, pooled, sketch_dim=sketch_dim, seed_tag=seed_tag)
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "frobenius_norm": round(self.frobenius_norm, 8),
