@@ -28,6 +28,13 @@ from vld.navigation.observer_orbit import (
     ObserverOrbitError,
     discover_similarity_blocks,
 )
+from vld.navigation.trace_law import (
+    DiscoveredTraceLaw,
+    TraceLawError,
+    TraceLawRefuted,
+    TraceLawUnderdetermined,
+    discover_trace_law,
+)
 from vld.navigation.sheaf import (
     CellularSheaf,
     SheafConsistencyError,
@@ -37,6 +44,11 @@ from vld.navigation.sheaf import (
 )
 
 __all__ = [
+    "DiscoveredTraceLaw",
+    "TraceLawError",
+    "TraceLawRefuted",
+    "TraceLawUnderdetermined",
+    "discover_trace_law",
     "AttributedObserverReading",
     "BisimulationReport",
     "CellularSheaf",
