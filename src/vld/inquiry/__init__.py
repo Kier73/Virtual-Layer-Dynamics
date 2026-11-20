@@ -16,6 +16,12 @@ from vld.inquiry.probes import (
     plan_probes_greedy,
     plan_probes_minimax,
 )
+from vld.inquiry.trace_inquiry import (
+    ActiveTraceInquiry,
+    TraceInquiryError,
+    TraceInquiryRefuted,
+    TraceObservationProbe,
+)
 from vld.inquiry.revision import (
     ActiveGroundInquiry,
     HypothesisDefinition,
@@ -26,6 +32,10 @@ from vld.inquiry.revision import (
 
 __all__ = [
     "ActiveGroundInquiry",
+    "ActiveTraceInquiry",
+    "TraceInquiryError",
+    "TraceInquiryRefuted",
+    "TraceObservationProbe",
     "GroundUncertaintyMetrics",
     "HypothesisDefinition",
     "HypothesisLedgerEvent",
