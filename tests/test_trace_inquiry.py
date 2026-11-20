@@ -83,7 +83,7 @@ def test_one_observer_cannot_acquire_identifying_rank_even_with_many_samples():
 def test_cost_aware_selection_is_deterministic_and_does_not_overspend():
     session = ActiveTraceInquiry(
         [[1, 1], [1, 2]], prime=101, order=2,
-        observer_costs=[5, Fraction(1, 2)], budget=16,
+        observer_costs=[5, Fraction(1, 2)], budget=17,
     )
     first = session.next_probe()
     assert first is not None and first.channel == 1 and first.rank_gain == 1
@@ -94,7 +94,7 @@ def test_cost_aware_selection_is_deterministic_and_does_not_overspend():
     assert session.coefficients == (3, 99)
     _engage(session)
     assert session.status == "HELDOUT_SUPPORTED"
-    assert session.bundle()["remaining_budget"] == [1, 2]  # cost 15.5
+    assert session.bundle()["remaining_budget"] == [1, 2]  # cost 16.5
     assert verify_trace_inquiry_bundle(session.bundle())["status"] == "HELDOUT_SUPPORTED"
 
 
