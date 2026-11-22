@@ -1,6 +1,40 @@
 # TRACE-002 — Active multi-observer inquiry and proof-carrying law acquisition
 
-**Research status:** executable finite-field experiment, independent transcript audit, optional declared-operator proof. No claim of deducing the true external system from finite samples.
+**Current mechanism:** a bounded, rank-aware source inquiry over a declared prime field, with independently audited probe choices, held-out checks and optional navigation through TRACE-001's recurrence Ground.
+
+## Implementation contract and current syntax
+
+Given a declared order \(d\) and prime \(p\), an observation \(y_c(t)\) on channel \(c\) supplies an exact coefficient equation:
+
+\[
+y_c(t)=\sum_{j=1}^{d}\alpha_jy_c(t-j)\pmod p.
+\]
+
+The next candidate regressor \(r_{c,t}=(y_c(t-1),\ldots,y_c(t-d))\) is already known from the observed prefix. The rank gain is therefore calculated **before** the new value is measured:
+
+\[
+\Delta_{c,t}=\operatorname{rank}_{\mathbb F_p}(R\cup\{r_{c,t}\})
+-\operatorname{rank}_{\mathbb F_p}(R)\in\{0,1\}.
+\]
+
+`ActiveTraceInquiry.next_probe` first maximizes this guaranteed gain, then selects the least-cost affordable channel, then uses prefix length and channel number to break ties. A zero-gain query is marked `bridge`; after unique identification, probes switch to held-out `validate` observations. `observe` requires the precise current proposed probe, appends a digest-linked event, consumes its budget and retains counterexamples. `bundle` invokes the independent transcript auditor.
+
+```python
+from vld.inquiry import ActiveTraceInquiry
+
+session = ActiveTraceInquiry([[1, 1], [1, 2]], prime=101, order=2, budget=20)
+for _ in range(2):
+    probe = session.next_probe()
+    assert probe.phase == "identify" and probe.rank_gain == 1
+    value = 1 if probe.channel == 0 else pow(2, probe.coordinate, 101)
+    session.observe(probe, value, evidence_ref=f"fixture:{probe.channel}")
+assert session.coefficients == (3, 99)  # y(t+2) = 3 y(t+1) - 2 y(t)
+assert session.status == "VALIDATING"   # held-out observations follow
+```
+
+**Source / tests:** [`src/vld/inquiry/trace_inquiry.py`](../src/vld/inquiry/trace_inquiry.py) and [`tests/test_trace_inquiry.py`](../tests/test_trace_inquiry.py), especially `test_joint_observation_recovers_law_when_each_channel_alone_is_unidentifiable`, `test_one_observer_cannot_acquire_identifying_rank_even_with_many_samples` and `test_independent_audit_rejects_forged_adaptive_choice_even_with_fresh_hashes`.
+
+**Translation discovery:** rank gain is a pre-observation structural fact, while coefficient correctness depends on observed outcomes and held-out checks. This suggests a shared query-planning interface with VGI's unknown/ambiguous Ground events and E-CPU's intention-formed processors: choose an observation whose result can remove a missing operator distinction, without asserting what that result will be. The [TDL-001 research log](https://github.com/Kier73/In-Formation-Space/blob/main/reports/TRANSLATION_DISCOVERY_LOG.md) records the integration hypothesis.
 
 ## Question
 
